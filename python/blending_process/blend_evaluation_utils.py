@@ -10,6 +10,7 @@
 
 import re
 import os
+from dataclasses import dataclass
 import patsy
 import pickle
 import warnings
@@ -1290,6 +1291,104 @@ def compute_cell_metrics_fast(df, allowed_cells=None):
 
     pooled_df = pd.DataFrame([pooled_row])
     return pd.concat([cell_metrics, pooled_df], ignore_index=True)
+
+
+def compute_yearly_metrics(cv_preds, model_name, method, n_bins):
+    """Per-year pooled Brier/RPS/AUC rows over the interval bins."""
+    bins = interval_bins(n_bins)
+    cv_cols = [f"cv_{b}" for b in bins]
+    sub = cv_preds.dropna(subset=["outcome"] + cv_cols)
+    rows = []
+    for yr, g in sub.groupby("year"):
+        P = g[cv_cols].values.astype(float)
+        Y = np.column_stack([(g["outcome"] == b).astype(float) for b in bins])
+        brier = float(np.mean(np.sum((P - Y) ** 2, axis=1)))
+        rps = pooled_rps5(P, Y)
+        y_long = Y.flatten()
+        p_long = P.flatten()
+        try:
+            auc = roc_auc_score(y_long, p_long) if len(np.unique(y_long)) == 2 else np.nan
+        except Exception:
+            auc = np.nan
+        rows.append({
+            "year": yr, "model": model_name, "cv_method": method,
+            "brier": brier, "rps": rps, "auc": auc,
+        })
+    return rows
+
+
+def score_model_predictions(cv_preds, model_name, method, allowed_cells, n_bins):
+    """Score CV predictions as one model: (per-cell metrics frame, yearly metric rows)."""
+    cell_metrics = compute_cell_metrics_fast(cv_preds, allowed_cells=allowed_cells)
+    cell_metrics["model"] = model_name
+    cell_metrics["cv_method"] = method
+    return cell_metrics, compute_yearly_metrics(cv_preds, model_name, method, n_bins)
+
+
+# ---------------------------------------------------------------------------
+# Externally produced CV predictions (extras.external_predictions)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ExternalPredictions:
+    """A spec entry naming a pickled cv_preds frame produced outside this script."""
+    name: str
+    path: str
+    method: str = "global"
+
+
+def parse_external_predictions(extras, results_dir):
+    """Parse extras.external_predictions; relative files resolve against results_dir."""
+    entries = (extras or {}).get("external_predictions") or []
+    return [_parse_external_entry(entry, results_dir) for entry in entries]
+
+
+def _parse_external_entry(entry, results_dir):
+    missing = [key for key in ("name", "file") if not (entry or {}).get(key)]
+    if missing:
+        raise ValueError(
+            f"extras.external_predictions entry {entry!r} is missing: {', '.join(missing)}"
+        )
+    path = os.path.join(results_dir, entry["file"])
+    return ExternalPredictions(
+        name=str(entry["name"]),
+        path=path,
+        method=str(entry.get("method") or "global"),
+    )
+
+
+def load_external_predictions(external, n_bins):
+    """Load an external cv_preds pickle, requiring the columns scoring reads."""
+    with open(external.path, "rb") as handle:
+        cv_preds = pickle.load(handle)
+    if not isinstance(cv_preds, pd.DataFrame):
+        raise ValueError(
+            f"External predictions '{external.name}' ({external.path}) must be a "
+            f"pandas DataFrame, got {type(cv_preds).__name__}."
+        )
+    _require_scoring_columns(cv_preds, external, n_bins)
+    if cv_preds.empty:
+        raise ValueError(
+            f"External predictions '{external.name}' ({external.path}) has no rows."
+        )
+    return cv_preds.reset_index(drop=True)
+
+
+def _require_scoring_columns(cv_preds, external, n_bins):
+    expected_cv = [f"cv_{b}" for b in interval_bins(n_bins)]
+    required = ["id", "year", "outcome"] + expected_cv
+    missing = [c for c in required if c not in cv_preds.columns]
+    unexpected = [f"cv_week{w}" for w in _cv_weeks(cv_preds) if w > n_bins]
+    if missing or unexpected:
+        problems = []
+        if missing:
+            problems.append(f"missing columns {missing}")
+        if unexpected:
+            problems.append(f"unexpected columns {unexpected} beyond {n_bins} week bins")
+        raise ValueError(
+            f"External predictions '{external.name}' ({external.path}): "
+            f"{'; '.join(problems)}. Expected {required}."
+        )
 
 
 def summarize_models_pooled(all_cells, baseline_model="unc_clim_raw"):

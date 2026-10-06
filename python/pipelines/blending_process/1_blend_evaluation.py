@@ -40,6 +40,9 @@ from python.blending_process.blend_evaluation_utils import (
     compute_cv_neighbors,
     compute_cv_clusters,
     compute_cell_metrics_fast,
+    score_model_predictions,
+    parse_external_predictions,
+    load_external_predictions,
     summarize_models_pooled,
     summarize_maps_compare,
     make_raw_preds_from_wide,
@@ -151,6 +154,11 @@ def main():
     # columns written by the connect stage.
     _, clim_weeks = resolve_climatology_weeks(spec, wide_df)
     N_BINS = max(clim_weeks)
+
+    external_predictions = [
+        (external, load_external_predictions(external, N_BINS))
+        for external in parse_external_predictions(spec.get("extras"), path_box)
+    ]
 
 
 #    # --- DIAGNOSTIC
@@ -329,32 +337,11 @@ def main():
                     raise ValueError(f"No predictions for {model_name}/{method}.")
 
 #                print("\n cv_pred = ", cv_preds)
-                # Compute metrics
-                cell_metrics = compute_cell_metrics_fast(cv_preds, allowed_cells=dissemination_cells)
-                cell_metrics["model"] = model_name
-                cell_metrics["cv_method"] = method
+                cell_metrics, yearly_rows = score_model_predictions(
+                    cv_preds, model_name, method, dissemination_cells, N_BINS
+                )
                 all_cells_list.append(cell_metrics)
-
-                # Yearly metrics
-                bins = interval_bins(N_BINS)
-                cv_cols = [f"cv_{b}" for b in bins]
-                sub = cv_preds.dropna(subset=["outcome"] + cv_cols)
-                for yr, g in sub.groupby("year"):
-                    P = g[cv_cols].values.astype(float)
-                    Y = np.column_stack([(g["outcome"] == b).astype(float) for b in bins])
-                    brier = float(np.mean(np.sum((P - Y) ** 2, axis=1)))
-                    rps = pooled_rps5(P, Y)
-                    y_long = Y.flatten()
-                    p_long = P.flatten()
-                    try:
-                        from sklearn.metrics import roc_auc_score
-                        auc = roc_auc_score(y_long, p_long) if len(np.unique(y_long)) == 2 else np.nan
-                    except Exception:
-                        auc = np.nan
-                    yearly_metrics_list.append({
-                        "year": yr, "model": model_name, "cv_method": method,
-                        "brier": brier, "rps": rps, "auc": auc,
-                    })
+                yearly_metrics_list.extend(yearly_rows)
 
                 # Save predictions
                 pred_path = os.path.join(path_box, f"cv_preds_{model_name}_{method}{output_tag}.pkl")
@@ -384,6 +371,18 @@ def main():
 
             except Exception as e:
                 raise RuntimeError(f"Error in {model_name}/{method}: {e}") from e
+
+    # --------------------------------------------------------------------------
+    # Section 1b: CV predictions produced outside this script, scored like the
+    # formulas above (not used for Platt calibration or MME)
+    # --------------------------------------------------------------------------
+    for external, cv_preds in external_predictions:
+        print(f"\nExternal CV predictions: {external.name} ({external.path})")
+        cell_metrics, yearly_rows = score_model_predictions(
+            cv_preds, external.name, external.method, dissemination_cells, N_BINS
+        )
+        all_cells_list.append(cell_metrics)
+        yearly_metrics_list.extend(yearly_rows)
 
     # --------------------------------------------------------------------------
     # Section 2: Climatology logit baselines
