@@ -1,0 +1,415 @@
+"""TrainedBlend: everything operations needs from training, in one file.
+
+A trained blend holds its recipe (the BlendConfig, with every derived default
+frozen), the fitted model, the reference data training read (frozen as the
+files' bytes), the observed onsets the climatology is fitted on, and each
+model's forecast signature. A forecast takes only live forecast files and an
+issue date; everything else comes from here, so operations cannot run with
+other parameters than training did.
+
+The file is a zip of JSON, YAML, NumPy and the reference files: no pickles,
+so it loads across library versions and is safe to read. It is written to a
+temporary file and renamed into place, and every member is checked against
+its digest on load.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime as dt
+import hashlib
+import io
+import json
+import os
+import tempfile
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import yaml
+
+from ._specs import _FORECAST_DIMS
+from .config import BlendConfig, ConfigError, ForecastModel
+
+# Bump whenever the numbers the features are computed from change: a blend
+# trained under another version is refused rather than fed different features.
+FEATURES_VERSION = 1
+FORMAT = "onset-blending/trained-blend"
+FORMAT_VERSION = 1
+_MANIFEST = "manifest.json"
+
+
+# ---------------------------------------------------------------------------
+# Forecast signatures
+# ---------------------------------------------------------------------------
+
+
+def forecast_signature(path: str | Path, model: ForecastModel) -> dict:
+    """What the blend reads from one forecast file after the trained reading
+    rules (renames, lead-day and member selection), apart from the issue
+    dates: variable and units, dimension sizes, member ids, lead days, the
+    grid, and the issue time of day."""
+    import netCDF4
+
+    rename = {str(k).lower(): v for k, v in {**_FORECAST_DIMS, **model.dims}.items()}
+    with netCDF4.Dataset(path) as ds:
+        if model.variable not in ds.variables:
+            raise ValueError(f"{Path(path).name} has no {model.variable!r} variable")
+        variable = ds.variables[model.variable]
+        names = {d: rename.get(d.lower(), d) for d in variable.dimensions}
+
+        def values(dim):
+            if dim in ds.variables:
+                raw = ds.variables[dim][:]
+                return np.asarray(raw.filled(np.nan) if np.ma.isMaskedArray(raw) else raw)
+            return np.arange(len(ds.dimensions[dim]))
+
+        signature: dict = {
+            "variable": model.variable,
+            "units": str(getattr(variable, "units", "")) or None,
+            "dims": {},
+        }
+        for dim, name in names.items():
+            if name == "time":
+                times = ds.variables[dim]
+                stamps = netCDF4.num2date(
+                    times[:], times.units, getattr(times, "calendar", "standard"),
+                    only_use_cftime_datetimes=False,
+                )
+                signature["issue_hours"] = sorted({int(t.hour) for t in np.atleast_1d(stamps)})
+                continue
+            vals = values(dim)
+            if name == "day":
+                days = [int(v) for v in vals]
+                lead = model.lead_days
+                signature["lead_days"] = [d for d in days if lead.min <= d <= lead.max]
+            elif name == "number":
+                members = [int(v) for v in vals]
+                if model.max_member is not None:
+                    members = [m for m in members if m <= model.max_member]
+                signature["members"] = members
+            elif name in ("lat", "lon"):
+                signature[name] = [round(float(v), 6) for v in vals]
+            elif name == "adm3_name":
+                signature["unit_ids"] = sorted(str(v) for v in vals)
+            else:
+                signature["dims"][name] = len(vals)
+    return signature
+
+
+def issue_dates(path: str | Path, model: ForecastModel) -> list[dt.date]:
+    """The issue dates a forecast file holds."""
+    import netCDF4
+
+    rename = {str(k).lower(): v for k, v in {**_FORECAST_DIMS, **model.dims}.items()}
+    with netCDF4.Dataset(path) as ds:
+        dims = ds.variables[model.variable].dimensions if model.variable in ds.variables else ()
+        for dim in dims:
+            if rename.get(dim.lower(), dim) == "time" and dim in ds.variables:
+                times = ds.variables[dim]
+                stamps = netCDF4.num2date(
+                    times[:], times.units, getattr(times, "calendar", "standard"),
+                    only_use_cftime_datetimes=False,
+                )
+                return sorted({dt.date(t.year, t.month, t.day) for t in np.atleast_1d(stamps)})
+    return []
+
+
+def _signature_differences(trained: dict, live: dict) -> list[str]:
+    labels = {
+        "variable": "variable", "units": "units", "dims": "other dimensions",
+        "issue_hours": "issue hour (UTC)", "lead_days": "lead days", "members": "members",
+        "lat": "latitudes", "lon": "longitudes", "unit_ids": "unit ids",
+    }
+    out = []
+    for key, label in labels.items():
+        if trained.get(key) != live.get(key):
+            out.append(f"{label} {_brief(live.get(key))}, trained on {_brief(trained.get(key))}")
+    return out
+
+
+def _brief(value) -> str:
+    if isinstance(value, list) and len(value) > 6:
+        if all(isinstance(v, int) for v in value) and value == list(range(value[0], value[-1] + 1)):
+            return f"{value[0]}–{value[-1]}"
+        return f"{len(value)} values {value[0]}…{value[-1]}"
+    return repr(value)
+
+
+# ---------------------------------------------------------------------------
+# Reference files frozen into the blend
+# ---------------------------------------------------------------------------
+
+# Config paths training read that are not forecast inputs, as attribute paths.
+def _reference_paths(config: BlendConfig) -> list[tuple[tuple, str]]:
+    found = []
+
+    def add(route, value):
+        if value is not None:
+            found.append((route, value))
+
+    add(("onset", "threshold", "file"), config.onset.threshold.file)
+    if config.onset.reference_onset is not None:
+        add(("onset", "reference_onset", "file"), config.onset.reference_onset.file)
+    add(("observations", "cell_transform"), config.observations.cell_transform)
+    domain = config.domain
+    if domain.regrid is not None:
+        add(("domain", "regrid", "weights"), domain.regrid.weights)
+    if domain.dissemination is not None:
+        add(("domain", "dissemination", "file"), domain.dissemination.file)
+    if domain.centroids is not None:
+        add(("domain", "centroids", "file"), domain.centroids.file)
+    if domain.area_of_interest is not None:
+        add(("domain", "area_of_interest", "geometry"), domain.area_of_interest.geometry)
+    for index, model in enumerate(config.models):
+        add(("models", index, "cell_transform"), model.cell_transform)
+        add(("models", index, "regrid_weights"), model.regrid_weights)
+    return found
+
+
+def _replace(node, route: tuple, value):
+    """node with the attribute at route replaced (tuples indexed by position)."""
+    head, *rest = route
+    if isinstance(node, tuple):
+        items = list(node)
+        items[head] = _replace(items[head], tuple(rest), value) if rest else value
+        return tuple(items)
+    child = getattr(node, head)
+    return dataclasses.replace(node, **{head: _replace(child, tuple(rest), value) if rest else value})
+
+
+# ---------------------------------------------------------------------------
+# Tables without pickles
+# ---------------------------------------------------------------------------
+
+
+def _table_arrays(df: pd.DataFrame) -> tuple[dict, dict[str, np.ndarray]]:
+    """A table as a column schema and plain arrays (strings as unicode)."""
+    schema, arrays = [], {}
+    for index, column in enumerate(df.columns):
+        series = df[column]
+        key = f"c{index}"
+        if pd.api.types.is_bool_dtype(series) or pd.api.types.is_numeric_dtype(series):
+            kind, data = "number", series.to_numpy()
+        elif pd.api.types.is_datetime64_any_dtype(series):
+            kind, data = "datetime", series.to_numpy(dtype="datetime64[ns]").astype(np.int64)
+        else:
+            values = series.astype(object)
+            if values.map(lambda v: isinstance(v, dt.date)).any():
+                kind = "date"
+                data = np.array([v.isoformat() if isinstance(v, dt.date) else "" for v in values], dtype=str)
+            else:
+                kind = "text"
+                data = np.array(["" if pd.isna(v) else str(v) for v in values], dtype=str)
+            arrays[f"{key}_missing"] = values.isna().to_numpy()
+        schema.append({"name": str(column), "kind": kind, "dtype": str(series.dtype)})
+        arrays[key] = data
+    return {"columns": schema, "rows": len(df)}, arrays
+
+
+def _table_from_arrays(schema: dict, arrays) -> pd.DataFrame:
+    columns = {}
+    for index, column in enumerate(schema["columns"]):
+        data = arrays[f"c{index}"]
+        kind = column["kind"]
+        if kind == "number":
+            columns[column["name"]] = pd.Series(data, dtype=column["dtype"])
+        elif kind == "datetime":
+            columns[column["name"]] = pd.Series(data.astype("datetime64[ns]"))
+        else:
+            missing = arrays[f"c{index}_missing"]
+            values = [None if m else (dt.date.fromisoformat(v) if kind == "date" else str(v))
+                      for v, m in zip(data.tolist(), missing.tolist())]
+            columns[column["name"]] = pd.Series(values, dtype=object if kind == "date" else column["dtype"])
+    return pd.DataFrame(columns, index=pd.RangeIndex(schema["rows"]))
+
+
+def _npz_bytes(arrays: dict[str, np.ndarray]) -> bytes:
+    buffer = io.BytesIO()
+    np.savez(buffer, **arrays)
+    return buffer.getvalue()
+
+
+def _npz_load(data: bytes):
+    return np.load(io.BytesIO(data), allow_pickle=False)
+
+
+# ---------------------------------------------------------------------------
+# The trained blend
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TrainedBlend:
+    config: BlendConfig                 # the recipe, derived defaults frozen
+    model: object                       # model.FittedModel
+    observed: pd.DataFrame              # id, year, onset_day: what the climatology is fitted on
+    units: tuple[str, ...]              # the units the blend was trained and scores on
+    signatures: dict[str, dict]         # model name -> forecast signature
+    reference_files: dict[str, bytes]   # frozen reference inputs, by artifact name
+    provenance: dict = field(default_factory=dict)
+
+    # -- building -----------------------------------------------------------
+
+    @classmethod
+    def from_training(cls, config: BlendConfig, inputs, model, *, provenance: dict | None = None) -> "TrainedBlend":
+        """The blend a training run produced (inputs: training.Inputs)."""
+        from . import inputs as input_files
+
+        climatology = inputs.climatology
+        resolved = dataclasses.replace(
+            config,
+            climatology=dataclasses.replace(
+                config.climatology, train_years=climatology.train_years, test_years=climatology.test_years
+            ),
+        )
+        reference_files, frozen = {}, resolved
+        for index, (route, value) in enumerate(_reference_paths(resolved)):
+            source = resolved.path(value)
+            name = f"reference/{index}-{source.name}"
+            reference_files[name] = source.read_bytes()
+            frozen = _replace(frozen, route, name)
+        frozen = dataclasses.replace(frozen, data_root=None)
+
+        signatures, problems = {}, []
+        for model_config in config.models:
+            files = input_files.list_files(model_config.files, config, f"model {model_config.name}")
+            seen = {}
+            for path in files:
+                seen.setdefault(json.dumps(forecast_signature(path, model_config), sort_keys=True), []).append(path.name)
+            if len(seen) > 1:
+                groups = "; ".join(f"{', '.join(names[:4])}{'…' if len(names) > 4 else ''}" for names in seen.values())
+                problems.append(
+                    f"{model_config.name}: its training files differ in dimensions, members, lead days or grid "
+                    f"({groups}); a blend needs one forecast structure to forecast with"
+                )
+            signatures[model_config.name] = json.loads(next(iter(seen)))
+        if problems:
+            raise ConfigError(problems)
+
+        observed = inputs.observed[["id", "year", "onset_day"]].reset_index(drop=True)
+        return cls(
+            config=frozen,
+            model=model,
+            observed=observed,
+            units=tuple(sorted(inputs.weekly["id"].astype(str).unique())),
+            signatures=signatures,
+            reference_files=reference_files,
+            provenance={
+                "trained_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                "training_years": list(config.evaluation.years.training),
+                **(provenance or {}),
+            },
+        )
+
+    # -- files --------------------------------------------------------------
+
+    def save(self, path: str | Path) -> Path:
+        """Write the blend to path, atomically."""
+        from importlib.metadata import PackageNotFoundError, version
+
+        path = Path(path)
+        members: dict[str, bytes] = {"config.yml": self.config.to_yaml().encode()}
+        model_meta, model_arrays = self.model.to_arrays()
+        members["model.json"] = json.dumps(model_meta, indent=1).encode()
+        members["model.npz"] = _npz_bytes(model_arrays)
+        schema, arrays = _table_arrays(self.observed)
+        members["observed.json"] = json.dumps(schema).encode()
+        members["observed.npz"] = _npz_bytes(arrays)
+        members["units.json"] = json.dumps(list(self.units)).encode()
+        members["signatures.json"] = json.dumps(self.signatures, indent=1).encode()
+        members.update(self.reference_files)
+        try:
+            package_version = version("onset-blending")
+        except PackageNotFoundError:
+            package_version = None
+        manifest = {
+            "format": FORMAT,
+            "format_version": FORMAT_VERSION,
+            "features_version": FEATURES_VERSION,
+            "package_version": package_version,
+            "provenance": self.provenance,
+            "config_sha256": hashlib.sha256(members["config.yml"]).hexdigest(),
+            "members": {name: hashlib.sha256(data).hexdigest() for name, data in members.items()},
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(handle, "wb") as raw, zipfile.ZipFile(raw, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(_MANIFEST, json.dumps(manifest, indent=1))
+                for name, data in members.items():
+                    archive.writestr(name, data)
+                raw.flush()
+                os.fsync(raw.fileno())
+            os.replace(temp, path)
+        except BaseException:
+            Path(temp).unlink(missing_ok=True)
+            raise
+        return path
+
+    @classmethod
+    def load(cls, path: str | Path) -> "TrainedBlend":
+        """Read a saved blend; refuses a damaged file or other feature numerics."""
+        from .model import FittedModel
+
+        with zipfile.ZipFile(path) as archive:
+            manifest = json.loads(archive.read(_MANIFEST))
+            if manifest.get("format") != FORMAT or manifest.get("format_version") != FORMAT_VERSION:
+                raise ValueError(f"{path} is not a trained blend this version can read")
+            members = {name: archive.read(name) for name in manifest["members"]}
+        damaged = [n for n, d in members.items() if hashlib.sha256(d).hexdigest() != manifest["members"][n]]
+        if damaged:
+            raise ValueError(f"{path} is damaged: {', '.join(damaged)} do not match their digests")
+        if manifest["features_version"] != FEATURES_VERSION:
+            raise ValueError(
+                f"{path} was trained with feature version {manifest['features_version']}; this package "
+                f"computes version {FEATURES_VERSION}. Retrain it, or forecast with the version it was trained with."
+            )
+        config = BlendConfig.from_dict(yaml.safe_load(members["config.yml"]))
+        observed = _table_from_arrays(json.loads(members["observed.json"]), _npz_load(members["observed.npz"]))
+        model = FittedModel.from_arrays(json.loads(members["model.json"]), dict(_npz_load(members["model.npz"])))
+        return cls(
+            config=config,
+            model=model,
+            observed=observed,
+            units=tuple(json.loads(members["units.json"])),
+            signatures=json.loads(members["signatures.json"]),
+            reference_files={n: d for n, d in members.items() if n.startswith("reference/")},
+            provenance=manifest.get("provenance", {}),
+        )
+
+    # -- operations -----------------------------------------------------------
+
+    def check_forecast_files(self, forecasts: dict[str, list[Path]]) -> list[str]:
+        """Every way the live files differ from what the blend was trained on."""
+        problems = []
+        trained = set(self.config.model_names)
+        given = set(forecasts)
+        if given != trained:
+            missing, extra = sorted(trained - given), sorted(given - trained)
+            problems.append(
+                "forecasts must be given for exactly the trained models ("
+                + ", ".join(sorted(trained)) + ")"
+                + (f"; missing {', '.join(missing)}" if missing else "")
+                + (f"; not trained on {', '.join(extra)}" if extra else "")
+            )
+        for name in sorted(trained & given):
+            model = self.config.model(name)
+            for path in forecasts[name]:
+                try:
+                    live = forecast_signature(path, model)
+                except (OSError, ValueError) as exc:
+                    problems.append(f"{name}: {Path(path).name}: {exc}")
+                    continue
+                differences = _signature_differences(self.signatures[name], live)
+                if differences:
+                    problems.append(f"{name}: {Path(path).name}: " + "; ".join(differences))
+        return problems
+
+    def forecast(self, forecasts: dict[str, str | Path | list], *, issue_date=None, resources=None):
+        """Blended onset probabilities from live forecast files (see forecast.run)."""
+        from . import forecast as forecast_module
+
+        return forecast_module.run(self, forecasts, issue_date=issue_date, resources=resources)

@@ -29,5 +29,8 @@ regrid = ["geopandas>=0.13", "pyproj>=3.5", "shapely>=2.0"]
 maps = ["cartopy>=0.25", "matplotlib>=3.7", "seaborn>=0.12"]
 test = ["pytest>=8"]
 
+[project.scripts]
+onset-blend = "onset_blending.__main__:main"
+
 [tool.setuptools.packages.find]
 include = ["onset_blending*"]

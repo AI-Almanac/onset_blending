@@ -1,6 +1,20 @@
 # Redesign: onset_blending owns the blend pipeline, in memory
 
-Status: phase 1 (config) done; phase 2 next.
+Status: phase 1 (config) done. Phase 2: the package side is done; ai-almanac's side
+(dataset normalisation, the live writer, switching its runners) is next.
+
+Phase 2 verification, against the cached references:
+- Ethiopia: `train()` reproduces every artifact exactly (combined and weekly
+  tables, CV predictions, fold and final coefficients, per-cell, pooled and
+  yearly metrics) in 44 s, against 525 s for the original code. A forecast from
+  the saved blend, replaying 2025 as a live season, gives the old apply path's
+  probabilities exactly.
+- India: the combined and weekly tables are identical (inputs in 242 s, peak
+  66 GB, against 48 GB when the stages hand over files: phase 3 targets this).
+  The evaluation and final fit, run on the reference weekly table, give all 36
+  artifacts byte-identical.
+- The old script-based run on India took 7,462 s (peak 94 GB) and matches the
+  branch's run on 38 of 39 files; the 39th differs only in log text.
 
 ## Goals
 
@@ -218,7 +232,32 @@ mm) must match the layout each model was trained from. Registered datasets
 are read with their own renames and unit scales (`model_layouts`); India's
 AIFS uses `prediction_timedelta_daily` and metres. Decision: datasets are normalised to the
 standard layout once, at registration, so training and live files come from
-the same layout and `model_layouts` goes away. Its live path today re-supplies parameters from the job record,
+the same layout and `model_layouts` goes away.
+
+The standard layout, one `{year}.nc` per season:
+
+- `tp` in mm (`units: mm`), float32, dims `(time, number, day, lat, lon)`;
+  `number` only for ensembles;
+- `time` is the issue date at 00Z;
+- `day` holds integer lead days 1..N. Day k is the UTC day ending at
+  issue + k days, i.e. hours (24(k−1), 24k], the convention of every
+  registered archive;
+- `lat` and `lon` ascend.
+
+A survey of ai-almanac against this layout found two live-path defects. They
+are inferred from the code and the files' attributes, not yet checked on live
+output:
+- **Lead days.** Live day d sums the 6-hourly steps at lead hours
+  24d … 24d+18, i.e. hours (24d−6, 24d+18], so it overlaps archive day d+1
+  by 18 h. Live forecasts are scored about a day late against blends trained
+  on the archives.
+- **Members.** Live ensemble runs average their 8 members into one trajectory
+  before writing, while the archives keep 26 members. The ensemble onset
+  probabilities (the share of members with an onset) then come from a single
+  mean trajectory.
+Decision: live ensemble runs keep all 26 members separate, and the live
+writer uses the archive lead-day convention. The signature check then holds
+for every existing blend. Its live path today re-supplies parameters from the job record,
 and the weekly-feature settings fall back to code defaults (day_max,
 days_per_week, n_weeks, rain_window). Those match training only because
 training never overrides them.

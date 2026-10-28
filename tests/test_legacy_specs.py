@@ -84,7 +84,7 @@ def problems(specs: dict) -> list[str]:
 
 @pytest.mark.parametrize("name", sorted(PORTED))
 def test_each_ported_config_is_its_spec_set(name):
-    converted = convert_spec_files(name=name, **spec_paths(name)).config
+    converted = convert_spec_files(name=name, data_root=str(ROOT.resolve()), **spec_paths(name)).config
     assert BlendConfig.from_yaml(ROOT / "configs" / f"{name}.yml") == converted
 
 

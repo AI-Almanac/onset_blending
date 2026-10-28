@@ -513,6 +513,9 @@ class Evaluation:
     cv_methods: tuple[Literal["global", "local", "clusters"], ...] = ("global",)
     cluster_var: str = _field("cluster", doc="Grouping column for clusters CV.")
     formulas: dict[str, Formula] = _field(factory=dict)
+    final_formula: str | None = _field(
+        None, doc="The formula fitted on every training year for operations; default the only enabled one."
+    )
     window_variants: tuple[WindowVariant, ...] = _field(factory=tuple)
     climatology_baselines: ClimatologyBaselines = _field(factory=ClimatologyBaselines)
     forecasts: tuple[ForecastEvaluation, ...] | None = _field(
@@ -536,6 +539,11 @@ class BlendConfig:
     # Fields in the order a config file reads best (kw_only allows required
     # fields after defaulted ones).
     name: str
+    data_root: str | None = _field(
+        None,
+        doc="Relative paths resolve against this directory; from a file, it is itself "
+        "relative to the file, which is the default root. From a dict: the working directory.",
+    )
     domain: Domain = _field(factory=Domain)
     observations: Observations
     models: tuple[ForecastModel, ...]
@@ -558,8 +566,20 @@ class BlendConfig:
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "BlendConfig":
+        path = Path(path)
         with open(path) as handle:
-            return cls.from_dict(yaml.safe_load(handle) or {})
+            data = yaml.safe_load(handle) or {}
+        if isinstance(data, dict):
+            root = path.parent.resolve() / (data.get("data_root") or ".")
+            data = {**data, "data_root": str(root.resolve())}
+        return cls.from_dict(data)
+
+    def path(self, value: str | Path) -> Path:
+        """A configured path, resolved against data_root."""
+        value = Path(value)
+        if value.is_absolute() or self.data_root is None:
+            return value
+        return Path(self.data_root) / value
 
     def to_dict(self) -> dict:
         return _dump(self)
@@ -587,6 +607,12 @@ class BlendConfig:
         if self.evaluation.forecasts is not None:
             return self.evaluation.forecasts
         return tuple(ForecastEvaluation(model=name) for name in self.model_names)
+
+    def final_formula(self) -> str:
+        """The formula the operational model is fitted with."""
+        if self.evaluation.final_formula is not None:
+            return self.evaluation.final_formula
+        return next(name for name, f in self.evaluation.formulas.items() if f.enabled)
 
     def climatology_forecast_window(self) -> int:
         if self.climatology.forecast_window is not None:
@@ -696,6 +722,13 @@ class BlendConfig:
         enabled = {name: f for name, f in evaluation.formulas.items() if f.enabled}
         if not enabled:
             problems.append("evaluation.formulas: at least one enabled formula is required")
+        if evaluation.final_formula is not None and evaluation.final_formula not in enabled:
+            problems.append(f"evaluation.final_formula: {evaluation.final_formula!r} is not an enabled formula")
+        elif evaluation.final_formula is None and len(enabled) > 1:
+            problems.append(
+                "evaluation.final_formula: name the formula operations uses "
+                f"(one of {', '.join(sorted(enabled))})"
+            )
         available = feature_bases(self)
         for name, formula in enabled.items():
             for token in formula_terms(formula.text):

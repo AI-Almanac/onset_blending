@@ -132,10 +132,12 @@ def _without_none(mapping: dict) -> dict:
 
 
 class _Converter:
-    def __init__(self, *, name, ground_truth, forecasts, combine, connect, cv_models, regrid, connect_onset_spec):
+    def __init__(self, *, name, ground_truth, forecasts, combine, connect, cv_models, regrid, connect_onset_spec,
+                 data_root=None):
         self.problems: list[str] = []
         self.notes: list[str] = []
         self.name = name
+        self.data_root = data_root
         self.gt = _Spec("ground_truth", ground_truth, self.notes)
         self.forecasts = {m: _Spec(f"forecast[{m}]", spec, self.notes) for m, spec in forecasts.items()}
         self.combine = _Spec("combine", combine, self.notes)
@@ -1003,6 +1005,8 @@ class _Converter:
         self.connect.drop("climatology.output_prefix", "the climatology features are always prob_clim")
 
         data: dict[str, Any] = {"name": self.name}
+        if self.data_root is not None:
+            data["data_root"] = self.data_root
         connect_models = list(self.connect.get("forecast_models", []) or [])
         if not connect_models:
             self.problems.append("connect: forecast_models is required")
@@ -1072,16 +1076,20 @@ def convert_specs(
     cv_models: dict,
     regrid: dict | None = None,
     connect_onset_spec: dict | None = None,
+    data_root: str | None = None,
 ) -> Conversion:
     """One BlendConfig from a set of stage specs (as loaded from YAML).
 
     `forecasts` maps each model name (the combine and connect key) to its
     raw_data spec. `connect_onset_spec` is the raw_data spec connect's
-    `onset_spec` names, when that is not the ground-truth spec.
+    `onset_spec` names, when that is not the ground-truth spec. The specs'
+    paths are relative to the directory the old scripts ran from: give it as
+    `data_root`.
     """
     return _Converter(
         name=name, ground_truth=ground_truth, forecasts=forecasts, combine=combine,
         connect=connect, cv_models=cv_models, regrid=regrid, connect_onset_spec=connect_onset_spec,
+        data_root=data_root,
     ).convert()
 
 
@@ -1101,6 +1109,7 @@ def convert_spec_files(
     connect: str | Path,
     cv_models: str | Path,
     regrid: str | Path | None = None,
+    data_root: str | None = None,
 ) -> Conversion:
     """`convert_specs` on YAML files; connect's onset_spec is looked up beside
     the ground-truth spec."""
@@ -1119,6 +1128,7 @@ def convert_spec_files(
         cv_models=_load(cv_models),
         regrid=_load(regrid),
         connect_onset_spec=onset_spec,
+        data_root=data_root,
     )
 
 
@@ -1132,6 +1142,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--connect", required=True)
     parser.add_argument("--cv-models", required=True)
     parser.add_argument("--regrid")
+    parser.add_argument("--data-root", help="where the specs' relative paths start, relative to the output file")
     parser.add_argument("-o", "--output", help="write the config here (default: stdout)")
     args = parser.parse_args(argv)
 
@@ -1149,6 +1160,7 @@ def main(argv: list[str] | None = None) -> int:
         conversion = convert_spec_files(
             name=args.name, ground_truth=args.ground_truth, forecasts=forecasts, combine=args.combine,
             connect=args.connect, cv_models=args.cv_models, regrid=args.regrid,
+            data_root=args.data_root,
         )
     except ConfigError as exc:
         print(exc, file=sys.stderr)

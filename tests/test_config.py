@@ -128,6 +128,7 @@ def test_windowed_climatologies_are_declared_once_and_referenced():
     data["evaluation"]["climatology_baselines"] = {"windows": ["2000:2020"]}
     data["evaluation"]["window_variants"] = [{"base": "blended_model", "windows": ["1990:2020"]}]
     data["evaluation"]["formulas"]["windowed"] = "outcome ~ prob_clim_1990_2020_qx"
+    data["evaluation"]["final_formula"] = "blended_model"
 
     config = BlendConfig.from_dict(data)
 
