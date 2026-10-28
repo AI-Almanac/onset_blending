@@ -43,6 +43,7 @@ from .spatial_id_utils import (
     resolve_grid_id_convention,
     validate_id_coordinate_consistency,
     validate_expected_source_ids,
+    working_copy,
 )
 from .sparse_transform_utils import (
     compile_sparse_cell_transform,
@@ -277,6 +278,52 @@ def nc_time_to_dates(time_num, time_units):
     return pd.DatetimeIndex(timestamps)
 
 
+def _filled_with_nan(raw):
+    """``np.ma.filled(raw, np.nan)`` for an array just read from a file,
+    filled in place rather than copied: a forecast variable runs to GBs, and
+    nothing else holds the buffer read for it. Anything but a float masked
+    array that owns its data takes the copying path."""
+    if not np.ma.isMaskedArray(raw):
+        return np.asarray(raw)
+    data = raw.data
+    if not np.issubdtype(data.dtype, np.floating) or not data.flags.writeable or not data.flags.owndata:
+        return np.ma.filled(raw, np.nan)
+    if raw.mask is not np.ma.nomask:
+        data[np.ma.getmaskarray(raw)] = np.nan
+    return data
+
+
+def _row_dates(time_num, time_units):
+    """``nc_time_to_dates(time_num, time_units)`` as (``.date`` objects, ``.year``)
+    arrays, converting each distinct time value once: a long or wide table
+    repeats each time for every cell (and member)."""
+    codes, distinct = pd.factorize(np.asarray(time_num), use_na_sentinel=False)
+    dates = nc_time_to_dates(distinct, time_units)
+    return dates.date[codes], dates.year.to_numpy()[codes]
+
+
+def _product_frame(names, values):
+    """``pd.DataFrame(list(itertools.product(*values)), columns=names)`` built
+    from array repeats rather than one Python tuple per row.
+
+    Each column takes the dtype pandas infers for it from the tuples: that
+    inference is per column, so it is reproduced by inferring a one-column
+    frame of the dimension's own values, which is then repeated by position.
+    """
+    sizes = [len(v) for v in values]
+    if not sizes or 0 in sizes:
+        return pd.DataFrame(list(product(*values)), columns=names)
+    n_rows = int(np.prod(sizes))
+    columns = {}
+    for i, (name, vals) in enumerate(zip(names, values)):
+        inner = int(np.prod(sizes[i + 1:]))
+        outer = n_rows // (sizes[i] * inner)
+        column = pd.DataFrame([(v,) for v in vals]).iloc[:, 0]
+        positions = np.tile(np.repeat(np.arange(sizes[i]), inner), outer)
+        columns[name] = column.take(positions).reset_index(drop=True)
+    return pd.DataFrame(columns)
+
+
 # ---------------------------------------------------------------------------
 # ID helpers  (adm3_name or legacy lat/lon grids)
 # ---------------------------------------------------------------------------
@@ -464,16 +511,19 @@ def attach_ref_onset(df, ref):
     each year), or a DataFrame keyed by 'year' and/or 'id' (per-year and/or
     per-unit dates). Merges on whichever keys are present in both.
     """
-    df = df.copy()
+    df = working_copy(df)
     if ref is None:
         df["ref_onset_date"] = pd.NaT
         return df
     if isinstance(ref, dict) and ref.get("mode") == "constant_month_day":
         md = ref["month_day"]
         if "year" in df.columns:
-            df["ref_onset_date"] = pd.to_datetime(
-                df["year"].astype(int).astype(str) + "-" + md, errors="coerce"
-            ).dt.date
+            df["ref_onset_date"] = _by_distinct(
+                df["year"],
+                lambda year: pd.to_datetime(
+                    year.astype(int).astype(str) + "-" + md, errors="coerce"
+                ).dt.date,
+            )
         else:
             df["ref_onset_date"] = pd.NaT
         return df
@@ -928,8 +978,7 @@ def nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
         )
 
         # Read and permute array so day is last
-        raw = v[:]
-        arr = np.ma.filled(raw, np.nan) if np.ma.isMaskedArray(raw) else np.asarray(raw)
+        arr = _filled_with_nan(v[:])
         other_idx = [i for i in range(len(dim_names)) if i != day_idx]
         perm = other_idx + [day_idx]
         arr = np.transpose(arr, perm)
@@ -938,8 +987,7 @@ def nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
         # Build grid of other dims
         other_dim_names = [dim_names[i] for i in other_idx]
         other_dim_vals = [dim_vals[dim_names[i]] for i in other_idx]
-        grid_rows = list(product(*other_dim_vals))
-        grid = pd.DataFrame(grid_rows, columns=other_dim_names)
+        grid = _product_frame(other_dim_names, other_dim_vals)
         grid = rename_dimensions(grid, dim_rename_map or {})
         grid.columns = grid.columns.str.lower()
 
@@ -951,7 +999,7 @@ def nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
         if "adm3_name" in grid.columns:
             grid = grid.rename(columns={"adm3_name": "id"})
 
-        n_rows = len(grid_rows)
+        n_rows = len(grid)
         n_days = len(day_vals)
         mat = arr.reshape(n_rows, n_days)
 
@@ -960,22 +1008,258 @@ def nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
             for dv, dv_num in zip(day_vals, day_vals_num)
         ]
         day_col_names = [f"{prefix}_day_{lab}" for lab in day_labels]
-        day_df = pd.DataFrame(mat, columns=day_col_names)
+        # mat is this function's own array (the day selection copied it), so
+        # the frame can wrap it instead of copying it again.
+        day_df = pd.DataFrame(mat, columns=day_col_names, copy=False)
 
         out = pd.concat([grid.reset_index(drop=True), day_df], axis=1)
 
         if add_year and "time" in out.columns:
             tinfo = get_nc_time(ds)
             if pd.api.types.is_float_dtype(out["time"]) or pd.api.types.is_integer_dtype(out["time"]):
-                dates = nc_time_to_dates(out["time"].values, tinfo["units"])
+                out["time"], out["year"] = _row_dates(out["time"].values, tinfo["units"])
             else:
                 dates = pd.to_datetime(out["time"])
-            out["time"] = dates.date
-            out["year"] = pd.DatetimeIndex(dates).year
+                out["time"] = dates.date
+                out["year"] = pd.DatetimeIndex(dates).year
 
         return out
     finally:
         ds.close()
+
+
+_SPATIAL_DIMS = ("lat", "lon", "id")
+# Values per slab read at once (~64 MB as float32): a slab of whole storage
+# chunks along the leading dimension, so each chunk is decompressed once.
+_READ_SLAB_VALUES = 1 << 24
+
+
+def _forecast_layout(ds, var_name, dim_rename_map, day_dim):
+    """The forecast variable's layout for point-wise reading, or None.
+
+    Supported: leading (time[, number]) dimensions, the lead day, and trailing
+    spatial dimensions (lat/lon, or adm3_name read as `id`), with time first.
+    """
+    v = ds.variables[var_name]
+    dim_names = list(v.dimensions)
+    dim_vals = {}
+    adm3_dim_name = None
+    for d in dim_names:
+        dl = d.lower()
+        if dl in ("adm3_name", "adm3"):
+            adm3_dim_name = d
+            dim_vals[d] = get_nc_adm3_names(ds)
+        elif dl == "time":
+            dim_vals[d] = get_nc_time(ds)["values"]
+        elif d in ds.variables:
+            dim_vals[d] = np.array(ds[d][:]).flatten()
+        elif d in ds.dimensions:
+            dim_vals[d] = np.arange(ds.dimensions[d].size)
+        else:
+            dim_vals[d] = np.arange(len(v))
+    dummy = rename_dimensions(
+        pd.DataFrame({d: [dim_vals[d][0]] for d in dim_names}), dim_rename_map or {}
+    )
+    renamed = [c.lower() for c in dummy.columns]
+    adm3_renamed = adm3_dim_name.lower() if adm3_dim_name else None
+    renamed = ["id" if name in ("adm3_name", adm3_renamed) else name for name in renamed]
+    if day_dim.lower() not in renamed:
+        return None
+    day_idx = renamed.index(day_dim.lower())
+    other_idx = [i for i in range(len(dim_names)) if i != day_idx]
+    names = [renamed[i] for i in other_idx]
+    n_spatial = 0
+    for name in reversed(names):
+        if name not in _SPATIAL_DIMS:
+            break
+        n_spatial += 1
+    leading = names[: len(names) - n_spatial]
+    if not n_spatial or leading not in (["time"], ["time", "number"]) or other_idx[0] != 0:
+        return None
+    return {
+        "dim_names": dim_names,
+        "dim_vals": dim_vals,
+        "adm3_dim_name": adm3_dim_name,
+        "day_idx": day_idx,
+        "other_idx": other_idx,
+        "n_leading": len(leading),
+        "has_members": "number" in leading,
+    }
+
+
+def _named_grid(frame, dim_rename_map, adm3_dim_name):
+    """A grid frame of raw dimension columns, renamed as nc_read_forecast_wide names them."""
+    frame = rename_dimensions(frame, dim_rename_map or {})
+    frame.columns = frame.columns.str.lower()
+    adm3_col_renamed = adm3_dim_name.lower() if adm3_dim_name else None
+    if adm3_col_renamed and adm3_col_renamed in frame.columns:
+        frame = frame.rename(columns={adm3_col_renamed: "id"})
+    if "adm3_name" in frame.columns:
+        frame = frame.rename(columns={"adm3_name": "id"})
+    return frame
+
+
+def _leading_tiles(v, n_times, n_members, member_dim):
+    """(t0, t1, m0, m1) tiles over the leading time (and member) dimensions:
+    whole storage chunks, grown along time to about _READ_SLAB_VALUES values,
+    so each chunk is decompressed exactly once. member_dim is the member
+    dimension's position in the variable, or None."""
+    chunks = v.chunking()
+    if isinstance(chunks, list):
+        time_chunk = int(chunks[0])
+        member_step = int(chunks[member_dim]) if member_dim is not None else n_members
+    else:  # contiguous storage: any slab reads only its own bytes
+        time_chunk, member_step = 1, n_members
+    member_step = max(1, min(n_members, member_step))
+    per_time = int(np.prod(v.shape[1:])) * member_step // max(1, n_members)
+    rows = max(1, _READ_SLAB_VALUES // max(1, per_time))
+    time_step = max(1, min(n_times, max(time_chunk, -(-rows // time_chunk) * time_chunk)))
+    for t0 in range(0, n_times, time_step):
+        for m0 in range(0, n_members, member_step):
+            yield t0, min(n_times, t0 + time_step), m0, min(n_members, m0 + member_step)
+
+
+def forecast_points(nc_path, var_name, dim_rename_map, day_dim="day"):
+    """The forecast variable's spatial points, in file order, as columns named
+    as nc_read_forecast_wide names them (lat/lon, or id); None when the layout
+    isn't one read_forecast_points supports."""
+    import netCDF4 as nc4
+
+    with nc4.Dataset(nc_path) as ds:
+        if var_name not in ds.variables:
+            return None
+        layout = _forecast_layout(ds, var_name, dim_rename_map, day_dim)
+        if layout is None:
+            return None
+        spatial = [layout["dim_names"][i] for i in layout["other_idx"][layout["n_leading"]:]]
+        points = _product_frame(spatial, [layout["dim_vals"][d] for d in spatial])
+        return _named_grid(points, dim_rename_map, layout["adm3_dim_name"])
+
+
+def read_forecast_points(nc_path, var_name, dim_rename_map, spec, keep, *,
+                         spread_over=None, scale=None, day_dim="day", prefix=None,
+                         add_year=True):
+    """nc_read_forecast_wide's rows at the kept spatial points only, read a slab
+    at a time: what reading every row and then filtering gives, row order and
+    dtypes included, without ever holding the whole grid.
+
+    ``keep`` is a boolean mask over forecast_points(). ``scale`` multiplies the
+    rainfall as it is read (as scaling the frame's day columns would). With
+    ``spread_over`` (a mask over the same points), also returns whether any of
+    those points has two or more non-missing members for one issue date and
+    lead day: (frame, member_spread). Returns None for an unsupported layout.
+    """
+    import netCDF4 as nc4
+
+    prefix = prefix or var_name
+    with nc4.Dataset(nc_path) as ds:
+        if var_name not in ds.variables:
+            return None
+        layout = _forecast_layout(ds, var_name, dim_rename_map, day_dim)
+        if layout is None:
+            return None
+        v = ds.variables[var_name]
+        dim_names, dim_vals = layout["dim_names"], layout["dim_vals"]
+        day_idx, other_idx, n_leading = layout["day_idx"], layout["other_idx"], layout["n_leading"]
+        day_positions, day_vals, day_vals_num = _select_forecast_days(
+            dim_vals[dim_names[day_idx]], spec, nc_path
+        )
+        leading_names = [dim_names[i] for i in other_idx[:n_leading]]
+        spatial_names = [dim_names[i] for i in other_idx[n_leading:]]
+        n_points = int(np.prod([len(dim_vals[d]) for d in spatial_names]))
+        keep = np.asarray(keep, dtype=bool)
+        if keep.shape != (n_points,):
+            raise ValueError(f"keep must have one entry per point ({n_points}).")
+        kept = np.flatnonzero(keep)
+        sizes = [len(dim_vals[d]) for d in leading_names]
+        n_times = sizes[0]
+        per_time = int(np.prod(sizes[1:])) if len(sizes) > 1 else 1
+        n_days = len(day_positions)
+
+        # Rows: the leading grid, each row repeated per kept point.
+        leading = _product_frame(leading_names, [dim_vals[d] for d in leading_names])
+        points = _product_frame(spatial_names, [dim_vals[d] for d in spatial_names])
+        n_lead_rows = len(leading)
+        grid = pd.concat(
+            [
+                leading.take(np.repeat(np.arange(n_lead_rows), len(kept))).reset_index(drop=True),
+                points.take(np.tile(kept, n_lead_rows)).reset_index(drop=True),
+            ],
+            axis=1,
+        )
+        grid = _named_grid(grid, dim_rename_map, layout["adm3_dim_name"])
+
+        spread_points = None
+        if spread_over is not None and layout["has_members"]:
+            spread_points = np.flatnonzero(np.asarray(spread_over, dtype=bool))
+            date_codes, distinct_dates = pd.factorize(
+                np.asarray(nc_time_to_dates(dim_vals[leading_names[0]], get_nc_time(ds)["units"]).date)
+            )
+            member_counts = np.zeros(
+                (len(distinct_dates), len(spread_points), n_days), dtype=np.int32
+            )
+
+        perm = other_idx + [day_idx]
+        all_points_spread = spread_points is not None and len(spread_points) == n_points
+        member_spread = False
+        mat = None
+        member_dim = other_idx[1] if layout["has_members"] else None
+        for t0, t1, m0, m1 in _leading_tiles(v, n_times, per_time, member_dim):
+            tile = [slice(None)] * len(dim_names)
+            tile[0] = slice(t0, t1)
+            if member_dim is not None:
+                tile[member_dim] = slice(m0, m1)
+            block = _filled_with_nan(v[tuple(tile)])
+            block = np.transpose(block, perm)[..., day_positions]
+            block = block.reshape(t1 - t0, m1 - m0, n_points, n_days)
+            if spread_points is not None and not member_spread:
+                in_area = block if all_points_spread else block[:, :, spread_points, :]
+                present = (~np.isnan(in_area)).sum(axis=1, dtype=np.int32)
+                del in_area
+                # Members of one tile already giving two values settle it;
+                # otherwise counts add up across member tiles, per issue date.
+                if (present >= 2).any():
+                    member_spread = True
+                else:
+                    for offset, code in enumerate(date_codes[t0:t1]):
+                        member_counts[code] += present[offset]
+                    member_spread = bool((member_counts >= 2).any())
+                del present
+            part = block[:, :, kept, :]
+            del block
+            if scale is not None and scale != 1.0:
+                part = part * scale
+            if mat is None:
+                mat = np.empty((n_lead_rows * len(kept), n_days), dtype=part.dtype)
+            # Rows run time, then member, then point: each time's rows for
+            # members m0:m1 are one contiguous run.
+            for offset, t in enumerate(range(t0, t1)):
+                first = (t * per_time + m0) * len(kept)
+                mat[first:first + (m1 - m0) * len(kept)] = part[offset].reshape(-1, n_days)
+            del part
+        if mat is None:
+            mat = np.empty((0, n_days))
+
+        day_labels = [
+            str(dv_num) if dv_num is not None else str(dv)
+            for dv, dv_num in zip(day_vals, day_vals_num)
+        ]
+        day_df = pd.DataFrame(
+            mat, columns=[f"{prefix}_day_{lab}" for lab in day_labels], copy=False
+        )
+        out = pd.concat([grid, day_df], axis=1)
+        if add_year and "time" in out.columns:
+            tinfo = get_nc_time(ds)
+            if pd.api.types.is_float_dtype(out["time"]) or pd.api.types.is_integer_dtype(out["time"]):
+                out["time"], out["year"] = _row_dates(out["time"].values, tinfo["units"])
+            else:
+                dates = pd.to_datetime(out["time"])
+                out["time"] = dates.date
+                out["year"] = pd.DatetimeIndex(dates).year
+
+    if spread_over is None:
+        return out
+    return out, member_spread
 
 
 def nc_read_groundtruth_long(nc_path, var_name, dim_rename_map, add_year=True,
@@ -1017,10 +1301,8 @@ def nc_read_groundtruth_long(nc_path, var_name, dim_rename_map, add_year=True,
                 else:
                     dim_vals[d] = np.arange(len(v))
 
-        raw = v[:]
-        arr = np.ma.filled(raw, np.nan) if np.ma.isMaskedArray(raw) else np.asarray(raw)
-        grid_rows = list(product(*[dim_vals[d] for d in dim_names]))
-        grid = pd.DataFrame(grid_rows, columns=dim_names)
+        arr = _filled_with_nan(v[:])
+        grid = _product_frame(dim_names, [dim_vals[d] for d in dim_names])
         grid = rename_dimensions(grid, dim_rename_map or {})
         grid.columns = grid.columns.str.lower()
 
@@ -1043,15 +1325,16 @@ def nc_read_groundtruth_long(nc_path, var_name, dim_rename_map, add_year=True,
         if add_year and "time" in grid.columns:
             tinfo = get_nc_time(ds)
             if pd.api.types.is_float_dtype(grid["time"]) or pd.api.types.is_integer_dtype(grid["time"]):
-                dates = nc_time_to_dates(grid["time"].values, tinfo["units"])
-                grid["time"] = dates.date
+                grid["time"], years = _row_dates(grid["time"].values, tinfo["units"])
+                # What pd.to_datetime(grid["time"]).dt.year gives: int32.
+                grid["year"] = years.astype(np.int32)
                 calendar = pd.Series(pd.to_datetime(nc_time_to_dates(
                     tinfo["values"], tinfo["units"]
                 )))
             else:
                 grid["time"] = pd.to_datetime(grid["time"]).dt.date
                 calendar = pd.Series(pd.to_datetime(tinfo["values"]))
-            grid["year"] = pd.to_datetime(grid["time"]).dt.year
+                grid["year"] = pd.to_datetime(grid["time"]).dt.year
 
             calendar = calendar.sort_values().reset_index(drop=True)
             if calendar.isna().any() or calendar.duplicated().any():
@@ -1447,9 +1730,10 @@ def _forecast_start_days(issue_dates, years, ref_onset_dates, day_ints,
     years = np.asarray(years, dtype=int)
     day_ints = np.asarray(day_ints)
 
+    distinct_years, year_codes = np.unique(years, return_inverse=True)
     cutoff_dates = np.array([
-        np.datetime64(f"{year}-{fixed_cutoff_month_day}") for year in years
-    ])
+        np.datetime64(f"{year}-{fixed_cutoff_month_day}") for year in distinct_years
+    ])[year_codes.reshape(-1)]
     cutoff_offsets = (
         cutoff_dates - issue_dates
     ).astype("timedelta64[D]").astype(int)
@@ -1488,12 +1772,12 @@ def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None,
     if params is None:
         params = read_onset_params({"options": {"window": win}})
 
-    t0 = pd.to_datetime(df["time"]).values
+    t0 = _by_distinct(df["time"], pd.to_datetime).values
     th = df["onset_thresh"].values.astype(float)
     yr = df["year"].values.astype(int)
 
     ref_onset_dates = (
-        pd.to_datetime(df["ref_onset_date"]).values
+        _by_distinct(df["ref_onset_date"], pd.to_datetime).values
         if "ref_onset_date" in df.columns
         else np.full(len(df), np.datetime64("NaT"), dtype="datetime64[ns]")
     )
@@ -1580,10 +1864,10 @@ def process_rainfall_forecast_id(df, spec, ref_onset_dt=None, thr_dt=None):
 
     Returns dict: {"wide": DataFrame}
     """
-    df = df.copy()
+    df = working_copy(df)
     df = ensure_id_col(df, spec=spec, context="forecast spatial IDs")
     if "time" in df.columns:
-        df["time"] = pd.to_datetime(df["time"]).dt.date
+        df["time"] = _by_distinct(df["time"], lambda t: pd.to_datetime(t).dt.date)
     if "year" in df.columns:
         df["year"] = df["year"].astype(int)
     if "number" in df.columns:
@@ -1674,6 +1958,105 @@ def process_rainfall_forecast_id(df, spec, ref_onset_dt=None, thr_dt=None):
     return {"wide": wide}
 
 
+def _by_distinct(values, fn):
+    """``fn(values)`` for an elementwise ``fn``, computed once per distinct value.
+
+    ``fn`` takes and returns a Series; the result is aligned to ``values``.
+    Only for values of one Python type (dates, years): factorize would merge
+    equal-hashing values of different types.
+    """
+    codes, distinct = pd.factorize(values, use_na_sentinel=False)
+    mapped = fn(pd.Series(distinct))
+    out = mapped.take(codes)
+    out.index = values.index
+    return out
+
+
+def _later_dates(first, second):
+    """``max(a, b)`` row by row (ties keep ``a``), computed once per distinct pair."""
+    # As objects, the way a row-wise apply hands them to max(): a datetime64
+    # column arrives as Timestamps, not numpy datetime64.
+    codes_a, distinct_a = pd.factorize(first.astype(object).to_numpy(), use_na_sentinel=False)
+    codes_b, distinct_b = pd.factorize(second.astype(object).to_numpy(), use_na_sentinel=False)
+    codes, pair_keys = pd.factorize(codes_a * len(distinct_b) + codes_b)
+    later = np.empty(len(pair_keys), dtype=object)
+    later[:] = [
+        max(distinct_a[key // len(distinct_b)], distinct_b[key % len(distinct_b)])
+        for key in pair_keys
+    ]
+    return later[codes]
+
+
+def _ground_truth_onsets_wide(df, value_col, win, onset_params):
+    """The per-(id, year) onset table of process_ground_truth_rainfall_id.
+
+    ``df`` is sorted by id, year, time, so each (id, year) group is a
+    contiguous run of rows in groupby's (sorted) order; the loop slices
+    arrays instead of materialising each group, with the same per-series
+    onset search.
+    """
+    n = len(df)
+    ids = df["id"].to_numpy()
+    years = df["year"].to_numpy()
+    if n:
+        new_group = np.ones(n, dtype=bool)
+        new_group[1:] = (ids[1:] != ids[:-1]) | (years[1:] != years[:-1])
+        starts = np.flatnonzero(new_group)
+    else:
+        starts = np.array([], dtype=int)
+    ends = np.append(starts[1:], n)
+
+    rain = df[value_col].to_numpy()
+    dates = df["time"].to_numpy()
+    times = pd.to_datetime(df["time"]).to_numpy()
+    start_dates = df["start_date"].to_numpy()
+    thresholds = df["onset_thresh"].to_numpy()
+    cutoff_dates = df["cutoff_date"].to_numpy()
+
+    wide_rows = []
+    for first, end in zip(starts, ends):
+        series = rain[first:end]
+        group_dates = dates[first:end]
+        th = thresholds[first]
+
+        start_pos_arr = np.flatnonzero(times[first:end] >= pd.Timestamp(start_dates[first]).to_datetime64())
+        start_pos = int(start_pos_arr[0]) + 1 if len(start_pos_arr) > 0 else 9999
+
+        if np.all(np.isnan(series)) or len(series) < win or np.isnan(th):
+            onset_idx = None
+            onset_date = None
+        else:
+            wsum_all = roll_sum_na_rm_left(series, win)
+            if len(series) >= 10:
+                sum10 = roll_sum_na_propagate_left(series, 10)
+                bad10 = (~np.isnan(sum10)) & (sum10 < 5)
+                pre_bad = np.concatenate([[0], np.cumsum(bad10.astype(int))])
+                last10start = len(series) - 10 + 1
+            else:
+                pre_bad = np.array([0])
+                last10start = 0
+            onset_idx = find_onset_precomp(series, win, th, wsum_all, pre_bad, last10start,
+                                           start_day=start_pos, reject_if_short_followup=True,
+                                           params=onset_params)
+            onset_date = group_dates[onset_idx - 1] if onset_idx is not None else None
+
+        cutoff_date = cutoff_dates[first]
+        if onset_date is not None:
+            onset_day = (pd.Timestamp(onset_date) - pd.Timestamp(cutoff_date)).days
+        else:
+            onset_day = np.nan
+
+        wide_rows.append({
+            "id": ids[first],
+            "year": years[first],
+            "onset_idx": onset_idx if onset_idx is not None else np.nan,
+            "onset_date": onset_date,
+            "onset_day": onset_day,
+            "cutoff_date": cutoff_date,
+        })
+    return pd.DataFrame(wide_rows)
+
+
 def process_ground_truth_rainfall_id(df, spec, ref_onset_dt=None, thr_dt=None, value_col=None):
     """
     Ground-truth pipeline: compute onset dates per (id, year).
@@ -1681,9 +2064,9 @@ def process_ground_truth_rainfall_id(df, spec, ref_onset_dt=None, thr_dt=None, v
     Returns dict: {"wide": DataFrame, "long": DataFrame or None}. The
     annotated daily-long table is omitted when output.write_long is false.
     """
-    df = df.copy()
+    df = working_copy(df)
     df = ensure_id_col(df, spec=spec, context="ground-truth spatial IDs")
-    df["time"] = pd.to_datetime(df["time"]).dt.date
+    df["time"] = _by_distinct(df["time"], lambda t: pd.to_datetime(t).dt.date)
     df["year"] = df["year"].astype(int)
     df[value_col] = df[value_col].astype(float)
 
@@ -1691,18 +2074,24 @@ def process_ground_truth_rainfall_id(df, spec, ref_onset_dt=None, thr_dt=None, v
     df = attach_ref_onset(df, ref_onset_dt)
 
     cutoff_md = spec["options"]["cutoff_month_day"]
-    df["cutoff_date"] = df["year"].apply(lambda y: pd.Timestamp(f"{y}-{cutoff_md}").date())
+    df["cutoff_date"] = _by_distinct(
+        df["year"], lambda y: y.apply(lambda y: pd.Timestamp(f"{y}-{cutoff_md}").date())
+    )
     df["start_date"] = df["cutoff_date"]
     mask = ~df["ref_onset_date"].isna()
-    df.loc[mask, "start_date"] = df.loc[mask].apply(
-        lambda r: max(r["cutoff_date"], r["ref_onset_date"]), axis=1
-    )
+    if mask.any():
+        df.loc[mask, "start_date"] = _later_dates(
+            df.loc[mask, "cutoff_date"], df.loc[mask, "ref_onset_date"]
+        )
 
     df = df.sort_values(["id", "year", "time"])
     #win = int(spec["options"]["window"])
     onset_params = read_onset_params(spec)
     win = onset_params.win
     write_long = spec.get("output", {}).get("write_long", True)
+    if not write_long:
+        wide = _ground_truth_onsets_wide(df, value_col, win, onset_params)
+        return {"wide": wide, "long": None}
 
     wide_rows = []
     long_rows = [] if write_long else None

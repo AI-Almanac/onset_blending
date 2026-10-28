@@ -13,11 +13,13 @@ import os
 from dataclasses import dataclass
 import patsy
 import pickle
+import tempfile
 import warnings
 import numpy as np
 import pandas as pd
 from multiprocessing import get_context
 from scipy.special import logit, expit
+from scipy.stats import rankdata
 from scipy.stats import ks_2samp
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
@@ -562,21 +564,34 @@ def platt_cv_multibin(df, prob_cols, holdout_years, true_holdout_years=(),
     bins = prob_cols
     out_list = []
 
+    # Per-row inputs every fold reads, computed once (each fold used to filter
+    # and copy the whole table and compare every outcome to every bin): a
+    # fold's training rows are then positions into these arrays.
+    years = df[year_col].to_numpy()
+    outside_true_holdout = ~df[year_col].isin(true_holdout_years).to_numpy()
+    if allowed_cells is not None:
+        allowed = df["id"].isin(set(allowed_cells["id"])).to_numpy()
+    else:
+        allowed = np.ones(len(df), dtype=bool)
+    outcome = df[outcome_col]
+    outcome_known = outcome.notna()
+    p_all = {b: np.clip(df[b].values.astype(float), 1e-6, 1 - 1e-6) for b in bins}
+    y_all = {
+        b: (outcome == b).astype(float).where(outcome_known, np.nan).to_numpy()
+        for b in bins
+    }
+
     for test_year in holdout_years:
-        train = df[(df[year_col] != test_year) & (~df[year_col].isin(true_holdout_years))].copy()
-        test = df[df[year_col] == test_year].copy()
+        test_rows = years == test_year
+        test = df[test_rows].copy()
         if test.empty:
             continue
-        if allowed_cells is not None:
-            allowed_ids = set(allowed_cells["id"])
-            train = train[train["id"].isin(allowed_ids)]
+        train_positions = np.flatnonzero((years != test_year) & outside_true_holdout & allowed)
 
         cal_mat = np.full((len(test), len(bins)), np.nan)
         for j, b in enumerate(bins):
-            p_tr = np.clip(train[b].values.astype(float), 1e-6, 1 - 1e-6)
-            outcome = train[outcome_col]
-            y_tr = ((outcome == b).astype(float)
-                    .where(outcome.notna(), np.nan).to_numpy())
+            p_tr = p_all[b][train_positions]
+            y_tr = y_all[b][train_positions]
             ok = np.isfinite(p_tr) & ~np.isnan(y_tr)
             if ok.sum() < 10 or len(np.unique(y_tr[ok])) < 2:
                 cal_mat[:, j] = test[b].values.astype(float)
@@ -588,7 +603,7 @@ def platt_cv_multibin(df, prob_cols, holdout_years, true_holdout_years=(),
             clf.fit(X, y_tr[ok])
 
             # Predict on test using raw probability
-            test_p = np.clip(test[b].values.astype(float), 1e-6, 1 - 1e-6).reshape(-1, 1)
+            test_p = p_all[b][test_rows].reshape(-1, 1)
             cal_mat[:, j] = expit(clf.intercept_[0] + clf.coef_[0][0] * test_p.flatten())
 
         rs = cal_mat.sum(axis=1, keepdims=True)
@@ -881,12 +896,28 @@ def apply_formula_sample_support(data, formulas):
 
 
 _GLOBAL_CV_WORKER_CONTEXT = None
+_GLOBAL_CV_WORKER_THREAD_LIMIT = None
 
 
-def _initialize_global_cv_worker(context):
-    """Install shared global-CV inputs once in each worker process."""
-    global _GLOBAL_CV_WORKER_CONTEXT
+def _initialize_global_cv_worker(context, blas_threads=None):
+    """Install shared global-CV inputs once in each worker process.
+
+    ``blas_threads`` caps the worker's BLAS/OpenMP pools: each worker would
+    otherwise start one thread per core, so N workers oversubscribe the
+    machine N times over.
+    """
+    global _GLOBAL_CV_WORKER_CONTEXT, _GLOBAL_CV_WORKER_THREAD_LIMIT
+    if isinstance(context, str):
+        # A path to the pickled context, written once by the parent.
+        with open(context, "rb") as handle:
+            context = pickle.load(handle)
     _GLOBAL_CV_WORKER_CONTEXT = context
+    if blas_threads:
+        try:
+            from threadpoolctl import threadpool_limits
+        except ImportError:  # scikit-learn installs it; without it, no cap
+            return
+        _GLOBAL_CV_WORKER_THREAD_LIMIT = threadpool_limits(limits=int(blas_threads))
 
 
 def _compute_global_cv_fold(test_year, context=None):
@@ -909,7 +940,8 @@ def _compute_global_cv_fold(test_year, context=None):
         & (data_train["year"] != test_year)
         & (~data_train["year"].isin(true_holdout_years))
     ]
-    test = data_pred[data_pred["year"] == test_year]
+    test_positions = np.flatnonzero(data_pred["year"].to_numpy() == test_year)
+    test = data_pred.iloc[test_positions]
     if test.empty:
         raise ValueError(f"Global CV holdout year {test_year} has no test rows.")
     if train.empty:
@@ -943,9 +975,6 @@ def _compute_global_cv_fold(test_year, context=None):
             f"Global CV model fitting failed for holdout year {test_year}."
         )
 
-    result = pd.concat(
-        [test.reset_index(drop=True), preds.reset_index(drop=True)], axis=1
-    )
     coef_artifact = None
     if context["save_coefs"]:
         rows = []
@@ -965,7 +994,18 @@ def _compute_global_cv_fold(test_year, context=None):
             "features": actual_features,
             "formula": formula_str,
         }
-    return test_year, result, coef_artifact
+    # The fold's rows go back as positions: the caller has every column of
+    # them, so workers can hold just the columns a fit reads.
+    return test_year, test_positions, preds, coef_artifact
+
+
+def _fit_columns(data, formula_str, extra):
+    """The columns of ``data`` a fold's fit reads, or None when the formula
+    names something other than plain columns (then the whole frame is used)."""
+    features = _parse_formula_cols(formula_str)
+    if not features or any(column not in data.columns for column in features):
+        return None
+    return list(dict.fromkeys([*features, *extra]))
 
 
 def compute_cv_global(formula_str, data_train, holdout_years, training_years,
@@ -990,11 +1030,15 @@ def compute_cv_global(formula_str, data_train, holdout_years, training_years,
         raise ValueError("n_jobs must be a positive integer.")
 
     holdout_years = list(holdout_years)
+    # Workers get only the columns a fit reads: each holds its own copy of
+    # these frames, and the full tables, times the workers, ran to tens of GB.
+    train_columns = _fit_columns(data_train, formula_str, ["year", "outcome"])
+    pred_columns = _fit_columns(data_pred, formula_str, ["year"])
     context = {
         "formula_str": formula_str,
         "feature_cols": feature_cols,
-        "data_train": data_train,
-        "data_pred": data_pred,
+        "data_train": data_train if train_columns is None else data_train[train_columns],
+        "data_pred": data_pred if pred_columns is None else data_pred[pred_columns],
         "training_years": tuple(training_years),
         "true_holdout_years": tuple(true_holdout_years),
         "required_classes": (
@@ -1008,14 +1052,21 @@ def compute_cv_global(formula_str, data_train, holdout_years, training_years,
             f"  Fitting {len(holdout_years)} global CV folds with "
             f"{worker_count} workers."
         )
-        with get_context("spawn").Pool(
-            processes=worker_count,
-            initializer=_initialize_global_cv_worker,
-            initargs=(context,),
-        ) as pool:
-            fold_results = list(
-                pool.imap(_compute_global_cv_fold, holdout_years)
-            )
+        blas_threads = max(1, (os.cpu_count() or 1) // worker_count)
+        # Each worker loads the context from one file: passed as initargs, it
+        # is pickled again for every worker, one worker after another.
+        with tempfile.TemporaryDirectory(prefix="global-cv-") as tmp:
+            context_path = os.path.join(tmp, "context.pkl")
+            with open(context_path, "wb") as handle:
+                pickle.dump(context, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            with get_context("spawn").Pool(
+                processes=worker_count,
+                initializer=_initialize_global_cv_worker,
+                initargs=(context_path, blas_threads),
+            ) as pool:
+                fold_results = list(
+                    pool.imap(_compute_global_cv_fold, holdout_years)
+                )
     else:
         fold_results = [
             _compute_global_cv_fold(test_year, context)
@@ -1025,11 +1076,21 @@ def compute_cv_global(formula_str, data_train, holdout_years, training_years,
     if not fold_results:
         raise ValueError("Global CV produced no fold predictions.")
     cv_preds = pd.concat(
-        [result[1] for result in fold_results], ignore_index=True
+        [
+            pd.concat(
+                [
+                    data_pred.iloc[positions].reset_index(drop=True),
+                    preds.reset_index(drop=True),
+                ],
+                axis=1,
+            )
+            for _, positions, preds, _ in fold_results
+        ],
+        ignore_index=True,
     )
     coefs_by_year = {
         test_year: coef_artifact
-        for test_year, _, coef_artifact in fold_results
+        for test_year, _, _, coef_artifact in fold_results
         if coef_artifact is not None
     }
     return cv_preds, coefs_by_year
@@ -1156,7 +1217,9 @@ def _fast_auc(y01, score):
     n0 = float(np.sum(y == 0))
     if n1 == 0 or n0 == 0:
         return np.nan
-    ranks = pd.Series(s).rank(method="average").values
+    # The same average ranks as pd.Series(s).rank(method="average"), without
+    # building a Series per call (this runs once per cell per metric).
+    ranks = rankdata(s, method="average")
     return (np.sum(ranks[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
 
 
@@ -1226,12 +1289,14 @@ def compute_cell_metrics_fast(df, allowed_cells=None):
 
     # --- Per-cell metrics ---
     rows = []
-    for cell_id, g_idx in sub.groupby("id").groups.items():
+    grouped = sub.groupby("id")
+    positions = grouped.indices  # the rows' positions; sub's index is 0..n-1
+    for cell_id, g_idx in grouped.groups.items():
         #g_P5 = P5[sub.index.get_indexer(g_idx)]
         #g_Y5 = Y5[sub.index.get_indexer(g_idx)]
         #g_Prps = P_rps[sub.index.get_indexer(g_idx)]
         #g_Yrps = Y_rps[sub.index.get_indexer(g_idx)]
-        pos = sub.index.get_indexer(g_idx)       # now safe: index is contiguous, no -1s
+        pos = positions[cell_id]
         g_P5 = P5[pos]
         g_Y5 = Y5[pos]
         g_Prps = P_rps[pos]

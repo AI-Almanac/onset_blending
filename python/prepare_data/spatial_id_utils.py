@@ -159,9 +159,21 @@ def infer_grid_id_convention(lat, lon, max_digits=12,
     )
 
 
+def _distinct_stripped_ids(ids):
+    """``pd.Series(ids, dtype="string").dropna().str.strip().unique()`` as a list,
+    converting only the distinct values: ID columns repeat a few thousand IDs
+    over millions of rows. First-appearance order is preserved, since the
+    distinct raw values are themselves in first-appearance order."""
+    ids = pd.Series(ids)
+    if ids.dtype == object and pd.api.types.infer_dtype(ids, skipna=True) not in ("string", "empty"):
+        return pd.Series(ids, dtype="string").dropna().str.strip().unique().tolist()
+    distinct = pd.unique(ids)
+    return pd.Series(distinct, dtype="string").dropna().str.strip().unique().tolist()
+
+
 def infer_grid_id_convention_from_ids(ids):
     """Infer a convention that reproduces established grid-ID strings exactly."""
-    values = pd.Series(ids, dtype="string").dropna().str.strip().unique().tolist()
+    values = _distinct_stripped_ids(ids)
     if not values:
         return None
     parsed = [parse_grid_id(value) for value in values]
@@ -191,7 +203,7 @@ def infer_grid_id_convention_from_ids(ids):
 
 
 def _convention_reproduces_ids(convention, ids):
-    values = pd.Series(ids, dtype="string").dropna().str.strip().unique().tolist()
+    values = _distinct_stripped_ids(ids)
     parsed = [parse_grid_id(value) for value in values]
     if not values or any(value is None for value in parsed):
         return False
@@ -234,15 +246,49 @@ def resolve_grid_id_convention(spec=None, lat=None, lon=None,
     return convention
 
 
+# pandas 3 is always copy-on-write; pandas 2 only when enabled.
+_COPY_ON_WRITE = int(pd.__version__.split(".")[0]) >= 3 or bool(
+    getattr(pd.options.mode, "copy_on_write", False) is True
+)
+
+
+def working_copy(df):
+    """A copy of ``df`` that can have columns added, replaced, or modified
+    without touching ``df``. Under copy-on-write a shallow copy is exactly
+    that (pandas copies a column only when it is modified), so large frames
+    aren't duplicated up front; otherwise this is a deep copy."""
+    return df.copy(deep=not _COPY_ON_WRITE)
+
+
 def normalize_id_series(values, context="spatial IDs"):
-    """Normalize string IDs without coercing codes through numeric types."""
+    """Normalize string IDs without coercing codes through numeric types.
+
+    Normalizes each distinct ID once and maps the result back: an ID column
+    repeats a few thousand IDs over millions of rows.
+    """
     values = pd.Series(values, copy=True)
-    missing = values.isna()
-    normalized = values.astype("string").str.strip()
-    invalid = missing | normalized.isna() | normalized.eq("")
-    if invalid.any():
+    if values.dtype == object and pd.api.types.infer_dtype(values, skipna=True) not in (
+        "string",
+        "empty",
+    ):
+        # Mixed objects: factorize would merge equal-hashing values of different
+        # types (1 and 1.0) that convert to different strings.
+        missing = values.isna()
+        normalized = values.astype("string").str.strip()
+        invalid = missing | normalized.isna() | normalized.eq("")
+        if invalid.any():
+            raise ValueError(f"{context} contain missing or empty values.")
+        return normalized.astype(str)
+    codes, distinct = pd.factorize(values, use_na_sentinel=True)
+    if (codes < 0).any():
         raise ValueError(f"{context} contain missing or empty values.")
-    return normalized.astype(str)
+    normalized = pd.Series(distinct).astype("string").str.strip()
+    if (normalized.isna() | normalized.eq("")).any():
+        raise ValueError(f"{context} contain missing or empty values.")
+    out = normalized.astype(str).take(codes)
+    out.index = values.index
+    out.name = values.name
+    return out
 
 
 def validate_id_coordinate_consistency(df, id_col="id", context="spatial IDs"):
@@ -264,7 +310,7 @@ def validate_id_coordinate_consistency(df, id_col="id", context="spatial IDs"):
 def ensure_spatial_id_col(df, id_col="id", spec=None, convention=None,
                           force_latlon=False, context="spatial data"):
     """Return a copy with a normalized ID, deriving grid IDs when necessary."""
-    out = df.copy()
+    out = working_copy(df)
     if id_col in out.columns and not force_latlon:
         out[id_col] = normalize_id_series(out[id_col], context=context)
         return out

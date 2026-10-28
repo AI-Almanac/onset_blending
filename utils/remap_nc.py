@@ -12,6 +12,44 @@ from python.prepare_data.sparse_transform_utils import (
 )
 
 
+# Values per slab worth one pass of slab overhead (~128 MB as float64).
+_SLAB_VALUES = 1 << 24
+
+
+def _leading_slabs(da, other_dims):
+    """Index slices over the first non-spatial dimension: whole storage chunks
+    (each decompressed once), enough of them to hold at least _SLAB_VALUES."""
+    if not other_dims:
+        return [()]
+    size = da.sizes[other_dims[0]]
+    chunks = da.encoding.get("chunksizes")
+    chunk = int(chunks[list(da.dims).index(other_dims[0])]) if chunks else 1
+    per_row = max(1, int(np.prod([n for d, n in da.sizes.items() if d != other_dims[0]])))
+    rows = max(1, _SLAB_VALUES // per_row)
+    step = max(chunk, -(-rows // chunk) * chunk)
+    step = max(1, min(size, step))
+    return [(slice(start, min(size, start + step)),) for start in range(0, size, step)]
+
+
+def _observed_mean_of(ordered, transform, fill_val, n_sources):
+    """The weighted mean over sources of an (other..., lat, lon) array: what the
+    whole-array code computed, for one slab of it."""
+    raw = ordered.values
+    values = np.asarray(raw, dtype=float)
+    if fill_val is not None:
+        # What da.where(da != fill_val) did, without a masked copy of the whole
+        # array: compared in the variable's own dtype.
+        sentinel = raw == fill_val
+        if values is raw:
+            values = values.copy()
+        values[sentinel] = np.nan
+    other_shape = values.shape[:-2]
+    source_values = values.reshape((-1, n_sources)).T
+    return sparse_observed_weighted_mean(transform, source_values).T.reshape(
+        other_shape + (len(transform.target_ids),)
+    )
+
+
 def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None):
     # 1. Load mapping
     mapping = normalize_regrid_weights(
@@ -45,7 +83,9 @@ def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None)
         # Open with mask_and_scale=True so _FillValue=-99 is automatically
         # masked to NaN before any arithmetic. This was the main data bug:
         # -99 fill values were being included in the weighted sum.
-        with xr.open_dataset(file_path, mask_and_scale=True) as ds:
+        # cache=False: indexing a slab then reads just that slab, where the
+        # default cache loads the whole variable on first access.
+        with xr.open_dataset(file_path, mask_and_scale=True, cache=False) as ds:
             # Standardize spatial coord names so we always work in lat/lon
             # (input files may use latitude/longitude, e.g. the IMD grids).
             rename_ll = {}
@@ -79,18 +119,20 @@ def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None)
                     fill_val = da.encoding.get('_FillValue', None) or \
                                da.attrs.get('_FillValue', None) or \
                                da.attrs.get('missing_value', None)
-                    if fill_val is not None:
-                        da = da.where(da != fill_val)
 
                     other_dims = [dim for dim in da.dims if dim not in ('lat', 'lon')]
                     ordered = da.transpose(*other_dims, 'lat', 'lon')
                     other_shape = tuple(ordered.sizes[dim] for dim in other_dims)
-                    source_values = np.asarray(ordered.values, dtype=float).reshape(
-                        (-1, len(source_ids))
-                    ).T
-                    transformed = sparse_observed_weighted_mean(
-                        transform, source_values
-                    ).T.reshape(other_shape + (len(transform.target_ids),))
+                    transformed = np.empty(other_shape + (len(transform.target_ids),))
+                    # One slab of the leading dimension at a time (a storage
+                    # chunk's worth): each value column is averaged on its own,
+                    # so the result is the same as for the whole array, at a
+                    # fraction of the memory.
+                    for slab in _leading_slabs(da, other_dims):
+                        transformed[slab] = _observed_mean_of(
+                            ordered[slab] if other_dims else ordered,
+                            transform, fill_val, len(source_ids),
+                        )
                     result = xr.DataArray(
                         transformed,
                         dims=other_dims + ['adm3_name'],
