@@ -1,0 +1,48 @@
+# India monsoon onset: IMD observations blended with AIFS ENS v2 and AIFS v2,
+# configured as ai-almanac runs it (one file, every fact stated once).
+name: india_aifs
+
+domain:
+  grid_ids: {decimal_digits: 2, format: fixed}      # "6.50_70.25"
+
+observations:
+  files: {folder: datasets/india/obs, pattern: '^data_\d{4}\.nc$'}
+  variable: RAINFALL
+  dims: {TIME: time, LATITUDE: lat, LONGITUDE: lon}
+
+models:
+  - name: aifs_ensv2
+    files: {folder: datasets/india/models/AIFS_ENS_v2, years: 2000:2025}
+    variable: tp
+    dims: {time: time, prediction_timedelta_daily: day, number: number}
+    unit_scale: 1000.0                                # m -> mm
+    rain_predictors: [{agg: diff, window: trigger}]
+  - name: aifsv2
+    files: {folder: datasets/india/models/AIFS_v2, years: 2000:2025}
+    variable: tp
+    dims: {time: time, prediction_timedelta_daily: day}
+    unit_scale: 1000.0
+    rain_predictors: [{agg: diff, window: trigger}]
+
+onset:
+  threshold: {mm: 20}
+  season_start: "05-01"
+  reference_onset: {month_day: "06-01"}
+  definition:
+    window: 3
+    wet_day_min_mm: 1.0
+    follow_days: 21
+    dry_spell: {mode: consecutive_dry, min_dry_days: 5, dry_day_min_mm: 1.0}
+
+climatology:
+  forecast_window: 45
+  issue_end: "07-31"
+
+evaluation:
+  cutoff_mode: fixed_cutoff
+  years:
+    training: 2000:2020
+    cv_holdout: 2000:2020
+    true_holdout: 2021:2025
+  formulas:
+    blended_model: outcome ~ prob_clim_qx * diff_aifs_ensv2_qx * diff_aifsv2_qx

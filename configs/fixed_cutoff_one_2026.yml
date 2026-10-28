@@ -1,0 +1,114 @@
+# Converted from the stage specs by onset_blending.legacy_specs.
+#   ground_truth: specs/raw_data/ref_rain_fixed_cutoff_2026.yml
+#   forecast[aifs_ens]: specs/raw_data/aifs_ens_2026.yml
+#   forecast[aifs]: specs/raw_data/aifs_2026.yml
+#   combine: specs/combine/combine_template_fixed_cutoff_2026.yml
+#   connect: specs/2025_blend/connect_fixed_cutoff_2026.yml
+#   cv_models: specs/2025_blend/cv_models_fixed_cutoff_one_2026.yml
+# Not carried over:
+#   - ground_truth: input.parallel (a run setting, not part of the blend)
+#   - ground_truth: input.workers (a run setting, not part of the blend)
+#   - ground_truth: output (derived from the config)
+#   - ground_truth: options.fixed_cutoff_month_day (only forecast processing reads it)
+#   - ground_truth: paths.climatology_out_dir (derived from the config)
+#   - ground_truth: paths.climatology_out_stem (derived from the config)
+#   - ground_truth: input.gt_path (derived from the config)
+#   - forecast[aifs_ens]: input.parallel (a run setting, not part of the blend)
+#   - forecast[aifs_ens]: input.workers (a run setting, not part of the blend)
+#   - forecast[aifs_ens]: output (derived from the config)
+#   - forecast[aifs_ens]: input.wide_prefix (derived from the config)
+#   - forecast[aifs]: input.parallel (a run setting, not part of the blend)
+#   - forecast[aifs]: input.workers (a run setting, not part of the blend)
+#   - forecast[aifs]: output (derived from the config)
+#   - forecast[aifs]: input.wide_prefix (derived from the config)
+#   - combine: input.ground_truth_wide_rds (derived from the config)
+#   - combine: output (derived from the config)
+#   - combine: forecasts.aifs_ens.daily[].add_plus (connect never reads the plus columns)
+#   - combine: forecasts.aifs.sources[].prob_col (no code reads it)
+#   - combine: forecasts.aifs.daily[].add_plus (connect never reads the plus columns)
+#   - combine: type (no code reads it)
+#   - combine: options.plus_label_template (no code reads it)
+#   - combine: options.default_prob_col (no code reads it)
+#   - combine: climatology.max_day (no code reads it)
+#   - combine: climatology.prob_col (no code reads it)
+#   - connect: input_rds (derived from the config)
+#   - connect: output_rds (derived from the config)
+#   - connect: onset_spec 'ref_rain_fixed_cutoff_2026' (rain windows now resolve against the one onset definition)
+#   - connect: mode (no code reads it)
+#   - cv_models: run.MR (no code reads it)
+#   - cv_models: run.pipeline_input_dir (derived from the config)
+#   - cv_models: run.pipeline_output_dir (set outputs.dir instead)
+#   - cv_models: models.window_variants[0] (disabled)
+#   - cv_models: mme.mc_cores (no code reads it)
+name: fixed_cutoff_one_2026
+domain:
+  dissemination:
+    file: Monsoon_Data/dissemination_cells.csv
+observations:
+  files:
+    folder: /Users/bodong/Code/project/ROMP/data/ENACTS
+    pattern: ^[0-9]{4}_adm3\.nc$
+  variable: precip
+  dims:
+    TIME: time
+    time: time
+models:
+- name: aifs_ens
+  files:
+    folder: /Users/bodong/Code/project/forecast/aifs_ens_v2
+    pattern: ^2026.*_adm3\.nc$
+    years: 2026
+  dims:
+    time: time
+    day: day
+    number: number
+  max_member: 30
+  rain_predictors:
+  - agg: diff
+- name: aifs
+  files:
+    folder: /Users/bodong/Code/project/forecast/aifs_v2
+    pattern: ^2026.*_adm3\.nc$
+    years: 2026
+  dims:
+    time: time
+    day: day
+    number: number
+  rain_predictors:
+  - agg: diff
+onset:
+  definition:
+    window: 3
+    dry_spell:
+      min_dry_days: 5
+  threshold:
+    file: Monsoon_Data/reference/thresholds_df.csv
+    id_col: adm3_name
+    value_col: onset_threshold
+  reference_onset:
+    file: Monsoon_Data/reference/MOK Onset May.csv
+    year_col: Year
+    day_col: MOK
+    base_date: 05-01
+climatology:
+  cv_by_year: false
+  train_years: 2000:2022
+  test_years: 2026
+  workers: 4
+evaluation:
+  years:
+    training: 2000:2022
+    cv_holdout: 2026
+  formulas:
+    blended_model:
+      text: outcome ~ prob_clim_qx * diff_aifs_qx
+  forecasts:
+  - model: aifs
+    variant: fixed_cutoff
+    raw: false
+  mme:
+    sources:
+    - name: clim_raw
+    - name: aifs
+      source: forecast
+      cal_variant: fixed_cutoff
