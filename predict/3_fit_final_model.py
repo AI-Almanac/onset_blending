@@ -4,6 +4,8 @@
 Fits the blending model on ALL available training years (no holdout),
 and saves the resulting coefficient bundle for use in future-year prediction.
 
+A command-line wrapper over onset_blending.model.fit_final().
+
 This is the "production" model — unlike the CV models in 1_blend_evaluation.py
 which each hold out one year, this uses every year of data to fit the best
 possible model for forecasting future (unseen) years.
@@ -44,107 +46,25 @@ os.chdir(REPO_ROOT)
 # ------------------------------------------
 import pickle
 import argparse
-import warnings
-import itertools
-import numpy as np
+import logging
 import pandas as pd
-import patsy
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 
 from onset_blending._legacy.blend_evaluation_utils import (
     DEFAULT_PIPELINE_INPUT_ROOT,
-    apply_formula_sample_support,
-    build_formulas_from_spec,
-    expand_formula_str,
-    make_cutoff_tag,
     resolve_blend_input_path,
-    resolve_climatology_weeks,
-    restrict_to_allowed,
-    _make_multinom_clf,
-)
-from onset_blending._legacy.misc import coalesce, interval_bins
-from onset_blending._legacy.nc_utils import ensure_id_col
-from onset_blending._legacy.spatial_id_utils import (
-    resolve_grid_id_convention,
-    validate_id_coordinate_consistency,
 )
 from onset_blending._legacy.read_spec import load_spec
+from onset_blending.evaluation import RunSettings
+from onset_blending.model import fit_final
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def fit_final_model(formula_str, train_df):
-    """
-    Fit multinomial logistic regression on all training rows.
-
-    Parameters
-    ----------
-    formula_str : str  e.g. "outcome ~ a + b + a:b"
-    train_df    : DataFrame — all training rows (all years, allowed cells)
-
-    Returns
-    -------
-    bundle : dict with keys coefs, scaler, features, formula
-    """
-    # Build design matrix via patsy (handles interaction terms)
-    rhs  = formula_str.split("~", 1)[1].strip() if "~" in formula_str else formula_str
-    X_df = patsy.dmatrix(
-        rhs, train_df, return_type="dataframe",
-        NA_action=patsy.NAAction(NA_types=[])
-    )
-    X_df = X_df.drop(columns=["Intercept"], errors="ignore")
-    feature_cols = list(X_df.columns)
-
-    # Build outcome vector — keep only string outcomes (drop NaN)
-    y = train_df["outcome"].values
-    valid = np.array([isinstance(v, str) for v in y])
-    X_vals = X_df.values.astype(float)
-
-    # Also drop rows with NaN/Inf features
-    finite = np.isfinite(X_vals).all(axis=1)
-    mask   = valid & finite
-
-    X_fit = X_vals[mask]
-    y_fit = y[mask]
-
-    if len(np.unique(y_fit)) < 2:
-        raise ValueError("Fewer than 2 outcome classes in training data — cannot fit model.")
-
-    print(f"  Training rows used : {mask.sum()} / {len(train_df)}")
-    print(f"  Outcome classes    : {sorted(np.unique(y_fit))}")
-    print(f"  Feature columns    : {len(feature_cols)}")
-
-    # Scale features
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_fit)
-
-    # Fit model
-    clf = _make_multinom_clf()
-    clf.fit(X_scaled, y_fit)
-    clf.feature_names = feature_cols
-    clf.scaler_       = scaler
-
-    # Build coef DataFrame
-    rows = []
-    for i, cls in enumerate(clf.classes_):
-        for j, feat in enumerate(feature_cols):
-            rows.append({
-                "class":       cls,
-                "feature":     feat,
-                "coefficient": float(clf.coef_[i, j]),
-                "intercept":   float(clf.intercept_[i]),
-            })
-    coef_df = pd.DataFrame(rows)
-
-    return {
-        "coefs":    coef_df,
-        "scaler":   scaler,
-        "features": feature_cols,
-        "formula":  formula_str,
-    }
+def _read_pickle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
 def print_coef_table(coef_df, model_name, label):
@@ -209,122 +129,37 @@ def main():
                              "pipeline input subdirectory")
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+
     # ── Load spec ──────────────────────────────────────────────────────
     spec = load_spec(args.spec_id, "2025_blend")
     run_cfg = spec.get("run", {})
-    cutoff_mode = coalesce(run_cfg.get("cutoff_mode"), "ref_onset")
-    training_years = list(map(
-        int,
-        coalesce(run_cfg.get("training_years"), list(range(2000, 2025))),
-    ))
-    true_holdout_years = set(map(
-        int, coalesce(run_cfg.get("true_holdout_years"), [])
-    ))
-    fit_years = [
-        year for year in training_years if year not in true_holdout_years
-    ]
+    run = RunSettings.from_spec(spec)
+    fit_years = run.fit_years
     out_dir = args.out_dir or "Monsoon_Data/results/2025_model_evaluation"
     os.makedirs(out_dir, exist_ok=True)
 
     # ── Load input data ────────────────────────────────────────────────
     input_path = resolve_blend_input_path(
-        cutoff_mode,
+        run.cutoff_mode,
         run_cfg,
         input_path=args.input_path,
         pipeline_input_root=args.pipeline_input_dir,
     )
     print(f"\nLoading wide_df from: {input_path}")
-    with open(input_path, "rb") as f:
-        wide_df = pickle.load(f)
-    print(f"  Total rows in wide_df : {len(wide_df)}")
-
-    # ── Normalize input and dissemination IDs ──────────────────────
-    wide_df = ensure_id_col(wide_df, spec=spec, context="blend input IDs")
-    id_convention = resolve_grid_id_convention(
-        spec=spec,
-        authoritative_ids=wide_df["id"],
-        context="blend input/dissemination ID handoff",
-    )
-
-    cell_cfg = spec["cell"]
     dissemination_csv = (
         args.dissem_file
-        or cell_cfg.get("dissemination")
+        or spec["cell"].get("dissemination")
         or "Monsoon_Data/dissemination_cells.csv"
     )
-    dissemination_input = pd.read_csv(dissemination_csv, dtype=str)
-    dissemination_id_col = cell_cfg.get("id_col") or cell_cfg.get(
-        "dissemination_id_col"
-    )
-    if dissemination_id_col:
-        if dissemination_id_col not in dissemination_input.columns:
-            raise ValueError(
-                f"cell.id_col '{dissemination_id_col}' not found. "
-                f"Found: {dissemination_input.columns.tolist()}"
-            )
-        dissemination_input = dissemination_input.rename(
-            columns={dissemination_id_col: "id"}
-        )
-    dissemination_cells = ensure_id_col(
-        dissemination_input,
-        spec=spec,
-        convention=id_convention,
-        context="blend dissemination IDs",
-    )
-    validate_id_coordinate_consistency(
-        dissemination_cells, context="blend dissemination IDs"
-    )
-    dissemination_cells = dissemination_cells.drop_duplicates("id")
-
-    _, clim_weeks = resolve_climatology_weeks(spec, wide_df)
-    n_bins = max(clim_weeks)
-
-    # ── Get formula ────────────────────────────────────────────────────
-    formulas = build_formulas_from_spec(
-        spec, cutoff_mode, data=wide_df, n_bins=n_bins
-    )
-    if args.model not in formulas:
-        raise ValueError(
-            f"Model '{args.model}' not found in spec formulas. "
-            f"Available: {list(formulas.keys())}"
-        )
-    formula_str = formulas[args.model]
-    wide_df, support = apply_formula_sample_support(wide_df, formulas)
-    print(
-        "Formula sample support "
-        f"({support['policy']}): {support['rows_before']} -> "
-        f"{support['rows_after']} rows "
-        f"({support['rows_excluded']} excluded)"
-    )
-
-    wide_df_allowed = restrict_to_allowed(wide_df, dissemination_cells)
-    train_df = wide_df_allowed[wide_df_allowed["year"].isin(fit_years)].copy()
-    if train_df.empty:
-        raise ValueError(
-            "Final fit has no rows in the configured training years and "
-            "dissemination cells."
-        )
-    required_classes = interval_bins(n_bins)
-    present_classes = {
-        value for value in train_df["outcome"].unique()
-        if isinstance(value, str)
-    }
-    missing_classes = [
-        value for value in required_classes if value not in present_classes
-    ]
-    if missing_classes:
-        raise ValueError(
-            "Final-fit training rows are missing outcome classes: "
-            + ", ".join(missing_classes)
-        )
-
-    print(f"  Training years        : {sorted(fit_years)}")
-    print(f"  Training rows (allowed cells) : {len(train_df)}")
-    print(f"\nFormula : {formula_str}")
+    dissemination = pd.read_csv(dissemination_csv, dtype=str)
 
     # ── Fit model on all training years ───────────────────────────────
-    print(f"\nFitting {args.model} on all {len(fit_years)} training years...")
-    bundle = fit_final_model(formula_str, train_df)
+    # The table goes straight in, so only fit_final's copies of it stay alive.
+    model = fit_final(
+        _read_pickle(input_path), spec, dissemination, model_name=args.model
+    )
+    bundle = model.to_legacy_bundle()
 
     # ── Print and save ────────────────────────────────────────────────
     print_coef_table(

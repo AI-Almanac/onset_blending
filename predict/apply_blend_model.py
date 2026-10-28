@@ -72,8 +72,6 @@ import argparse
 import warnings
 import numpy as np
 import pandas as pd
-import patsy                                                                  # ← NEW
-from scipy.special import expit
 
 
 from onset_blending._legacy.blend_evaluation_utils import (
@@ -84,16 +82,14 @@ from onset_blending._legacy.blend_evaluation_utils import (
     make_cutoff_tag,
     make_year_tag,
     resolve_blend_input_path,
-    restrict_to_allowed,
-    _parse_formula_cols,
 )
 from onset_blending._legacy.read_spec import load_spec
-from onset_blending._legacy.misc import coalesce
 from onset_blending._legacy.nc_utils import ensure_id_col
 from onset_blending._legacy.spatial_id_utils import (
     resolve_grid_id_convention,
     validate_id_coordinate_consistency,
 )
+from onset_blending.model import FittedModel
 
 
 # ---------------------------------------------------------------------------
@@ -174,106 +170,6 @@ def resolve_application_formula(coef_bundle, spec, cutoff_mode, model_name,
             f"Available: {list(formulas.keys())}"
         )
     return formulas[model_name], "current spec (legacy coefficient bundle)"
-
-
-def build_application_design_matrix(formula_str, data, feature_cols):
-    """Build a Patsy matrix and enforce the saved training feature schema."""
-    rhs = formula_str.split("~", 1)[1].strip() if "~" in formula_str else formula_str
-    design = patsy.dmatrix(
-        rhs,
-        data,
-        return_type="dataframe",
-        NA_action=patsy.NAAction(NA_types=[]),
-    ).drop(columns=["Intercept"], errors="ignore")
-
-    missing = [feature for feature in feature_cols if feature not in design]
-    unexpected = [feature for feature in design if feature not in feature_cols]
-    if missing or unexpected:
-        raise ValueError(
-            "Applied design matrix does not match the saved training schema. "
-            f"Missing: {missing}; unexpected: {unexpected}."
-        )
-
-    design = design.loc[:, feature_cols]
-    all_nonfinite = [
-        column for column in feature_cols
-        if not np.isfinite(
-            pd.to_numeric(design[column], errors="coerce").to_numpy(dtype=float)
-        ).any()
-    ]
-    if all_nonfinite:
-        raise ValueError(
-            "Saved model features have no finite values in the application "
-            f"data: {all_nonfinite}."
-        )
-    return design
-
-
-def apply_coefs(coef_df, wide_df, feature_cols, design_matrix=None):          # ← NEW: added design_matrix param
-    """
-    Apply saved coefficients to wide_df to produce cv_* probability columns.
-
-    Parameters
-    ----------
-    coef_df : DataFrame with columns: class, feature, coefficient, intercept
-    wide_df : DataFrame containing the feature columns
-    feature_cols : list of str — ordered feature column names
-    design_matrix : optional pre-built DataFrame (n_rows x feature_cols)     # ← NEW
-        If provided, used directly instead of indexing wide_df columns.
-        Required when feature_cols contains interaction terms (a:b) that
-        don't exist as raw columns in wide_df.                                # ← NEW
-
-    Returns
-    -------
-    DataFrame with cv_* probability columns, same index as wide_df
-    """
-    classes = coef_df["class"].unique()
-    classes = sorted(classes)
-
-    # ← NEW: use pre-built design matrix if provided, else fall back to raw columns
-    if design_matrix is not None:
-        X = design_matrix[feature_cols].values.astype(float)
-    else:
-        missing = [f for f in feature_cols if f not in wide_df.columns]
-        if missing:
-            raise ValueError(f"Missing feature columns in wide_df: {missing}")
-        X = wide_df[feature_cols].values.astype(float)
-
-    n_rows = len(X)
-    n_classes = len(classes)
-
-    # Build W (n_classes x n_features) and b (n_classes,)
-    W = np.zeros((n_classes, len(feature_cols)))
-    b = np.zeros(n_classes)
-
-    for i, cls in enumerate(classes):
-        cls_rows = coef_df[coef_df["class"] == cls]
-        b[i] = cls_rows["intercept"].iloc[0]
-        for j, feat in enumerate(feature_cols):
-            feat_row = cls_rows[cls_rows["feature"] == feat]
-            if feat_row.empty:
-                warnings.warn(f"Feature '{feat}' not found in coefs for class '{cls}' — using 0")
-            else:
-                W[i, j] = float(feat_row["coefficient"].iloc[0])
-
-    # Compute scores: (n_rows x n_classes) = X @ W.T + b
-    scores = X @ W.T + b   # shape: (n_rows, n_classes)
-
-    # Handle NaN/Inf rows — give NaN probs
-    bad = ~np.isfinite(X).all(axis=1)
-    probs = np.full((n_rows, n_classes), np.nan)
-    if (~bad).any():
-        s = scores[~bad]
-        s -= s.max(axis=1, keepdims=True)
-        exp_s = np.exp(s)
-        probs[~bad] = exp_s / exp_s.sum(axis=1, keepdims=True)
-
-    return pd.DataFrame(
-        probs,
-        columns=[f"cv_{c}" for c in classes],
-        #index=wide_df.index,
-        index=design_matrix.index if design_matrix is not None else wide_df.index,  # ← fix
-    )
 
 
 def print_coef_table(coef_df, model_name, label):
@@ -388,7 +284,6 @@ def main():
     # ← NEW: load_coefs now returns a dict bundle instead of a bare DataFrame
     coef_bundle  = load_coefs(coef_path)                                      # ← NEW
     coef_df      = coef_bundle["coefs"]                                       # ← NEW
-    scaler       = coef_bundle["scaler"]                                      # ← NEW
     feature_cols = coef_bundle["features"]                                    # ← NEW
 
     label = "final model (all years)" if args.coef_tag == "final" else f"test_year={args.year}"  # ← NEW
@@ -434,33 +329,16 @@ def main():
     formula_str, formula_source = resolve_application_formula(
         coef_bundle, spec, cutoff_mode, args.model, test_df
     )
+    model = FittedModel.from_legacy_bundle(coef_bundle, formula=formula_str)
 
     print(f"\nFormula ({formula_source}): {formula_str}")
     print(f"Feature columns ({len(feature_cols)}): {feature_cols}")
 
-    # ── Build design matrix with patsy ────────────────────────────────
-    # patsy expands interaction terms (a:b) that don't exist as raw columns,
-    # matching exactly what was done during training. NA_action keeps NaN rows.
-    X_df = build_application_design_matrix(
-        formula_str, test_df, feature_cols
-    )
-
-    # ← NEW: apply the same StandardScaler fitted during training
-    if scaler is not None:                                                    # ← NEW
-        X_scaled = pd.DataFrame(                                              # ← NEW
-            scaler.transform(X_df.values.astype(float)),                     # ← NEW
-            columns=feature_cols,                                             # ← NEW
-            #index=test_df.index,                                              # ← NEW
-            index=X_df.index,
-        )                                                                     # ← NEW
-    else:                                                                     # ← NEW
-        X_scaled = X_df                                                       # ← NEW
-
-    # ── Apply coefficients → predicted probabilities ───────────────────
+    # ── Apply the model → predicted probabilities ─────────────────────
+    # The design matrix comes from the saved formula (patsy expands a:b
+    # interaction terms exactly as in training) and the saved scaler.
     print(f"\nApplying coefficients to {len(test_df)} test rows...")
-    cv_preds_raw = apply_coefs(coef_df, test_df, feature_cols,
-                               design_matrix=X_scaled)
-    cv_preds = test_df.join(cv_preds_raw, how="left")
+    cv_preds = test_df.join(model.predict(test_df), how="left")
 
     cv_cols = [c for c in cv_preds.columns if c.startswith("cv_")]
     display_cols = ["time", "id", "year"] + (["outcome"] if not is_future_year else []) + cv_cols
