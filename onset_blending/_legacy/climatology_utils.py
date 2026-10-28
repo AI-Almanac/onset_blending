@@ -752,9 +752,32 @@ def write_paired_climatologies(gt_train, issue_grid, season_start_md,
                                conditional_path, unconditional_path,
                                workers=1):
     """Write a compatible conditional/unconditional pair with shared work."""
-    workers = int(workers)
     os.makedirs(os.path.dirname(conditional_path) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(unconditional_path) or ".", exist_ok=True)
+    conditional, unconditional = paired_climatologies(
+        gt_train, issue_grid, season_start_md, forecast_window, horizons,
+        cv_by_year, workers=workers,
+        temp_parent=os.path.dirname(conditional_path) or ".",
+    )
+    with open(conditional_path, "wb") as f:
+        pickle.dump(conditional, f)
+    del conditional
+    gc.collect()
+    with open(unconditional_path, "wb") as f:
+        pickle.dump(unconditional, f)
+    return {
+        "conditional": conditional_path,
+        "unconditional": unconditional_path,
+    }
+
+
+def paired_climatologies(gt_train, issue_grid, season_start_md,
+                         forecast_window, horizons, cv_by_year,
+                         workers=1, temp_parent=None):
+    """The conditional and unconditional climatologies, from shared work:
+    (conditional, unconditional) tables. Chunks spill to a temporary directory
+    under temp_parent (the system's by default) while they are assembled."""
+    workers = int(workers)
 
     cell_ids = gt_train["id"].unique()
     ids_per_chunk = max(1, 200_000 // max(1, len(issue_grid)))
@@ -763,7 +786,6 @@ def write_paired_climatologies(gt_train, issue_grid, season_start_md,
         for start in range(0, len(cell_ids), ids_per_chunk)
     ]
 
-    temp_parent = os.path.dirname(conditional_path) or "."
     with tempfile.TemporaryDirectory(
         prefix=".climatology_tmp-", dir=temp_parent
     ) as temp_dir:
@@ -797,21 +819,8 @@ def write_paired_climatologies(gt_train, issue_grid, season_start_md,
             [result[0] for result in chunk_results],
             [result[1] for result in chunk_results],
         )
-        with open(conditional_path, "wb") as f:
-            pickle.dump(conditional, f)
-        del conditional
-        gc.collect()
-
         unconditional = _assemble_pickle_parts(
             [result[2] for result in chunk_results],
             [result[3] for result in chunk_results],
         )
-        with open(unconditional_path, "wb") as f:
-            pickle.dump(unconditional, f)
-        del unconditional
-        gc.collect()
-
-    return {
-        "conditional": conditional_path,
-        "unconditional": unconditional_path,
-    }
+    return conditional, unconditional

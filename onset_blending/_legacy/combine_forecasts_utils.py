@@ -25,6 +25,18 @@ import pandas as pd
 from .misc import coalesce
 
 
+def _load_frame(source, what):
+    """A table given in memory (returned as a shallow copy, so callers' frames
+    are never modified) or as a pickle path."""
+    if isinstance(source, pd.DataFrame):
+        return source.copy(deep=False)
+    if not os.path.exists(source):
+        raise FileNotFoundError(f"{what} file not found: {source}")
+    with open(source, "rb") as f:
+        dt = pickle.load(f)
+    return dt if isinstance(dt, pd.DataFrame) else pd.DataFrame(dt)
+
+
 # ---------------------------------------------------------------------------
 # Year parsing
 # ---------------------------------------------------------------------------
@@ -103,13 +115,8 @@ def normalize_plus_bin(df, prefix):
 # ---------------------------------------------------------------------------
 
 def read_ground_truth_wide(path):
-    """Read stage-2 ground-truth wide pickle. Returns DataFrame."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Ground truth file not found: {path}")
-    with open(path, "rb") as f:
-        dt = pickle.load(f)
-    if not isinstance(dt, pd.DataFrame):
-        dt = pd.DataFrame(dt)
+    """Read stage-2 ground-truth wide pickle (or the table itself). Returns DataFrame."""
+    dt = _load_frame(path, "Ground truth")
 
     req = ["id", "year"]
     miss = [c for c in req if c not in dt.columns]
@@ -134,16 +141,11 @@ def read_ground_truth_wide(path):
 
 def read_and_format_climatology_wide(path, out_prefix="clim_p_onset"):
     """
-    Read climatology wide pickle. Rename predicted_prob_day_<k> -> <out_prefix>_day_<k>.
-    Adds normalized plus-bin column.
-    Returns DataFrame.
+    Read climatology wide pickle (or the table itself). Rename
+    predicted_prob_day_<k> -> <out_prefix>_day_<k>. Adds normalized plus-bin
+    column. Returns DataFrame.
     """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Climatology file not found: {path}")
-    with open(path, "rb") as f:
-        dt = pickle.load(f)
-    if not isinstance(dt, pd.DataFrame):
-        dt = pd.DataFrame(dt)
+    dt = _load_frame(path, "Climatology")
 
     key_req = ["id", "time", "year"]
     miss_keys = [c for c in key_req if c not in dt.columns]
@@ -182,20 +184,19 @@ def read_and_format_climatology_wide(path, out_prefix="clim_p_onset"):
 
 def read_one_forecast_source(source, daily_cols, const_cols):
     """
-    Read a single forecast wide pickle and optionally filter by years.
+    Read a single forecast wide pickle (source["file"], or the table itself as
+    source["frame"]) and optionally filter by years.
 
     Returns DataFrame.
     """
-    file_path = str(source["file"])
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Forecast file not found: {file_path}")
+    if "frame" in source:
+        file_path = "<in-memory forecast table>"
+        dt = _load_frame(source["frame"], "Forecast")
+    else:
+        file_path = str(source["file"])
+        dt = _load_frame(file_path, "Forecast")
 
     yrs = parse_years(source.get("years", ""))
-
-    with open(file_path, "rb") as f:
-        dt = pickle.load(f)
-    if not isinstance(dt, pd.DataFrame):
-        dt = pd.DataFrame(dt)
 
     key_req = ["id", "time", "year"]
     miss_keys = [c for c in key_req if c not in dt.columns]

@@ -290,18 +290,32 @@ def make_cv_rds_from_daylevel(spec, required_probability_prefixes=None):
     -------
     DataFrame  (also saved to spec["output_rds"])
     """
-    input_rds = spec["input_rds"]
+    with open(spec["input_rds"], "rb") as f:
+        raw = pickle.load(f)
+    wide_df = weekly_from_daylevel(raw, spec, required_probability_prefixes)
+
     output_rds = spec["output_rds"]
+    out_dir = os.path.dirname(output_rds)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    with open(output_rds, "wb") as f:
+        pickle.dump(wide_df, f)
+
+    return wide_df
+
+
+def weekly_from_daylevel(raw, spec, required_probability_prefixes=None):
+    """The weekly table make_cv_rds_from_daylevel writes, from the combined
+    day-level table in memory (spec's input_rds/output_rds are not used).
+    `raw` is not modified."""
     day_max = coalesce(spec.get("day_max"), 28)
     # Accept both the Python names and the maintained R spec names.
     days_per_bin = coalesce(spec.get("days_per_bin"),
                             coalesce(spec.get("days_per_week"), 7))
     n_bins = coalesce(spec.get("n_bins"), coalesce(spec.get("n_weeks"), 4))
 
-    with open(input_rds, "rb") as f:
-        raw = pickle.load(f)
-    if not isinstance(raw, pd.DataFrame):
-        raw = pd.DataFrame(raw)
+    raw = raw.copy(deep=False) if isinstance(raw, pd.DataFrame) else pd.DataFrame(raw)
 
     raw = ensure_spatial_id_col(
         raw, spec=spec, context="connector spatial IDs"
@@ -591,12 +605,4 @@ def make_cv_rds_from_daylevel(spec, required_probability_prefixes=None):
     wide_df.attrs.update(raw.attrs)
     wide_df.attrs["rain_horizons"] = rain_horizon_metadata
     wide_df.attrs["unavailable_rain_predictors"] = unavailable_rain_predictors
-
-    out_dir = os.path.dirname(output_rds)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-
-    with open(output_rds, "wb") as f:
-        pickle.dump(wide_df, f)
-
     return wide_df
