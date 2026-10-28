@@ -97,23 +97,136 @@ reads from the one before.
 | combine + connect | 12 GB daily table → 1.2 GB weekly table, via pickles and row chunks | feature arrays `[row, feature]` + outcome codes; one slim DataFrame only for formula evaluation |
 | evaluation | spawned scripts reading pickles and YAML | functions returning a `BlendResult` (CV predictions, coefficients, metrics tables, final model) |
 
-## API (sketch)
+## Package layout
 
-```python
-from onset_blending import BlendConfig, run_blend, apply_blend
+onset_blending is an installable package (`pyproject.toml`, `pip install -e .`).
+Nothing in it edits `sys.path`, changes directory, or finds files relative to
+the repository: modules import each other as `onset_blending.<module>`, and
+every path comes from the config or the caller. Relative paths in a config
+file resolve against that file's directory, or against its `data_root` if it
+sets one.
 
-cfg = BlendConfig.from_yaml("blend.yml")         # or built in code
-result = run_blend(cfg)                          # in memory, stage by stage:
-#   inputs = load_inputs(cfg); onsets = compute_onsets(inputs, cfg)
-#   clim = build_climatology(onsets.obs, cfg); feats = build_features(...)
-#   result = evaluate(feats, cfg)
-result.save("out/", intermediates=["onsets", "features"])   # optional extras
-season = apply_blend(result.final_model, cfg, live_forecasts)
+```
+onset_blending/
+  config.py          BlendConfig: the recipe (done)
+  inputs.py          read observation and forecast NetCDF into xarray
+  domain.py          units, ids, regrid weights, dissemination, area of interest
+  onsets.py          onset detection: observed onsets, forecast onset probabilities
+  climatology.py     KDE climatology
+  features.py        weekly features (today's combine + connect)
+  model.py           formula expansion and the fitted multinomial model
+  evaluation/        cv.py, calibration.py, metrics.py, mme.py
+  training.py        train(config) -> TrainingResult, holding a TrainedBlend
+  blend.py           TrainedBlend: recipe + fitted model + reference data
+  forecast.py        TrainedBlend.forecast(...) -> Forecast: the operational path
+  maps.py            forecast maps (optional extra: cartopy)
+  legacy_specs.py    spec-set converter (until the specs are gone)
+  __main__.py        `python -m onset_blending train | forecast | convert-specs`
 ```
 
-ai-almanac's local runner builds a `BlendConfig` from the job, calls
-`run_blend`, and publishes `result.save(...)`. Its intermediates cache becomes
-a thin wrapper over the stage functions.
+Each stage is a function from inputs to a result object, with no files, globals
+or working-directory state between stages. Extension points are plain tables
+in one place: a new rain-predictor aggregate, CV method or output writer is
+one function registered next to the others, not a new script.
+
+`predict/` becomes `forecast.py` and `maps.py`: no separate scripts, specs or
+temporary `_op.yml` copies.
+
+## Training and operational forecasting
+
+```python
+from onset_blending import BlendConfig, TrainedBlend, train
+
+result = train(BlendConfig.from_yaml("configs/india_aifs.yml"))
+result.save("out/")                       # evaluation tables (the output contract)
+result.blend.save("india_aifs.blend")     # what operations needs, in one file
+
+blend = TrainedBlend.load("india_aifs.blend")
+forecast = blend.forecast(issue_date="2026-06-09",
+                          forecasts={"aifs_ensv2": "live/ens.nc", "aifsv2": "live/det.nc"})
+forecast.save("out/2026-06-09/")          # weekly + daily CSVs, maps if asked
+```
+
+**The operational path cannot take blending parameters.** `forecast()` accepts
+the issue date and where the live forecast files are, nothing else. Every
+parameter comes from the `TrainedBlend`, which is written by training and
+holds, in one file:
+
+- the `BlendConfig` it was trained with (the recipe);
+- the fitted model: formula, feature names, scaler, coefficients, classes;
+- reference data, resolved at training time so operations cannot resolve it
+  differently: the units, per-unit thresholds, the observed onset days that
+  the climatology is fitted on, the regrid weights per model grid, and the
+  dissemination units;
+- each model's forecast signature (below);
+- provenance: package version, `FEATURES_VERSION`, config digest, training
+  years, and fingerprints of the training inputs.
+
+Today a coefficient pickle travels separately from the five specs that
+produced its features, and nothing checks that the specs used for operations
+are the ones used for training. The onset definition, thresholds,
+climatology years, rain windows and horizons, bins and cutoff mode can all
+drift silently; only the feature names are checked. Keeping the recipe and
+reference data inside the trained blend removes that possibility rather than
+detecting it.
+
+**Forecasts must have the structure the blend was trained on.** Live files
+are read only with the trained reading rules (variable, dimension renames,
+unit scale, member and lead-day selection); there is no per-file override.
+Training records each model's forecast signature, which is what the blend
+actually reads after those rules:
+
+- the variable and its `units` attribute;
+- the dimension names and sizes (order is irrelevant to xarray, so it is not
+  compared);
+- the ensemble member ids;
+- the lead days;
+- the grid: lat/lon values, or unit ids for files already on units;
+- the issue time of day (00Z or 12Z shifts every lead day).
+
+Every training file must give the same signature, apart from the issue dates.
+Otherwise training refuses and names the files that differ: a blend fitted on
+a mix of ensemble sizes has no single ensemble to forecast with. An
+operational forecast must give exactly the trained signature, apart from its
+own issue dates. Members or lead days that the trained selection drops (past
+`max_member` or `lead_days.max`) do not count; any other difference refuses
+the forecast. That includes fewer or different members, missing lead days,
+another grid, other units, or another initialisation hour. Live rainfall
+magnitude is also compared with training, a second guard on units.
+
+The other checks, made before any work with every problem reported at once:
+- exactly the trained models are supplied;
+- the issue date is inside the season;
+- a per-year reference-onset table has the live year.
+
+**Code version.** `FEATURES_VERSION` is bumped whenever feature numerics
+change. A blend trained under another version is refused: retrain, or run the
+version it was trained with. The same parameters on changed code is the same
+failure in another form.
+
+Atomicity:
+- a trained blend is saved and loaded as a whole, written to a temporary
+  file and renamed, and verified against its digest on load;
+- an operational run writes its whole output set or nothing;
+- no pickles in the artifact (JSON, NumPy and NetCDF only), so it loads
+  across library versions and is safe to read.
+
+ai-almanac stores the one `.blend` file per trained blend and calls
+`forecast()`. Under the signature rule, the live files it assembles
+(`forecast_pipeline.assemble_season_netcdf`: time × day × lat × lon, `tp`,
+mm) must match the layout each model was trained from. Registered datasets
+are read with their own renames and unit scales (`model_layouts`); India's
+AIFS uses `prediction_timedelta_daily` and metres. Decision: datasets are normalised to the
+standard layout once, at registration, so training and live files come from
+the same layout and `model_layouts` goes away. Its live path today re-supplies parameters from the job record,
+and the weekly-feature settings fall back to code defaults (day_max,
+days_per_week, n_weeks, rain_window). Those match training only because
+training never overrides them.
+
+Existing operational blends (a coefficient pickle plus a spec set) import once
+with `TrainedBlend.from_legacy(coef_pkl, config)`. It builds the reference data
+from the config's inputs and refuses if the coefficients' feature names are
+not exactly what the config builds.
 
 ## Functionality retained
 
@@ -184,10 +297,14 @@ the differences shown.
 
 1. **Config.** `BlendConfig` with validation; a converter from today's spec
    sets so existing templates and tests carry over; port the templates.
-2. **In-memory pipeline on today's functions.** Stage functions calling the
-   existing logic, no files or subprocesses between stages; ai-almanac's local
-   runner switches to it. Results should stay bit-identical at this phase,
-   which isolates plumbing from numerics.
+2. **Package and in-memory pipeline on today's functions.** `pyproject.toml`
+   and the module layout above; stage functions that call the existing logic,
+   with no files or subprocesses between them; `train()`, `TrainedBlend` and
+   `forecast()` replace `1_blend_evaluation.py`, `3_fit_final_model.py` and
+   `predict/`. ai-almanac's local runner and live scoring switch to it.
+   Results should stay bit-identical at this phase, which isolates the
+   plumbing from the numerics. The operational path is checked against
+   today's `run_operational_pipeline.py` on a replayed season.
 3. **Data model, stage by stage.** Observation onsets, forecast onsets,
    climatology, features, then evaluation move to the array model; each step
    verified and measured.
