@@ -19,8 +19,8 @@ import pickle
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from python.pipelines._shared.read_spec import load_spec, validate_spec
-from python.prepare_data.climatology_utils import (
+from onset_blending._legacy.read_spec import load_spec, validate_spec
+from onset_blending._legacy.climatology_utils import (
     get_paths_clim,
     get_climatology_options_from_run,
     read_gt_onset_from_tbl,

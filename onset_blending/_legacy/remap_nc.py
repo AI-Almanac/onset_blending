@@ -5,8 +5,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from python.prepare_data.geometry_utils import normalize_regrid_weights
-from python.prepare_data.sparse_transform_utils import (
+from .geometry_utils import normalize_regrid_weights
+from .sparse_transform_utils import (
     compile_sparse_cell_transform,
     sparse_observed_weighted_mean,
 )

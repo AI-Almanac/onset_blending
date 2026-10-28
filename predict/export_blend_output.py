@@ -80,14 +80,14 @@ if REPO_ROOT not in sys.path:
 os.chdir(REPO_ROOT)
 
 try:
-    from python.blending_process.blend_evaluation_utils import (
+    from onset_blending._legacy.blend_evaluation_utils import (
         configured_holdout_years,
         input_rds_from_cutoff,
         make_cutoff_tag,
         make_year_tag,
         resolve_climatology_weeks,
     )
-    from python.pipelines._shared.read_spec import load_spec
+    from onset_blending._legacy.read_spec import load_spec
 except ImportError:
     print(f"Error: Could not import internal modules from {REPO_ROOT}")
     print("Ensure this script is located exactly one folder deep from the root.")

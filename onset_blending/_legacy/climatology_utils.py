@@ -34,7 +34,7 @@ from datetime import date
 from scipy.stats import gaussian_kde
 from scipy.interpolate import interp1d
 
-from python.pipelines._shared.misc import coalesce
+from .misc import coalesce
 
 
 # ---------------------------------------------------------------------------

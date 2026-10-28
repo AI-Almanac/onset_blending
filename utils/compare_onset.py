@@ -59,14 +59,14 @@ import matplotlib.lines as mlines
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from python.prepare_data.onset_utils import (
+from onset_blending._legacy.onset_utils import (
     find_onset, read_onset_params, read_thresholds,
     roll_sum_na_rm_left,
 )
-from python.prepare_data.nc_utils import (
+from onset_blending._legacy.nc_utils import (
     get_nc_coord, get_nc_time, nc_time_to_dates,
 )
-from python.pipelines._shared.read_spec import load_spec
+from onset_blending._legacy.read_spec import load_spec
 
 
 # ===========================================================================

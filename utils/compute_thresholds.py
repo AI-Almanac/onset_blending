@@ -34,8 +34,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from python.prepare_data.onset_utils import threshold_quantile_accumulation
-from python.prepare_data.spatial_id_utils import ensure_spatial_id_col
+from onset_blending._legacy.onset_utils import threshold_quantile_accumulation
+from onset_blending._legacy.spatial_id_utils import ensure_spatial_id_col
 
 
 def _md_to_doy_mask(times, season_start, season_end):

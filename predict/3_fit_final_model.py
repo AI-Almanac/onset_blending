@@ -52,7 +52,7 @@ import patsy
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
-from python.blending_process.blend_evaluation_utils import (
+from onset_blending._legacy.blend_evaluation_utils import (
     DEFAULT_PIPELINE_INPUT_ROOT,
     apply_formula_sample_support,
     build_formulas_from_spec,
@@ -63,13 +63,13 @@ from python.blending_process.blend_evaluation_utils import (
     restrict_to_allowed,
     _make_multinom_clf,
 )
-from python.pipelines._shared.misc import coalesce, interval_bins
-from python.prepare_data.nc_utils import ensure_id_col
-from python.prepare_data.spatial_id_utils import (
+from onset_blending._legacy.misc import coalesce, interval_bins
+from onset_blending._legacy.nc_utils import ensure_id_col
+from onset_blending._legacy.spatial_id_utils import (
     resolve_grid_id_convention,
     validate_id_coordinate_consistency,
 )
-from python.pipelines._shared.read_spec import load_spec
+from onset_blending._legacy.read_spec import load_spec
 
 
 # ---------------------------------------------------------------------------

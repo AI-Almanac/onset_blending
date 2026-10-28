@@ -20,7 +20,7 @@ import os
 # Allow running from MO_Forecast_Code/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from python.prepare_data.nc_utils import run_single_pipeline
+from onset_blending._legacy.nc_utils import run_single_pipeline
 
 
 def main():

@@ -23,13 +23,13 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from python.pipelines._shared.misc import coalesce, interval_bins
-from python.prepare_data.nc_utils import ensure_id_col
-from python.prepare_data.spatial_id_utils import (
+from onset_blending._legacy.misc import coalesce, interval_bins
+from onset_blending._legacy.nc_utils import ensure_id_col
+from onset_blending._legacy.spatial_id_utils import (
     resolve_grid_id_convention,
     validate_id_coordinate_consistency,
 )
-from python.blending_process.blend_evaluation_utils import (
+from onset_blending._legacy.blend_evaluation_utils import (
     _present_weeks,
     resolve_climatology_weeks,
     build_formulas_from_spec,
@@ -493,7 +493,7 @@ def main():
 
                     # Save Platt weights if requested
                     if fc_cfg.get("export_platt_weights", False):
-                        from python.blending_process.blend_evaluation_utils import (
+                        from onset_blending._legacy.blend_evaluation_utils import (
                             get_forecast_variant_suffix, forecast_prob_cols
                         )
                         suf = get_forecast_variant_suffix(spec, variant)

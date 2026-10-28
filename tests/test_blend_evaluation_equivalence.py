@@ -5,7 +5,7 @@ import pytest
 from scipy.special import expit
 from sklearn.linear_model import LogisticRegression
 
-from python.blending_process.blend_evaluation_utils import (
+from onset_blending._legacy.blend_evaluation_utils import (
     _fit_columns,
     compute_cv_global,
     platt_cv_multibin,

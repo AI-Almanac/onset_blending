@@ -19,7 +19,7 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from python.blending_process.connect_utils import make_cv_rds_from_daylevel
+from onset_blending._legacy.connect_utils import make_cv_rds_from_daylevel
 
 
 def main():

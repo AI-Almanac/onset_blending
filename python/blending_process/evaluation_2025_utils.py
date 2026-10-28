@@ -14,8 +14,8 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 from scipy.special import logit, expit
 
-from ..pipelines._shared.misc import interval_bins, rps_bins, assign_lead_bin
-from ..prepare_data.spatial_id_utils import ensure_spatial_id_col
+from onset_blending._legacy.misc import interval_bins, rps_bins, assign_lead_bin
+from onset_blending._legacy.spatial_id_utils import ensure_spatial_id_col
 
 # Default 4-week layout; the functions below accept n_bins / explicit bins to
 # generalize to any number of forecast bins.

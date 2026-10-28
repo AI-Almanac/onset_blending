@@ -38,7 +38,7 @@ from dateutil import parser as dateutil_parser
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from python.pipelines._shared.misc import interval_bins, rps_bins
+from onset_blending._legacy.misc import interval_bins, rps_bins
 from python.blending_process.evaluation_2025_utils import (
     skill_score,
     diff_to_bin,

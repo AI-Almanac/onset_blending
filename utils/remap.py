@@ -37,7 +37,7 @@ import argparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from python.prepare_data.geometry_utils import build_grid_to_admin_weights, get_geometry_cfg
+from onset_blending._legacy.geometry_utils import build_grid_to_admin_weights, get_geometry_cfg
 
 
 def _cfg_from_args(args):
@@ -81,7 +81,7 @@ def cmd_weights(args):
 
 
 def cmd_apply(args):
-    from utils.remap_nc import batch_aggregate_to_adm3_matrix
+    from onset_blending._legacy.remap_nc import batch_aggregate_to_adm3_matrix
     batch_aggregate_to_adm3_matrix(args.input_dir, args.weights, input_file=args.input_file)
 
 

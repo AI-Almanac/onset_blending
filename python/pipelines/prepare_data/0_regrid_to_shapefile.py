@@ -51,19 +51,19 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from python.prepare_data.geometry_utils import (
+from onset_blending._legacy.geometry_utils import (
     get_geometry_cfg, load_admin_geometry, build_grid_to_admin_weights,
     grid_valid_cells, restrict_weights_to_valid, grid_coords_of, get_half_delta,
     grids_equal, build_coverage_geom, coverage_missing_fraction,
     build_weights_to_coverage, build_grid_cell_units, unit_centroids,
     normalize_regrid_weights, CANON_REGION_KEY,
 )
-from python.prepare_data.spatial_id_utils import (
+from onset_blending._legacy.spatial_id_utils import (
     ensure_spatial_id_col,
     resolve_grid_id_convention,
     validate_id_coordinate_consistency,
 )
-from utils.remap_nc import batch_aggregate_to_adm3_matrix
+from onset_blending._legacy.remap_nc import batch_aggregate_to_adm3_matrix
 
 _QLABELS = ["min", "p05", "p25", "p50", "p75", "p95", "max"]
 _QS = [0.0, 0.05, 0.25, 0.50, 0.75, 0.95, 1.0]

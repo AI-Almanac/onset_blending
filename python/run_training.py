@@ -98,7 +98,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from python.rain_horizon_utils import resolve_rain_day_max  # noqa: E402
+from onset_blending._legacy.rain_horizon_utils import resolve_rain_day_max  # noqa: E402
 
 os.chdir(REPO_ROOT)
 

@@ -19,9 +19,9 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from python.pipelines._shared.misc import coalesce
-from python.pipelines._shared.read_spec import load_spec
-from python.prepare_data.combine_forecasts_utils import (
+from onset_blending._legacy.misc import coalesce
+from onset_blending._legacy.read_spec import load_spec
+from onset_blending._legacy.combine_forecasts_utils import (
     read_ground_truth_wide,
     read_and_format_climatology_wide,
     format_forecast_family,

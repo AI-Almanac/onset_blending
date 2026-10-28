@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onset-blending"
+version = "0.2.0"
+description = "Blend AI weather forecasts into rainfall-onset probabilities."
+readme = "readme.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "netCDF4>=1.6",
+    "numpy>=1.24",
+    "packaging",
+    "pandas>=2.0",
+    "patsy>=0.5",
+    "pyyaml>=6.0",
+    "scikit-learn>=1.3",
+    "scipy>=1.10",
+    "threadpoolctl>=3",
+    "xarray>=2023.1",
+]
+
+[project.optional-dependencies]
+# Regridding onto shapefile polygons.
+regrid = ["geopandas>=0.13", "pyproj>=3.5", "shapely>=2.0"]
+# Forecast maps.
+maps = ["cartopy>=0.25", "matplotlib>=3.7", "seaborn>=0.12"]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["onset_blending*"]

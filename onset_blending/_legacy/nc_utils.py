@@ -22,9 +22,9 @@ from datetime import datetime, date, timedelta
 from itertools import product
 from multiprocessing import get_context
 
-from ..pipelines._shared.misc import coalesce
-from ..pipelines._shared.read_spec import load_spec, validate_spec
-from ..rain_horizon_utils import (
+from .misc import coalesce
+from .read_spec import load_spec, validate_spec
+from .rain_horizon_utils import (
     resolve_rain_day_max,
     validate_day_coordinate,
     validate_rain_horizon_frame,

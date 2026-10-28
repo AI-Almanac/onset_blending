@@ -46,7 +46,7 @@ from python.blending_process.blend_figure_utils import (
     plot_metric_map,
     plot_fig2_combined,
 )
-from python.blending_process.blend_evaluation_utils import (
+from onset_blending._legacy.blend_evaluation_utils import (
     summarize_maps_compare,
     build_polygons_for_mapping,
 )

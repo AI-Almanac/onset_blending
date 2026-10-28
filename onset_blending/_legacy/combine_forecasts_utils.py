@@ -22,7 +22,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from ..pipelines._shared.misc import coalesce
+from .misc import coalesce
 
 
 # ---------------------------------------------------------------------------

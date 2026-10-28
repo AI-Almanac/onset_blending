@@ -24,7 +24,7 @@ from scipy.stats import ks_2samp
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
-from ..pipelines._shared.misc import coalesce, week_labels, interval_bins
+from .misc import coalesce, week_labels, interval_bins
 
 
 DEFAULT_PIPELINE_INPUT_ROOT = os.path.join(
