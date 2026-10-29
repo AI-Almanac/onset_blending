@@ -3,25 +3,15 @@ and regridding inputs onto the units."""
 
 from __future__ import annotations
 
-import contextlib
 import json
-import math
-import shutil
-import tempfile
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from . import _parallel
 from ._legacy import nc_utils
 from ._legacy.spatial_id_utils import GridIdConvention, ensure_spatial_id_col, format_coord_component
 from .config import BlendConfig
 
-# Peak bytes per value of the largest variable while one file is regridded.
-_REGRID_BYTES_PER_VALUE = 18
-# The regridder reads the grid's coordinates under these names.
-_COORDINATE_NAMES = {"lat": "lat", "latitude": "lat", "lon": "lon", "longitude": "lon"}
 
 
 def id_convention(config: BlendConfig) -> GridIdConvention | None:
@@ -82,6 +72,14 @@ class AreaFilter:
             else {}
         )
 
+    @classmethod
+    def everything(cls) -> "AreaFilter":
+        """No area of interest and no dissemination filter (a trained blend's
+        units are given instead)."""
+        area = cls.__new__(cls)
+        area._filter, area.bbox, area.outlines, area.dissemination, area._geometry = {}, None, None, None, {}
+        return area
+
     @property
     def active(self) -> bool:
         return bool(self.bbox or self.outlines or self.dissemination)
@@ -119,67 +117,61 @@ class AreaFilter:
         return df[shapely.contains_xy(outline, lon, lat)]
 
 
-def _has_unit_dimension(path: Path) -> bool:
-    import xarray as xr
+class Regridder:
+    """Area-weighted means of gridded values over the blend's units: the
+    sparse transform the legacy regrid applied file by file (a weighted mean
+    over each unit's observed source cells), applied to arrays as read."""
 
-    with xr.open_dataset(path, decode_times=False) as ds:
-        names = {str(name).lower() for name in [*ds.dims, *ds.coords]}
-    return bool(names & {"adm3", "adm3_name"})
+    def __init__(self, weights: pd.DataFrame):
+        from ._legacy.geometry_utils import normalize_regrid_weights
+
+        mapping = normalize_regrid_weights(weights, context="regrid weights")
+        mapping = mapping.rename(columns={"latitude": "lat", "longitude": "lon"})
+        for column in ("lat", "lon", "weight"):
+            mapping[column] = pd.to_numeric(mapping[column], errors="raise")
+        mapping["source_id"] = list(zip(mapping["lat"], mapping["lon"]))
+        mapping["target_id"] = mapping["target_id"].astype(str)
+        self.mapping = mapping
+        self.targets = np.asarray(sorted(mapping["target_id"].unique()), dtype=object)
+        self._transforms: dict[tuple, object] = {}
+
+    @classmethod
+    def from_csv(cls, path) -> "Regridder":
+        return cls(pd.read_csv(path, dtype={"target_id": str, "adm3_name": str}))
+
+    def transform(self, lats: np.ndarray, lons: np.ndarray):
+        """The compiled transform for a grid (latitude-major source order)."""
+        from ._legacy.sparse_transform_utils import compile_sparse_cell_transform
+
+        sources = tuple((float(a), float(b)) for a in lats for b in lons)
+        if sources not in self._transforms:
+            self._transforms[sources] = compile_sparse_cell_transform(
+                self.mapping, source_ids=sources, target_ids=tuple(self.targets)
+            )
+        return self._transforms[sources]
+
+    @staticmethod
+    def sources_of(transform, targets: np.ndarray) -> np.ndarray:
+        """Source positions with weight for the given target positions."""
+        return np.unique(transform.weighted_matrix[targets].indices)
+
+    @staticmethod
+    def apply(transform, values: np.ndarray) -> np.ndarray:
+        """(source, column) values -> (target, column) weighted means; NaN
+        sources are unobserved."""
+        from ._legacy.sparse_transform_utils import sparse_observed_weighted_mean
+
+        return sparse_observed_weighted_mean(transform, values)
 
 
-def _largest_value_count(path: Path) -> int:
-    import netCDF4
-
-    with netCDF4.Dataset(path) as ds:
-        return max(
-            (math.prod(var.shape) for var in ds.variables.values() if len(var.dimensions) >= 2),
-            default=0,
-        )
+def point_sources(points: pd.DataFrame, transform) -> np.ndarray:
+    """Each point's position among the transform's sources (-1 for none)."""
+    index = transform.source_index
+    return np.array(
+        [index.get((float(a), float(b)), -1) for a, b in zip(points["lat"], points["lon"])], dtype=np.int64
+    )
 
 
-def _regrid_file(src: Path, context: dict) -> Path:
-    """One file aggregated onto the units, written into context["out_dir"]."""
-    import xarray as xr
-
-    from ._legacy.remap_nc import batch_aggregate_to_adm3_matrix
-
-    work = Path(tempfile.mkdtemp(dir=context["work_dir"]))
-    staged = work / src.name
-    with xr.open_dataset(src, mask_and_scale=True) as ds:
-        rename = {
-            name: _COORDINATE_NAMES[str(name).lower()]
-            for name in [*ds.dims, *ds.coords]
-            if _COORDINATE_NAMES.get(str(name).lower(), name) != name
-        }
-        if rename:
-            ds.rename(rename).to_netcdf(staged)
-        else:
-            staged.symlink_to(src.resolve())
-    batch_aggregate_to_adm3_matrix(str(work), context["weights"], input_file=str(staged))
-    regridded = staged.with_name(f"{staged.stem}_adm3{staged.suffix}")
-    if not regridded.is_file():
-        raise FileNotFoundError(f"Regridding {src.name} produced no {regridded.name}")
-    target = Path(context["out_dir"]) / src.name
-    shutil.move(str(regridded), target)
-    shutil.rmtree(work, ignore_errors=True)
-    return target
-
-
-@contextlib.contextmanager
-def on_units(paths: list[Path], weights: Path | None, *, workers: int = 1, budget_bytes: int | None = None):
-    """The inputs as files on the blend's units: regridded with `weights` into
-    a temporary directory that lasts while the block runs, or the files
-    themselves when there is nothing to regrid."""
-    pending = [p for p in paths if weights is not None and not _has_unit_dimension(p)]
-    if not pending:
-        yield list(paths)
-        return
-    with tempfile.TemporaryDirectory(prefix="onset-blending-units-") as tmp:
-        out_dir = Path(tmp) / "units"
-        out_dir.mkdir()
-        context = {"weights": str(weights), "out_dir": str(out_dir), "work_dir": tmp}
-        count = _parallel.workers_within(
-            [_largest_value_count(p) * _REGRID_BYTES_PER_VALUE for p in pending], workers, budget_bytes
-        )
-        regridded = dict(zip(pending, _parallel.map_ordered(_regrid_file, pending, context, count)))
-        yield [regridded.get(p, p) for p in paths]
+def grid_axes(points: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """The distinct latitudes and longitudes of a grid's points, in file order."""
+    return pd.unique(points["lat"].to_numpy()), pd.unique(points["lon"].to_numpy())

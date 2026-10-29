@@ -17,7 +17,7 @@ import tempfile
 import warnings
 import numpy as np
 import pandas as pd
-from multiprocessing import get_context
+from multiprocessing import get_context, shared_memory
 from scipy.special import logit, expit
 from scipy.stats import rankdata
 from scipy.stats import ks_2samp
@@ -761,9 +761,12 @@ def _fit_predict_design(X_tr, y_tr, X_te, feature_cols, test_index, *, return_cl
     scaler = None
     if scale:
         from sklearn.preprocessing import StandardScaler
-        scaler = StandardScaler()
+        # In place: both designs are this fit's own copies, and the scaled
+        # values are the same as a scaled copy's.
+        scaler = StandardScaler(copy=False)
         X_tr = scaler.fit_transform(X_tr)            # ← fixes convergence
         X_te = scaler.transform(X_te)
+        scaler.set_params(copy=True)  # as saved before: later transforms copy
 
     # Drop NaN/Inf rows from training
     #bad_tr = ~np.isfinite(X_tr).all(axis=1)
@@ -932,10 +935,11 @@ def _initialize_global_cv_worker(context, blas_threads=None):
         _GLOBAL_CV_WORKER_THREAD_LIMIT = threadpool_limits(limits=int(blas_threads))
 
 
-def _shared_design(formula_str, data_train, data_pred, directory):
+def _shared_design(formula_str, data_train, data_pred, blocks):
     """The formula's design matrices for every training and prediction row,
-    saved under directory for the fold workers to map rather than copy; None
-    when folds must build their own.
+    in shared memory the fold workers attach to rather than copy (the blocks
+    are appended to `blocks` for the caller to release); None when folds
+    must build their own.
 
     A formula of plain numeric columns gives each row's terms from that row
     alone, so slicing these matrices by a fold's rows gives what the fold's
@@ -956,22 +960,30 @@ def _shared_design(formula_str, data_train, data_pred, directory):
         columns = list(design.columns)
         if shared and columns != shared["columns"]:
             return None
-        path = os.path.join(directory, f"design_{name}.npy")
+        values = design.to_numpy(dtype=float)
+        block = shared_memory.SharedMemory(create=True, size=max(values.nbytes, 1))
+        blocks.append(block)
         # Column-major, as patsy's frame hands its values over: the scaler and
         # the solver then sum in the same order as for a fold's own design.
-        np.save(path, np.asfortranarray(design.to_numpy(dtype=float)))
-        shared[name] = path
+        np.ndarray(values.shape, values.dtype, buffer=block.buf, order="F")[...] = values
+        shared[name] = (block.name, values.shape, values.dtype.str)
         shared["columns"] = columns
-        del design
+        del design, values
     return shared
 
 
-def _design_rows(path, rows):
-    """The rows of a saved design, column-major as patsy's design would be."""
-    mapped = np.load(path, mmap_mode="r")
-    out = np.empty((len(rows), mapped.shape[1]), dtype=mapped.dtype, order="F")
-    for column in range(mapped.shape[1]):
-        out[:, column] = mapped[:, column][rows]
+_ATTACHED_DESIGNS = {}
+
+
+def _design_rows(design, rows):
+    """Rows of a shared design, column-major as patsy's design would be."""
+    name, shape, dtype = design
+    if name not in _ATTACHED_DESIGNS:
+        _ATTACHED_DESIGNS[name] = shared_memory.SharedMemory(name=name)
+    shared = np.ndarray(shape, dtype, buffer=_ATTACHED_DESIGNS[name].buf, order="F")
+    out = np.empty((len(rows), shape[1]), dtype=shared.dtype, order="F")
+    for column in range(shape[1]):
+        out[:, column] = shared[:, column][rows]
     return out
 
 
@@ -1163,11 +1175,13 @@ def compute_cv_global(formula_str, data_train, holdout_years, training_years,
         "save_coefs": bool(save_coefs),
     }
     worker_count = min(n_jobs, len(holdout_years))
+    blocks = []
     with tempfile.TemporaryDirectory(prefix="global-cv-") as tmp:
-        # One design matrix for every fold, mapped by each worker; otherwise
-        # workers get only the columns a fit reads (each holds its own copy,
-        # and full tables times the workers ran to tens of GB).
-        design = _shared_design(formula_str, data_train, data_pred, tmp)
+        # One design matrix for every fold, in shared memory each worker
+        # attaches to; otherwise workers get only the columns a fit reads
+        # (each holds its own copy, and full tables times the workers ran to
+        # tens of GB).
+        design = _shared_design(formula_str, data_train, data_pred, blocks)
         if design is not None:
             context.update(
                 design=design,
@@ -1182,7 +1196,16 @@ def compute_cv_global(formula_str, data_train, holdout_years, training_years,
                 data_train=data_train if train_columns is None else data_train[train_columns],
                 data_pred=data_pred if pred_columns is None else data_pred[pred_columns],
             )
-        fold_results = _run_global_cv_folds(context, holdout_years, worker_count, tmp)
+        try:
+            fold_results = _run_global_cv_folds(context, holdout_years, worker_count, tmp)
+        finally:
+            for name in [b.name for b in blocks]:
+                attached = _ATTACHED_DESIGNS.pop(name, None)
+                if attached is not None:
+                    attached.close()
+            for block in blocks:
+                block.close()
+                block.unlink()
 
     if not fold_results:
         raise ValueError("Global CV produced no fold predictions.")

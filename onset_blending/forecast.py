@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import climatology as climatology_stage, config as cfg, features, inputs, onsets
+from . import climatology as climatology_stage, config as cfg, domain, features, inputs, onsets
 from .blend import issue_dates
 from .config import FileSet
 
@@ -104,31 +104,28 @@ def run(blend, forecasts: dict, *, issue_date=None, resources=None) -> Forecast:
     if problems:
         raise IncompatibleForecast(problems)
 
-    with tempfile.TemporaryDirectory(prefix="onset-blending-forecast-") as root:
-        for name, data in blend.reference_files.items():
-            target = Path(root) / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
-        config = dataclasses.replace(
-            blend.config,
-            data_root=root,
-            models=tuple(
-                dataclasses.replace(m, files=FileSet(paths=tuple(str(p.resolve()) for p in live[m.name])))
-                for m in blend.config.models
-            ),
+    config = dataclasses.replace(
+        blend.config,
+        models=tuple(
+            dataclasses.replace(m, files=FileSet(paths=tuple(str(p.resolve()) for p in live[m.name])))
+            for m in blend.config.models
+        ),
+    )
+    # Only the trained units, with the trained reference data: no area,
+    # dissemination or reference file is read.
+    keep = frozenset(blend.units)
+    model_onsets = {
+        model.name: onsets.forecast(
+            config, model, keep_ids=keep, reference=blend.reference, area=domain.AreaFilter.everything(),
+            workers=resources.workers, budget_bytes=resources.budget_bytes,
         )
-        keep = frozenset(blend.units)
-        model_onsets = {
-            model.name: onsets.forecast(
-                config, model, keep_ids=keep, workers=resources.workers, budget_bytes=resources.budget_bytes
-            )
-            for model in config.models
-        }
-        climatology = climatology_stage.build(
-            config, blend.observed, [year], test_years=(year, year), workers=resources.workers
-        )
-        # No trimming: a forecast must not know when the onset came.
-        weekly = features.weekly(config, climatology, blend.observed, model_onsets, trim=False)
+        for model in config.models
+    }
+    climatology = climatology_stage.build(
+        config, blend.observed, [year], test_years=(year, year), workers=resources.workers
+    )
+    # No trimming: a forecast must not know when the onset came.
+    weekly = features.weekly(config, climatology, blend.observed, model_onsets, trim=False)
     if issue_date is not None:
         weekly = weekly[pd.to_datetime(weekly["time"]).dt.date == issue_date]
     rows = weekly.dropna(subset=_input_columns(blend.model, weekly)).reset_index(drop=True)

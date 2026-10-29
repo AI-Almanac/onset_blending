@@ -16,6 +16,7 @@ from . import _parallel, climatology as climatology_stage, features, onsets
 from .climatology import Climatology
 from .config import BlendConfig
 from .onsets import ForecastOnsets, ObservedOnsets
+from .reference import Reference
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class Resources:
 class Inputs:
     """Everything the blend is fitted on, stage by stage."""
 
+    reference: Reference
     observed: ObservedOnsets
     forecasts: dict[str, ForecastOnsets]
     climatology: Climatology
@@ -70,7 +72,8 @@ def prepare(
         log.info("%s in %.1fs", stage, timings[stage])
 
     started = time.perf_counter()
-    observed = onsets.observed(config, workers=workers, budget_bytes=budget)
+    reference = Reference.resolve(config)
+    observed = onsets.observed(config, reference=reference, workers=workers, budget_bytes=budget)
     lap("observed onsets", started)
 
     # Under the inner join only units the climatology keeps survive, so the
@@ -80,7 +83,8 @@ def prepare(
     for model in config.models:
         started = time.perf_counter()
         forecasts[model.name] = onsets.forecast(
-            config, model, keep_ids=blendable, daily=daily, workers=workers, budget_bytes=budget
+            config, model, keep_ids=blendable, daily=daily, reference=reference,
+            workers=workers, budget_bytes=budget,
         )
         lap(f"{model.name} forecast onsets", started)
 
@@ -105,6 +109,7 @@ def prepare(
     if "climatology" not in keep:
         climatology.release()
     return Inputs(
+        reference=reference,
         observed=observed,
         forecasts=forecasts,
         climatology=climatology,

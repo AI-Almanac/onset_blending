@@ -15,6 +15,7 @@ import xarray as xr
 from . import _parallel, _specs, domain, inputs, readers
 from ._legacy import nc_utils, onset_utils
 from .config import BlendConfig, ForecastModel
+from .reference import OBSERVATIONS, Reference
 
 # Peak bytes per forecast value while one file is processed (the values read
 # at kept points, measured below), and the cost beyond its values.
@@ -22,15 +23,17 @@ _FORECAST_BYTES_PER_VALUE = 18
 _FORECAST_FIXED_BYTES = 512 * 2**20
 
 
-def _context(config: BlendConfig, spec: dict) -> dict:
+def _context(config: BlendConfig, spec: dict, reference: Reference, source: str,
+             area: domain.AreaFilter | None) -> dict:
     return {
         "spec": spec,
         "onset_params": onset_utils.read_onset_params(spec),
         "convention": domain.id_convention(config),
-        "area": domain.AreaFilter(config),
-        "thresholds": onset_utils.read_thresholds(spec),
-        "reference_onset": onset_utils.read_ref_onset_dates(spec),
-        "cell_transform": nc_utils.read_cell_transform(spec),
+        "area": area if area is not None else domain.AreaFilter(config),
+        "thresholds": reference.thresholds,
+        "reference_onset": reference.reference_onset,
+        "cell_transform": reference.cell_transforms.get(source),
+        "regridder": reference.regridder(source),
     }
 
 
@@ -45,7 +48,16 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
     read = readers.read_observations(
         path, context["spec"]["input"]["value_col"], context["spec"]["dimensions"]["rename"]
     )
-    points = domain.with_ids(read.points, context["convention"])
+    rain_by_point, points = read.rain, read.points
+    regridder = context["regridder"]
+    if regridder is not None and "id" not in points.columns:
+        transform = regridder.transform(*domain.grid_axes(points))
+        source = domain.point_sources(points, transform)
+        values = np.full((len(transform.source_ids), rain_by_point.shape[0]), np.nan)
+        values[source[source >= 0]] = rain_by_point[:, source >= 0].T
+        rain_by_point = domain.Regridder.apply(transform, values).T
+        points = pd.DataFrame({"id": pd.Series(regridder.targets, dtype=str)})
+    points = domain.with_ids(points, context["convention"])
     kept = np.zeros(len(points), dtype=bool)
     kept[context["area"](points.assign(_point=np.arange(len(points))))["_point"].to_numpy()] = True
     ids = points["id"].to_numpy()[kept]
@@ -53,7 +65,7 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
         return _observed_file_from_table(path, context)
     spec = context["spec"]
     policy = str(spec["options"]["missing_rain_policy"]).lower()
-    rain = read.rain[:, kept].astype(float)
+    rain = rain_by_point[:, kept].astype(float)
     if policy == "zero":
         rain = np.where(np.isnan(rain), 0.0, rain)
 
@@ -213,13 +225,13 @@ class ObservedOnsets:
         return frozenset(self.data["unit"].values[counts >= int(min_onset_years)].astype(str))
 
 
-def observed(config: BlendConfig, *, workers: int = 1, budget_bytes: int | None = None) -> ObservedOnsets:
+def observed(config: BlendConfig, *, reference: Reference | None = None, workers: int = 1,
+             budget_bytes: int | None = None) -> ObservedOnsets:
     """Observed onsets for every observation file."""
     paths = inputs.list_files(config.observations.files, config, "observations")
-    weights = _regrid_weights(config, None)
-    context = _context(config, _specs.observation_spec(config))
-    with domain.on_units(paths, weights, workers=workers, budget_bytes=budget_bytes) as unit_paths:
-        parts = _parallel.map_ordered(_observed_file, unit_paths, context, workers)
+    reference = reference or Reference.resolve(config)
+    context = _context(config, _specs.observation_spec(config), reference, OBSERVATIONS, None)
+    parts = _parallel.map_ordered(_observed_file, paths, context, workers)
     return ObservedOnsets.from_frames(parts, config.onset.season_start)
 
 
@@ -350,6 +362,10 @@ def _forecast_file(path: Path, context: dict) -> tuple[xr.Dataset, bool]:
     at a time."""
     if context["cell_transform"] is not None or context["area"].dissemination:
         return _forecast_file_from_table(path, context)
+    if context["regridder"] is not None:
+        points = nc_utils.forecast_points(str(path), context["variable"], context["spec"]["dimensions"]["rename"], day_dim="day")
+        if points is not None and "id" not in points.columns:
+            return _regridded_forecast_file(path, points, context)
     masks = _kept_mask(path, context)
     if masks is None:
         return _forecast_file_from_table(path, context)
@@ -368,6 +384,41 @@ def _forecast_file(path: Path, context: dict) -> tuple[xr.Dataset, bool]:
         for start, stop, rain in forecast.issue_runs():
             summary.add(start, stop, rain[:, selected])
         return summary.dataset(), forecast.member_spread
+
+
+def _regridded_forecast_file(path: Path, points: pd.DataFrame, context: dict) -> tuple[xr.Dataset, bool]:
+    """A gridded forecast summarised on the blend's units: each run of issues
+    is read at the cells feeding the kept units and regridded in memory, then
+    scaled (the legacy order: regrid the file, scale as it is read)."""
+    regridder = context["regridder"]
+    transform = regridder.transform(*domain.grid_axes(points))
+    source = domain.point_sources(points, transform)
+    units = pd.DataFrame({"id": pd.Series(regridder.targets, dtype=str)})
+    in_area = np.zeros(len(units), dtype=bool)
+    in_area[context["area"].area(units.assign(_point=np.arange(len(units))))["_point"].to_numpy()] = True
+    keep = in_area & (units["id"].isin(context["keep_ids"]).to_numpy() if context["keep_ids"] is not None else True)
+    kept_units = np.flatnonzero(keep)
+    feeding = np.isin(source, domain.Regridder.sources_of(transform, kept_units))
+    spec = context["spec"]
+    with readers.ForecastFile(path, context["variable"], spec["dimensions"]["rename"], spec, feeding) as forecast:
+        selected = slice(None)
+        if forecast.members is not None and context["max_member"] is not None:
+            selected = forecast.members <= context["max_member"]
+        rows = source[feeding]
+        summary = _Summary(units["id"].to_numpy()[keep], forecast.issues, forecast.days, context)
+        member_spread = False
+        for start, stop, rain in forecast.issue_runs():
+            n_run, n_member, _, n_day = rain.shape
+            values = np.full((len(transform.source_ids), n_run * n_member * n_day), np.nan)
+            values[rows] = rain.transpose(2, 0, 1, 3).reshape(len(rows), -1)
+            regridded = domain.Regridder.apply(transform, values)[kept_units]
+            regridded = regridded.reshape(len(kept_units), n_run, n_member, n_day).transpose(1, 2, 0, 3)
+            if context["unit_scale"] != 1.0:
+                regridded = regridded * context["unit_scale"]
+            if forecast.members is not None and not member_spread:
+                member_spread = bool(((~np.isnan(regridded)).sum(axis=1) >= 2).any())
+            summary.add(start, stop, np.ascontiguousarray(regridded[:, selected]))
+    return summary.dataset(), member_spread
 
 
 def _summarise(rain: np.ndarray, ids: np.ndarray, issues: np.ndarray, days: list[int], context: dict) -> xr.Dataset:
@@ -534,6 +585,8 @@ def forecast(
     *,
     keep_ids: frozenset[str] | None = None,
     daily: bool = False,
+    reference: Reference | None = None,
+    area: domain.AreaFilter | None = None,
     workers: int = 1,
     budget_bytes: int | None = None,
 ) -> ForecastOnsets:
@@ -542,22 +595,21 @@ def forecast(
     keep_ids, when given, limits the units to those (the blendable units
     under the inner join); the results for them are unchanged. daily also
     keeps what only the day-level table reports: the members' rain spread,
-    the raining fraction and the reference onset dates.
+    the raining fraction and the reference onset dates. reference and area
+    default to the config's (a forecast passes the trained blend's).
     """
     paths = inputs.list_files(model.files, config, f"model {model.name}")
     spec = _specs.forecast_spec(config, model)
     context = {
-        **_context(config, spec),
+        **_context(config, spec, reference or Reference.resolve(config), model.name, area),
         "variable": model.variable,
         "unit_scale": float(model.unit_scale),
         "keep_ids": keep_ids,
         "daily": daily,
         "max_member": model.max_member,
     }
-    weights = _regrid_weights(config, model)
-    with domain.on_units(paths, weights, workers=workers, budget_bytes=budget_bytes) as unit_paths:
-        count = _parallel.workers_within([_forecast_bytes(p, context) for p in unit_paths], workers, budget_bytes)
-        results = _parallel.map_ordered(_forecast_file, unit_paths, context, count)
+    count = _parallel.workers_within([_forecast_bytes(p, context) for p in paths], workers, budget_bytes)
+    results = _parallel.map_ordered(_forecast_file, paths, context, count)
     units = [tuple(data["unit"].values) for data, _ in results]
     if len(set(units)) > 1:
         raise ValueError(f"model {model.name}: its files cover different units")
@@ -569,17 +621,3 @@ def forecast(
         else None
     )
     return ForecastOnsets(model=model.name, data=data, has_spread=any(spread for _, spread in results))
-
-
-def _regrid_weights(config: BlendConfig, model: ForecastModel | None) -> Path | None:
-    """The weights that put a model's (or the observations') grid on the units."""
-    regrid = config.domain.regrid
-    if regrid is None:
-        return None
-    supplied = (model.regrid_weights if model is not None else None) or regrid.weights
-    if supplied is None:
-        raise NotImplementedError(
-            "Building regrid weights from domain.regrid.shapefile arrives later in phase 2; "
-            "give domain.regrid.weights for now"
-        )
-    return config.path(supplied)

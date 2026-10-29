@@ -1,9 +1,10 @@
 """TrainedBlend: everything operations needs from training, in one file.
 
 A trained blend holds its recipe (the BlendConfig, with every derived default
-frozen), the fitted model, the reference data training read (frozen as the
-files' bytes), the observed onsets the climatology is fitted on, and each
-model's forecast signature. A forecast takes only live forecast files and an
+frozen), the fitted model, the reference data training resolved
+(thresholds, reference onsets, regrid and cell weights, as arrays), the
+observed onsets the climatology is fitted on, and each model's forecast
+signature. A forecast takes only live forecast files and an
 issue date; everything else comes from here, so operations cannot run with
 other parameters than training did.
 
@@ -33,6 +34,7 @@ import yaml
 
 from ._specs import _FORECAST_DIMS
 from .onsets import ObservedOnsets
+from .reference import Reference
 from .config import BlendConfig, ConfigError, ForecastModel
 
 # Bump whenever the numbers the features are computed from change: a blend
@@ -141,48 +143,6 @@ def _brief(value) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Reference files frozen into the blend
-# ---------------------------------------------------------------------------
-
-# Config paths training read that are not forecast inputs, as attribute paths.
-def _reference_paths(config: BlendConfig) -> list[tuple[tuple, str]]:
-    found = []
-
-    def add(route, value):
-        if value is not None:
-            found.append((route, value))
-
-    add(("onset", "threshold", "file"), config.onset.threshold.file)
-    if config.onset.reference_onset is not None:
-        add(("onset", "reference_onset", "file"), config.onset.reference_onset.file)
-    add(("observations", "cell_transform"), config.observations.cell_transform)
-    domain = config.domain
-    if domain.regrid is not None:
-        add(("domain", "regrid", "weights"), domain.regrid.weights)
-    if domain.dissemination is not None:
-        add(("domain", "dissemination", "file"), domain.dissemination.file)
-    if domain.centroids is not None:
-        add(("domain", "centroids", "file"), domain.centroids.file)
-    if domain.area_of_interest is not None:
-        add(("domain", "area_of_interest", "geometry"), domain.area_of_interest.geometry)
-    for index, model in enumerate(config.models):
-        add(("models", index, "cell_transform"), model.cell_transform)
-        add(("models", index, "regrid_weights"), model.regrid_weights)
-    return found
-
-
-def _replace(node, route: tuple, value):
-    """node with the attribute at route replaced (tuples indexed by position)."""
-    head, *rest = route
-    if isinstance(node, tuple):
-        items = list(node)
-        items[head] = _replace(items[head], tuple(rest), value) if rest else value
-        return tuple(items)
-    child = getattr(node, head)
-    return dataclasses.replace(node, **{head: _replace(child, tuple(rest), value) if rest else value})
-
-
-# ---------------------------------------------------------------------------
 # Arrays without pickles
 # ---------------------------------------------------------------------------
 
@@ -209,7 +169,7 @@ class TrainedBlend:
     observed: ObservedOnsets            # what the climatology is fitted on
     units: tuple[str, ...]              # the units the blend was trained and scores on
     signatures: dict[str, dict]         # model name -> forecast signature
-    reference_files: dict[str, bytes]   # frozen reference inputs, by artifact name
+    reference: Reference                # thresholds, reference onsets, regrid and cell weights
     provenance: dict = field(default_factory=dict)
 
     # -- building -----------------------------------------------------------
@@ -226,14 +186,6 @@ class TrainedBlend:
                 config.climatology, train_years=climatology.train_years, test_years=climatology.test_years
             ),
         )
-        reference_files, frozen = {}, resolved
-        for index, (route, value) in enumerate(_reference_paths(resolved)):
-            source = resolved.path(value)
-            name = f"reference/{index}-{source.name}"
-            reference_files[name] = source.read_bytes()
-            frozen = _replace(frozen, route, name)
-        frozen = dataclasses.replace(frozen, data_root=None)
-
         signatures, problems = {}, []
         for model_config in config.models:
             files = input_files.list_files(model_config.files, config, f"model {model_config.name}")
@@ -251,12 +203,12 @@ class TrainedBlend:
             raise ConfigError(problems)
 
         return cls(
-            config=frozen,
+            config=resolved,
             model=model,
             observed=inputs.observed,
             units=tuple(sorted(inputs.weekly["id"].astype(str).unique())),
             signatures=signatures,
-            reference_files=reference_files,
+            reference=inputs.reference,
             provenance={
                 "trained_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
                 "training_years": list(config.evaluation.years.training),
@@ -283,7 +235,9 @@ class TrainedBlend:
         })
         members["units.json"] = json.dumps(list(self.units)).encode()
         members["signatures.json"] = json.dumps(self.signatures, indent=1).encode()
-        members.update(self.reference_files)
+        reference_meta, reference_arrays = self.reference.to_arrays()
+        members["reference.json"] = json.dumps(reference_meta).encode()
+        members["reference.npz"] = _npz_bytes(reference_arrays)
         try:
             package_version = version("onset-blending")
         except PackageNotFoundError:
@@ -346,7 +300,7 @@ class TrainedBlend:
             observed=observed,
             units=tuple(json.loads(members["units.json"])),
             signatures=json.loads(members["signatures.json"]),
-            reference_files={n: d for n, d in members.items() if n.startswith("reference/")},
+            reference=Reference.from_arrays(json.loads(members["reference.json"]), _npz_load(members["reference.npz"])),
             provenance=manifest.get("provenance", {}),
         )
 
