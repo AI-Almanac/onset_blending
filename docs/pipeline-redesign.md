@@ -1,8 +1,7 @@
 # Redesign: onset_blending owns the blend pipeline, in memory
 
 Status: phase 1 (config) done. Phases 2 and 3: the package side is done;
-ai-almanac's side (dataset normalisation, the live writer, switching its
-runners) is next.
+ai-almanac's side (the live writer, switching its runners) is next.
 
 Phase 2 verification, against the cached references:
 - Ethiopia: `train()` reproduces every artifact exactly (combined and weekly
@@ -207,29 +206,44 @@ drift silently; only the feature names are checked. Keeping the recipe and
 reference data inside the trained blend removes that possibility rather than
 detecting it.
 
-**Forecasts must have the structure the blend was trained on.** Live files
-are read only with the trained reading rules (variable, dimension renames,
-unit scale, member and lead-day selection); there is no per-file override.
-Training records each model's forecast signature, which is what the blend
-actually reads after those rules:
+**A forecast must cover what the blend was trained on.** Files need not share
+a layout: each file is read in its own format (`formats.py`, the rules
+ai-almanac registers datasets by). A dimension's role comes from the model's
+`dims`, else its name (aliases such as `prediction_timedelta_daily`,
+`member`, `latitude`), else a lead coordinate counted in days; rainfall is
+converted to millimetres from the variable's declared `units` (`m` ×1000,
+`mm`, `kg m-2`), the model's `unit_scale` applying only to files that
+declare none. Training records each model's forecast signature, what the
+blend reads in that resolved form:
 
-- the variable and its `units` attribute;
-- the dimension names and sizes (order is irrelevant to xarray, so it is not
-  compared);
+- the variable and the units its rainfall is read in (mm, or undeclared);
+- how its daily values were aggregated: the cell method over the lead
+  dimension (`cell_methods`, e.g. sum) and the window the lead coordinate
+  states (e.g. "End of the UTC calendar-day aggregation window (00:00 UTC
+  of the following date)");
 - the ensemble member ids;
 - the lead days;
-- the grid: lat/lon values, or unit ids for files already on units;
-- the issue time of day (00Z or 12Z shifts every lead day).
+- the grid: its lat/lon values as sets, or unit ids for files already on units;
+- other dimensions' sizes and the issue time of day (00Z or 12Z shifts every
+  lead day).
 
 Every training file must give the same signature, apart from the issue dates.
 Otherwise training refuses and names the files that differ: a blend fitted on
-a mix of ensemble sizes has no single ensemble to forecast with. An
-operational forecast must give exactly the trained signature, apart from its
-own issue dates. Members or lead days that the trained selection drops (past
-`max_member` or `lead_days.max`) do not count; any other difference refuses
-the forecast. That includes fewer or different members, missing lead days,
-another grid, other units, or another initialisation hour. Live rainfall
-magnitude is also compared with training, a second guard on units.
+a mix of ensemble sizes has no single ensemble to forecast with.
+
+A live file may hold more than the blend was trained on and is trimmed to
+it: longer leads, more members (only the trained member ids are read), a
+larger domain such as the globe (only the trained units are read). It is
+refused when it holds less, or something else:
+- lead days, members or grid points the training had are missing;
+- an ensemble where training was deterministic, or the reverse;
+- the grid has another resolution (its spacing differs), even where its
+  points include the trained ones;
+- rainfall in other units after conversion (e.g. declared against
+  undeclared), another aggregation method or window, another issue hour,
+  another variable or other dimension sizes.
+A file that declares no aggregation is accepted only against training files
+that declared none.
 
 The other checks, made before any work with every problem reported at once:
 - exactly the trained models are supplied;
@@ -249,41 +263,33 @@ Atomicity:
   across library versions and is safe to read.
 
 ai-almanac stores the one `.blend` file per trained blend and calls
-`forecast()`. Under the signature rule, the live files it assembles
-(`forecast_pipeline.assemble_season_netcdf`: time × day × lat × lon, `tp`,
-mm) must match the layout each model was trained from. Registered datasets
-are read with their own renames and unit scales (`model_layouts`); India's
-AIFS uses `prediction_timedelta_daily` and metres. Decision: datasets are normalised to the
-standard layout once, at registration, so training and live files come from
-the same layout and `model_layouts` goes away.
+`forecast()` with one single-initialisation file per model. Registered
+archives keep their own layout: no copies are written, and `model_layouts`
+is not needed by this path (each file says its format). India's and
+Ethiopia's AIFS, Aurora and GraphCast archives use
+`prediction_timedelta_daily` and metres, declaring `cell_methods:
+prediction_timedelta: sum` and the UTC-day window on the lead coordinate;
+the live writer writes `day` and mm.
 
-The standard layout, one `{year}.nc` per season:
-
-- `tp` in mm (`units: mm`), float32, dims `(time, number, day, lat, lon)`;
-  `number` only for ensembles;
-- `time` is the issue date at 00Z;
-- `day` holds integer lead days 1..N. Day k is the UTC day ending at
-  issue + k days, i.e. hours (24(k−1), 24k], the convention of every
-  registered archive;
-- `lat` and `lon` ascend.
-
-A survey of ai-almanac against this layout found two live-path defects. They
-are inferred from the code and the files' attributes, not yet checked on live
-output:
+The live writer must still produce what the archives hold, which the
+signature check now enforces. A survey of ai-almanac's writer found two
+defects, inferred from the code and the files' attributes:
 - **Lead days.** Live day d sums the 6-hourly steps at lead hours
   24d … 24d+18, i.e. hours (24d−6, 24d+18], so it overlaps archive day d+1
   by 18 h. Live forecasts are scored about a day late against blends trained
-  on the archives.
+  on the archives. Archive day k is the UTC day ending at issue + k days,
+  hours (24(k−1), 24k] for a 00Z issue.
 - **Members.** Live ensemble runs average their 8 members into one trajectory
   before writing, while the archives keep 26 members. The ensemble onset
   probabilities (the share of members with an onset) then come from a single
   mean trajectory.
 Decision: live ensemble runs keep all 26 members separate, and the live
-writer uses the archive lead-day convention. The signature check then holds
-for every existing blend. Its live path today re-supplies parameters from the job record,
-and the weekly-feature settings fall back to code defaults (day_max,
-days_per_week, n_weeks, rain_window). Those match training only because
-training never overrides them.
+writer uses the archive lead-day convention and declares it (the archive's
+`cell_methods` and lead-window description) with `units: mm`. Its live path
+today also re-supplies parameters from the job record, and the
+weekly-feature settings fall back to code defaults (day_max, days_per_week,
+n_weeks, rain_window). Those match training only because training never
+overrides them.
 
 Existing operational blends (a coefficient pickle plus a spec set) import once
 with `TrainedBlend.from_legacy(coef_pkl, config)`. It builds the reference data

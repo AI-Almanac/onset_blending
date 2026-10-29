@@ -22,6 +22,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
@@ -32,7 +33,7 @@ import pandas as pd
 import xarray as xr
 import yaml
 
-from ._specs import _FORECAST_DIMS
+from . import formats
 from .onsets import ObservedOnsets
 from .reference import Reference
 from .config import BlendConfig, ConfigError, ForecastModel
@@ -50,19 +51,21 @@ _MANIFEST = "manifest.json"
 # ---------------------------------------------------------------------------
 
 
-def forecast_signature(path: str | Path, model: ForecastModel) -> dict:
-    """What the blend reads from one forecast file after the trained reading
-    rules (renames, lead-day and member selection), apart from the issue
-    dates: variable and units, dimension sizes, member ids, lead days, the
-    grid, and the issue time of day."""
+def forecast_signature(path: str | Path, model: ForecastModel, *, selected: bool = True) -> dict:
+    """What a forecast file holds, read in its own format (formats), apart
+    from the issue dates: the variable, the units its rainfall is read in
+    and how its daily values were aggregated, other dimension sizes, member
+    ids, lead days, the grid (as sets: order is the file's own) and the
+    issue time of day. selected: after the model's lead-day and member
+    selection, as training reads it; else all a (live) file holds."""
     import netCDF4
 
-    rename = {str(k).lower(): v for k, v in {**_FORECAST_DIMS, **model.dims}.items()}
     with netCDF4.Dataset(path) as ds:
         if model.variable not in ds.variables:
             raise ValueError(f"{Path(path).name} has no {model.variable!r} variable")
+        fmt = formats.forecast_format(ds, model.variable, model.dims, model.unit_scale, where=Path(path).name)
         variable = ds.variables[model.variable]
-        names = {d: rename.get(d.lower(), d) for d in variable.dimensions}
+        names = {d: fmt.rename.get(d, d) for d in variable.dimensions}
 
         def values(dim):
             if dim in ds.variables:
@@ -70,11 +73,9 @@ def forecast_signature(path: str | Path, model: ForecastModel) -> dict:
                 return np.asarray(raw.filled(np.nan) if np.ma.isMaskedArray(raw) else raw)
             return np.arange(len(ds.dimensions[dim]))
 
-        signature: dict = {
-            "variable": model.variable,
-            "units": str(getattr(variable, "units", "")) or None,
-            "dims": {},
-        }
+        signature: dict = {"variable": model.variable, "units": fmt.units, "dims": {}}
+        lead_dim = next((d for d, name in names.items() if name == "day"), None)
+        signature["aggregation"] = _aggregation(ds, variable, lead_dim)
         for dim, name in names.items():
             if name == "time":
                 times = ds.variables[dim]
@@ -88,14 +89,14 @@ def forecast_signature(path: str | Path, model: ForecastModel) -> dict:
             if name == "day":
                 days = [int(v) for v in vals]
                 lead = model.lead_days
-                signature["lead_days"] = [d for d in days if lead.min <= d <= lead.max]
+                signature["lead_days"] = [d for d in days if lead.min <= d <= lead.max] if selected else days
             elif name == "number":
                 members = [int(v) for v in vals]
-                if model.max_member is not None:
+                if model.max_member is not None and selected:
                     members = [m for m in members if m <= model.max_member]
                 signature["members"] = members
             elif name in ("lat", "lon"):
-                signature[name] = [round(float(v), 6) for v in vals]
+                signature[name] = sorted(round(float(v), 6) for v in vals)
             elif name == "adm3_name":
                 signature["unit_ids"] = sorted(str(v) for v in vals)
             else:
@@ -107,11 +108,12 @@ def issue_dates(path: str | Path, model: ForecastModel) -> list[dt.date]:
     """The issue dates a forecast file holds."""
     import netCDF4
 
-    rename = {str(k).lower(): v for k, v in {**_FORECAST_DIMS, **model.dims}.items()}
     with netCDF4.Dataset(path) as ds:
-        dims = ds.variables[model.variable].dimensions if model.variable in ds.variables else ()
-        for dim in dims:
-            if rename.get(dim.lower(), dim) == "time" and dim in ds.variables:
+        if model.variable not in ds.variables:
+            return []
+        rename = formats.forecast_format(ds, model.variable, model.dims, model.unit_scale, where=Path(path).name).rename
+        for dim in ds.variables[model.variable].dimensions:
+            if rename.get(dim) == "time" and dim in ds.variables:
                 times = ds.variables[dim]
                 stamps = netCDF4.num2date(
                     times[:], times.units, getattr(times, "calendar", "standard"),
@@ -121,17 +123,70 @@ def issue_dates(path: str | Path, model: ForecastModel) -> list[dt.date]:
     return []
 
 
+def _aggregation(ds, variable, lead_dim: str | None) -> dict:
+    """How the file says its daily values were made: the cell method over
+    its lead dimension (e.g. sum) and the window its lead coordinate states
+    (e.g. the UTC day ending at the issue time plus the lead), or None
+    where it does not say."""
+    method = None
+    if lead_dim is not None:
+        for name, how in re.findall(r"([^\s:]+):\s*([^\s:]+)", str(getattr(variable, "cell_methods", "") or "")):
+            if name in (lead_dim, "day") or lead_dim.startswith(name):
+                method = how.lower()
+    window = None
+    if lead_dim is not None and lead_dim in ds.variables:
+        coordinate = ds.variables[lead_dim]
+        text = getattr(coordinate, "description", None) or getattr(coordinate, "long_name", None)
+        window = " ".join(str(text).lower().split()) if text else None
+    return {"method": method, "window": window}
+
+
 def _signature_differences(trained: dict, live: dict) -> list[str]:
-    labels = {
-        "variable": "variable", "units": "units", "dims": "other dimensions",
-        "issue_hours": "issue hour (UTC)", "lead_days": "lead days", "members": "members",
-        "lat": "latitudes", "lon": "longitudes", "unit_ids": "unit ids",
-    }
+    """How a live file fails to cover the trained signature. It may hold
+    more (longer leads, more members, a larger domain such as the globe):
+    the blend reads only what it was trained on. It may not hold less, nor
+    another resolution, units, aggregation, issue hour or variable."""
     out = []
-    for key, label in labels.items():
+    for key, label in (
+        ("variable", "variable"), ("units", "rainfall units"), ("aggregation", "daily aggregation"),
+        ("issue_hours", "issue hour (UTC)"), ("dims", "other dimensions"),
+    ):
         if trained.get(key) != live.get(key):
             out.append(f"{label} {_brief(live.get(key))}, trained on {_brief(trained.get(key))}")
+    for key, label in (("lead_days", "lead days"), ("members", "members"), ("unit_ids", "unit ids")):
+        have, need = live.get(key), trained.get(key)
+        if (have is None) != (need is None):
+            out.append(f"{label} {_brief(have)}, trained on {_brief(need)}")
+        elif need is not None and set(need) - set(have):
+            missing = sorted(set(need) - set(have))
+            out.append(f"{label} {_brief(have)}, trained on {_brief(need)} (missing {_brief(missing)})")
+    for key, label in (("lat", "latitudes"), ("lon", "longitudes")):
+        have, need = live.get(key), trained.get(key)
+        if (have is None) != (need is None):
+            out.append(f"{label} {_brief(have)}, trained on {_brief(need)}")
+        elif need is not None:
+            have_step, need_step = _grid_step(have), _grid_step(need)
+            if None not in (have_step, need_step) and have_step != need_step:
+                out.append(f"{label} every {_degrees(have_step)}, trained on every {_degrees(need_step)} (another resolution)")
+            elif set(need) - set(have):
+                out.append(
+                    f"{label} {_span(have)}, trained on {_span(need)}: the trained domain is not covered"
+                )
     return out
+
+
+def _grid_step(values: list[float]) -> float | None:
+    """A grid's spacing (the median gap between its distinct values)."""
+    distinct = np.unique(values)
+    return round(float(np.median(np.diff(distinct))), 6) if len(distinct) > 1 else None
+
+
+def _degrees(step: float | None) -> str:
+    return "?" if step is None else f"{step:g}°"
+
+
+def _span(values: list[float]) -> str:
+    return f"{min(values):g}–{max(values):g}" if values else "none"
 
 
 def _brief(value) -> str:
@@ -323,7 +378,7 @@ class TrainedBlend:
             model = self.config.model(name)
             for path in forecasts[name]:
                 try:
-                    live = forecast_signature(path, model)
+                    live = forecast_signature(path, model, selected=False)
                 except (OSError, ValueError) as exc:
                     problems.append(f"{name}: {Path(path).name}: {exc}")
                     continue

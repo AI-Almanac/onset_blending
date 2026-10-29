@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from . import _parallel, _specs, domain, inputs, readers
+from . import _parallel, _specs, domain, formats, inputs, readers
 from ._legacy import nc_utils, onset_utils
 from .config import BlendConfig, ForecastModel
 from .reference import OBSERVATIONS, Reference
@@ -358,9 +358,19 @@ def _unit_frame_values(context: dict, ids: np.ndarray, issues: np.ndarray):
     return thresholds, ref
 
 
+def _file_context(path: Path, context: dict) -> dict:
+    """The context for one file, read in its own format: its dimension names
+    and the scale that puts its rainfall in millimetres (see formats)."""
+    fmt = formats.of_file(path, context["variable"], context["dims"], context["fallback_unit_scale"])
+    dimensions = context["spec"]["dimensions"]
+    spec = {**context["spec"], "dimensions": {**dimensions, "rename": {**dimensions["rename"], **fmt.rename}}}
+    return {**context, "spec": spec, "unit_scale": fmt.scale}
+
+
 def _forecast_file(path: Path, context: dict) -> tuple[xr.Dataset, bool]:
     """One forecast file's onset counts and rain summaries, a run of issues
     at a time."""
+    context = _file_context(path, context)
     if context["cell_transform"] is not None or context["area"].dissemination:
         return _forecast_file_from_table(path, context)
     if context["regridder"] is not None:
@@ -376,15 +386,26 @@ def _forecast_file(path: Path, context: dict) -> tuple[xr.Dataset, bool]:
         path, context["variable"], spec["dimensions"]["rename"], spec, keep,
         spread_over=in_area, scale=context["unit_scale"],
     ) as forecast:
-        selected = slice(None)
-        if forecast.members is not None and context["max_member"] is not None:
-            selected = forecast.members <= context["max_member"]
-            if not selected.any():
-                raise ValueError(f"{path.name}: no members <= {context['max_member']}")
+        selected = _selected_members(forecast.members, context, path)
         summary = _Summary(points["id"].to_numpy()[keep], forecast.issues, forecast.days, context)
         for start, stop, rain in forecast.issue_runs():
             summary.add(start, stop, rain[:, selected])
         return summary.dataset(), forecast.member_spread
+
+
+def _selected_members(members: np.ndarray | None, context: dict, path: Path):
+    """The members read: up to max_member, and only member_ids when given
+    (a forecast reads the members the blend was trained on)."""
+    if members is None or (context["max_member"] is None and context["member_ids"] is None):
+        return slice(None)
+    selected = np.ones(len(members), dtype=bool)
+    if context["max_member"] is not None:
+        selected &= members <= context["max_member"]
+    if context["member_ids"] is not None:
+        selected &= np.isin(members, context["member_ids"])
+    if not selected.any():
+        raise ValueError(f"{path.name}: none of its members are read")
+    return selected
 
 
 def _regridded_forecast_file(path: Path, points: pd.DataFrame, context: dict) -> tuple[xr.Dataset, bool]:
@@ -402,9 +423,7 @@ def _regridded_forecast_file(path: Path, points: pd.DataFrame, context: dict) ->
     feeding = np.isin(source, domain.Regridder.sources_of(transform, kept_units))
     spec = context["spec"]
     with readers.ForecastFile(path, context["variable"], spec["dimensions"]["rename"], spec, feeding) as forecast:
-        selected = slice(None)
-        if forecast.members is not None and context["max_member"] is not None:
-            selected = forecast.members <= context["max_member"]
+        selected = _selected_members(forecast.members, context, path)
         rows = source[feeding]
         summary = _Summary(units["id"].to_numpy()[keep], forecast.issues, forecast.days, context)
         member_spread = False
@@ -550,6 +569,8 @@ def _forecast_file_from_table(path: Path, context: dict) -> tuple[xr.Dataset, bo
         df = df[df["id"].isin(context["keep_ids"])]
     if "number" in df.columns and context["max_member"] is not None:
         df = df[df["number"] <= context["max_member"]]
+    if "number" in df.columns and context["member_ids"] is not None:
+        df = df[df["number"].isin(context["member_ids"])]
     issues = np.sort(pd.to_datetime(df["time"].unique()).to_numpy())
     ids = np.sort(df["id"].astype(str).unique())
     members = np.sort(df["number"].unique()) if "number" in df.columns else np.array([0])
@@ -573,6 +594,9 @@ def _forecast_bytes(path: Path, context: dict) -> int:
         variable = ds.variables.get(context["variable"])
         if variable is None:
             return _FORECAST_FIXED_BYTES
+    context = _file_context(path, context)
+    with netCDF4.Dataset(path) as ds:
+        variable = ds.variables[context["variable"]]
         values = math.prod(variable.shape)
         chunks = variable.chunking()
         run = int(chunks[0]) if isinstance(chunks, list) else 1
@@ -596,6 +620,7 @@ def forecast(
     daily: bool = False,
     reference: Reference | None = None,
     area: domain.AreaFilter | None = None,
+    member_ids: list[int] | None = None,
     workers: int = 1,
     budget_bytes: int | None = None,
 ) -> ForecastOnsets:
@@ -605,17 +630,22 @@ def forecast(
     under the inner join); the results for them are unchanged. daily also
     keeps what only the day-level table reports: the members' rain spread,
     the raining fraction and the reference onset dates. reference and area
-    default to the config's (a forecast passes the trained blend's).
+    default to the config's (a forecast passes the trained blend's);
+    member_ids limits the members read (a forecast reads the trained ones).
     """
     paths = inputs.list_files(model.files, config, f"model {model.name}")
     spec = _specs.forecast_spec(config, model)
     context = {
         **_context(config, spec, reference or Reference.resolve(config), model.name, area),
         "variable": model.variable,
-        "unit_scale": float(model.unit_scale),
+        # Each file's own dimension names and units decide how it is read;
+        # these apply where a file does not say (see _file_context).
+        "dims": dict(model.dims),
+        "fallback_unit_scale": float(model.unit_scale),
         "keep_ids": keep_ids,
         "daily": daily,
         "max_member": model.max_member,
+        "member_ids": None if member_ids is None else [int(m) for m in member_ids],
     }
     count = _parallel.workers_within([_forecast_bytes(p, context) for p in paths], workers, budget_bytes)
     results = _parallel.map_ordered(_forecast_file, paths, context, count)

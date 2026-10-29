@@ -146,10 +146,14 @@ def run(blend, forecasts: dict, *, issue_date=None, resources=None) -> Forecast:
     )
     # Only the trained units, with the trained reference data: no area,
     # dissemination or reference file is read.
+    # A live file may hold more than the blend was trained on (longer leads,
+    # more members, a larger domain): only the trained lead days, members and
+    # units are read.
     keep = frozenset(blend.units)
     model_onsets = {
         model.name: onsets.forecast(
             config, model, keep_ids=keep, reference=blend.reference, area=domain.AreaFilter.everything(),
+            member_ids=blend.signatures[model.name].get("members"),
             workers=resources.workers, budget_bytes=resources.budget_bytes,
         )
         for model in config.models

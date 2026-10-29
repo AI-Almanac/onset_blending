@@ -89,8 +89,11 @@ class ForecastFile:
             self._tiles.append((bounds, grid_index[tuple(slice(a, b) for a, b in bounds)].reshape(-1)))
         self._perm = other_idx + [day_idx]
         self._dim_names = dim_names
-        tinfo = nc_utils.get_nc_time(ds)
-        stamps = pd.DatetimeIndex(nc_utils.nc_time_to_dates(dim_vals[dim_names[0]], tinfo["units"]))
+        # The issue dimension's own units, whatever it is called.
+        time_dim = dim_names[0]
+        units = getattr(ds.variables[time_dim], "units", None) if time_dim in ds.variables else None
+        units = units or nc_utils.get_nc_time(ds)["units"]
+        stamps = pd.DatetimeIndex(nc_utils.nc_time_to_dates(dim_vals[time_dim], units))
         self.issues = stamps.normalize().to_numpy()
 
     def __enter__(self):

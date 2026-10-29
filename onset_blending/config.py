@@ -285,8 +285,16 @@ class ForecastModel:
     name: str = _field(doc="Model name; prefixes every column derived from it.")
     files: FileSet = _field(doc="The model's forecast files.")
     variable: str = _field("tp", doc="Rainfall variable.")
-    dims: dict[str, str] = _field(factory=dict, doc="Rename dims to time/day/lat/lon/number.")
-    unit_scale: float = _field(1.0, doc="Multiply rainfall by this to get mm (e.g. 1000 for m).")
+    dims: dict[str, str] = _field(
+        factory=dict,
+        doc="Rename dims to time/day/lat/lon/number, for names a file's format does not "
+        "already tell (formats.py: aliases such as prediction_timedelta_daily, member).",
+    )
+    unit_scale: float = _field(
+        1.0,
+        doc="Multiply rainfall by this to get mm, for files that declare no units "
+        "(declared units, e.g. 'm', decide the conversion).",
+    )
     max_member: int | None = _field(None, doc="Keep members whose index is <= this.")
     lead_days: LeadDays = _field(factory=LeadDays, doc="Lead days read from the files.")
     rain_horizon: RainHorizon = _field(factory=RainHorizon)
