@@ -5,6 +5,7 @@ import dataclasses
 import io
 import json
 import pickle
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,7 @@ from onset_blending._legacy.blend_evaluation_utils import (
 )
 from onset_blending._legacy.nc_utils import ensure_id_col
 from onset_blending._legacy.spatial_id_utils import resolve_grid_id_convention
+from onset_blending.evaluation import evaluate
 from onset_blending.model import FittedModel, fit_final
 
 BINS = ["week1", "week2", "later"]
@@ -178,6 +180,23 @@ def test_final_fit_is_the_scripts_bundle():
     assert pickle.dumps(model.to_legacy_bundle()) == pickle.dumps(legacy)
     assert model.classes == ("later", "week1", "week2")
     assert model.n_samples == int(legacy["scaler"].n_samples_seen_)
+
+
+def test_final_fit_beside_the_cv_folds_is_the_scripts_bundle():
+    weekly = weekly_table()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        evaluation = evaluate(weekly, SPEC, dissemination(weekly), workers=2, final_model="blend")
+    formula, train = _legacy_final_training_rows(weekly, SPEC, dissemination(weekly), "blend")
+    bundle, legacy = evaluation.final_model.to_legacy_bundle(), _legacy_fit_final_model(formula, train)
+
+    # The same content (a worker's strings are its own objects, so the pickle's bytes differ).
+    assert sorted(bundle) == sorted(legacy)
+    pd.testing.assert_frame_equal(bundle["coefs"], legacy["coefs"], check_exact=True)
+    assert (bundle["features"], bundle["formula"]) == (legacy["features"], legacy["formula"])
+    assert list(vars(bundle["scaler"])) == list(vars(legacy["scaler"]))
+    for name, value in vars(legacy["scaler"]).items():
+        np.testing.assert_array_equal(vars(bundle["scaler"])[name], value, strict=True)
 
 
 def test_legacy_bundle_round_trip():

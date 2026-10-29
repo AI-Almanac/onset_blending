@@ -206,7 +206,7 @@ class TrainedBlend:
             config=resolved,
             model=model,
             observed=inputs.observed,
-            units=tuple(sorted(inputs.weekly["id"].astype(str).unique())),
+            units=tuple(sorted({str(unit) for unit in inputs.weekly.units})),
             signatures=signatures,
             reference=inputs.reference,
             provenance={

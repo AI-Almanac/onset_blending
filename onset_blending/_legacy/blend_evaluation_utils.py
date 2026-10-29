@@ -630,9 +630,13 @@ def _platt_fold(arrays, test_year):
     from threadpoolctl import threadpool_limits
 
     if not isinstance(arrays["p"], np.ndarray):
-        from .._parallel import attach
+        from .._parallel import attach, detach
 
-        arrays = attach(arrays)
+        specs = arrays
+        try:
+            return _platt_fold(attach(specs), test_year)
+        finally:
+            detach(specs)
     p_all, y_all, years = arrays["p"], arrays["y"], arrays["years"]
     test_rows = years == test_year
     train_positions = np.flatnonzero((years != test_year) & arrays["trainable"])
@@ -817,6 +821,13 @@ def _fit_predict_design(X_tr, y_tr, X_te, feature_cols, test_index, *, return_cl
     bad_tr = bad_tr | bad_outcome                                     # ← NEW
     X_tr = X_tr[~bad_tr]
     y_tr = y_tr[~bad_tr]
+    return _fit_and_predict(X_tr, y_tr, X_te, feature_cols, test_index, scaler, return_clf=return_clf)
+
+
+def _fit_and_predict(X_tr, y_tr, X_te, feature_cols, test_index, scaler, *, return_clf=False):
+    """The multinomial fit on prepared training rows (standardised, with an
+    outcome and finite features) and its probabilities for the test rows,
+    NaN where a test row has a non-finite feature."""
     if len(X_tr) == 0:
         #return None
         return (None, None) if return_clf else None 
@@ -855,6 +866,11 @@ def _parse_formula_cols(formula_str):
     return [c for c in cols if c and not c.isdigit() and c != "1"]
 
 
+def _as_float(values):
+    """A column's values as floats, non-numbers as NaN (a Series or an array)."""
+    return np.asarray(pd.to_numeric(values, errors="coerce"), dtype=float)
+
+
 def validate_formula_feature_support(data, formulas):
     """
     Validate that every enabled formula feature exists and has finite support.
@@ -881,9 +897,7 @@ def validate_formula_feature_support(data, formulas):
         for column in columns:
             if column not in data.columns:
                 continue
-            numeric = pd.to_numeric(data[column], errors="coerce").to_numpy(
-                dtype=float
-            )
+            numeric = _as_float(data[column])
             if np.isfinite(numeric).any():
                 continue
 
@@ -916,6 +930,15 @@ def apply_formula_sample_support(data, formulas):
     Returns the filtered DataFrame and diagnostics. Predictors that exist in
     the connector output but are unused by all formulas do not affect support.
     """
+    keep, diagnostics = formula_sample_support(data, formulas)
+    filtered = data.loc[keep].copy()
+    filtered.attrs["formula_sample_support"] = diagnostics
+    return filtered, diagnostics
+
+
+def formula_sample_support(data, formulas):
+    """The rows apply_formula_sample_support keeps (a boolean mask) and its
+    diagnostics, for a table or anything whose columns read as arrays."""
     feature_map = validate_formula_feature_support(data, formulas)
     required = list(dict.fromkeys(
         column
@@ -925,19 +948,15 @@ def apply_formula_sample_support(data, formulas):
     keep = np.ones(len(data), dtype=bool)
     excluded_by_column = {}
     for column in required:
-        numeric = pd.to_numeric(data[column], errors="coerce").to_numpy(
-            dtype=float
-        )
-        finite = np.isfinite(numeric)
+        finite = np.isfinite(_as_float(data[column]))
         excluded_by_column[column] = int((~finite).sum())
         keep &= finite
 
-    filtered = data.loc[keep].copy()
     diagnostics = {
         "policy": "common_complete",
         "required_columns": required,
         "rows_before": int(len(data)),
-        "rows_after": int(len(filtered)),
+        "rows_after": int(keep.sum()),
         "rows_excluded": int((~keep).sum()),
         "nonfinite_by_column": {
             column: count
@@ -945,8 +964,7 @@ def apply_formula_sample_support(data, formulas):
             if count
         },
     }
-    filtered.attrs["formula_sample_support"] = diagnostics
-    return filtered, diagnostics
+    return keep, diagnostics
 
 
 _GLOBAL_CV_WORKER_CONTEXT = None

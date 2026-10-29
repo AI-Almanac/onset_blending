@@ -7,17 +7,15 @@ import os
 import shutil
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
-from multiprocessing import get_context
 from pathlib import Path
 
 import pandas as pd
 
 from . import _parallel, climatology as climatology_stage, features, onsets
 from .climatology import Climatology
-from . import config as cfg
 from .config import BlendConfig
+from .features import Weekly
 from .onsets import ForecastOnsets, ObservedOnsets
 from .reference import Reference
 
@@ -44,7 +42,7 @@ class Inputs:
     observed: ObservedOnsets
     forecasts: dict[str, ForecastOnsets]
     climatology: Climatology
-    weekly: pd.DataFrame
+    weekly: Weekly
     combined: pd.DataFrame | None = None   # the day-level table, only when asked for
     timings: dict[str, float] = field(default_factory=dict)
 
@@ -60,11 +58,11 @@ def prepare(
     keep: tuple[str, ...] = STAGE_TABLES,
     daily: bool = False,
 ) -> Inputs:
-    """Observed and forecast onsets, the climatology and the weekly feature
-    table for a config; with daily, also the day-level table.
+    """Observed and forecast onsets, the climatology and the weekly
+    features for a config; with daily, also the day-level table.
 
     Forecast and climatology arrays not in `keep` are released once the
-    feature tables are built; the observed onsets and weekly table are always
+    features are built; the observed onsets and weekly features are always
     kept. test_years overrides the climatology's test window (a live season)."""
     resources = resources or Resources.default()
     workers, budget = resources.workers, resources.budget_bytes
@@ -122,11 +120,11 @@ def prepare(
     )
 
 
-def dissemination_table(config: BlendConfig, weekly: pd.DataFrame) -> pd.DataFrame:
+def dissemination_table(config: BlendConfig, weekly: Weekly) -> pd.DataFrame:
     """The units the blend trains on and is scored on: the configured table, or
-    every unit of the weekly table."""
+    every unit of the weekly features."""
     if config.domain.dissemination is None:
-        return pd.DataFrame({"adm3_name": sorted(weekly["id"].astype(str).unique())})
+        return pd.DataFrame({"adm3_name": sorted({str(unit) for unit in weekly.units})})
     return pd.read_csv(config.path(config.domain.dissemination.file), dtype=str)
 
 
@@ -139,9 +137,9 @@ class TrainingResult:
 
     def save(self, directory, *, intermediates=("weekly",)) -> Path:
         """Write the evaluation, the trained blend (trained.blend) and the chosen
-        intermediates into a new directory, all or nothing: the weekly and
-        day-level ("combined", when built) tables as pickles, the observed
-        onsets as NetCDF."""
+        intermediates into a new directory, all or nothing: the weekly
+        features (as the legacy table) and day-level ("combined", when built)
+        tables as pickles, the observed onsets as NetCDF."""
         directory = Path(directory)
         if directory.exists() and any(directory.iterdir()):
             raise FileExistsError(f"{directory} exists and is not empty")
@@ -159,7 +157,7 @@ class TrainingResult:
                         raise ValueError("the day-level table was not built (train(..., daily=True))")
                     self.inputs.combined.to_pickle(staging / "combined_wide.pkl")
                 elif name == "weekly":
-                    self.inputs.weekly.to_pickle(staging / "weekly_training_input.pkl")
+                    self.inputs.weekly.frame().to_pickle(staging / "weekly_training_input.pkl")
                 else:
                     raise ValueError(f"unknown intermediate {name!r}")
             if directory.exists():
@@ -181,68 +179,26 @@ def train(config: BlendConfig, *, resources: Resources | None = None, daily: boo
     from . import _specs
     from .blend import TrainedBlend
     from .evaluation import evaluate
-    from .model import fit_final
 
     resources = resources or Resources.default()
     inputs = prepare(config, resources=resources, keep=("observed", "weekly"), daily=daily)
     cv_spec = _specs.cv_spec(config)
     dissemination = dissemination_table(config, inputs.weekly)
 
-    # The final fit needs only the training rows' formula columns, so it runs
-    # in its own process alongside the evaluation (as the separate
-    # 3_fit_final_model.py did beside 1_blend_evaluation.py).
+    # The final fit runs alongside the global CV folds, on their design matrix.
     started = time.perf_counter()
-    # One BLAS thread: the fit's coefficients do not depend on the thread
-    # count (checked on India), and it then takes no core from the evaluation.
-    with ProcessPoolExecutor(
-        max_workers=1, mp_context=get_context("spawn"), initializer=_parallel.limit_blas_threads, initargs=(1,)
-    ) as pool:
-        final = pool.submit(
-            fit_final, _final_fit_columns(inputs.weekly, cv_spec, config), cv_spec, dissemination,
-            model_name=config.final_formula(),
-        )
-        evaluation = evaluate(inputs.weekly, cv_spec, dissemination, workers=_cv_workers(inputs.weekly, resources))
-        inputs.timings["evaluation"] = time.perf_counter() - started
-        log.info("evaluation in %.1fs", inputs.timings["evaluation"])
-        started = time.perf_counter()
-        fitted = final.result()
-    inputs.timings["final fit (after the evaluation)"] = time.perf_counter() - started
-    blend = TrainedBlend.from_training(config, inputs, fitted)
+    evaluation = evaluate(
+        inputs.weekly, cv_spec, dissemination, workers=resources.workers,
+        budget_bytes=_budget_now(resources), final_model=config.final_formula(),
+    )
+    inputs.timings["evaluation and final fit"] = time.perf_counter() - started
+    log.info("evaluation and final fit in %.1fs", inputs.timings["evaluation and final fit"])
+    blend = TrainedBlend.from_training(config, inputs, evaluation.final_model)
     return TrainingResult(config=config, inputs=inputs, evaluation=evaluation, blend=blend)
 
 
-def _final_fit_columns(weekly: pd.DataFrame, cv_spec: dict, config: BlendConfig) -> pd.DataFrame:
-    """The weekly table's columns the final fit reads: keys, outcome, the
-    climatology weeks and every enabled formula's terms (the sample support
-    spans them all); the whole table when a formula names anything else."""
-    from ._legacy.blend_evaluation_utils import _parse_formula_cols, build_formulas_from_spec
-
-    formulas = build_formulas_from_spec(
-        cv_spec, config.evaluation.cutoff_mode, data=weekly, n_bins=config.features.bins.count
-    )
-    terms = {column for text in formulas.values() for column in _parse_formula_cols(text)}
-    if not terms <= set(weekly.columns):
-        return weekly
-    keys = {"id", "time", "year", "lat", "lon", "outcome"}
-    climatology = f"{cfg.CLIMATOLOGY_FEATURE}_"
-    slim = weekly[[c for c in weekly.columns if c in keys or c in terms or c.startswith(climatology)]]
-    slim.attrs.update(weekly.attrs)
-    return slim
-
-
-# Copies of the weekly table the evaluation's main process and each CV fold
-# worker hold.
-_MAIN_TABLE_COPIES = 3
-_FOLD_WORKER_TABLE_COPIES = 3
-
-
-def _cv_workers(weekly: pd.DataFrame, resources: Resources) -> int:
-    """CV fold workers whose copies of the weekly table fit the memory budget,
-    and the memory available now that the stage tables exist."""
+def _budget_now(resources: Resources) -> int | None:
+    """The memory budget, within half of what is available now that the
+    stage arrays exist."""
     budgets = [b for b in (resources.budget_bytes, _parallel.default_resources()[1]) if b is not None]
-    if not budgets:
-        return resources.workers
-    budget = min(budgets)
-    table = int(weekly.memory_usage(deep=True).sum())
-    spare = budget - _MAIN_TABLE_COPIES * table
-    return max(1, min(resources.workers, spare // max(_FOLD_WORKER_TABLE_COPIES * table, 1)))
+    return min(budgets) if budgets else None

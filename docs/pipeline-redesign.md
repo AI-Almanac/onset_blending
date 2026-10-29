@@ -1,7 +1,8 @@
 # Redesign: onset_blending owns the blend pipeline, in memory
 
-Status: phase 1 (config) done. Phase 2: the package side is done; ai-almanac's side
-(dataset normalisation, the live writer, switching its runners) is next.
+Status: phase 1 (config) done. Phases 2 and 3: the package side is done;
+ai-almanac's side (dataset normalisation, the live writer, switching its
+runners) is next.
 
 Phase 2 verification, against the cached references:
 - Ethiopia: `train()` reproduces every artifact exactly (combined and weekly
@@ -15,6 +16,22 @@ Phase 2 verification, against the cached references:
   artifacts byte-identical.
 - The old script-based run on India took 7,462 s (peak 94 GB) and matches the
   branch's run on 38 of 39 files; the 39th differs only in log text.
+
+Phase 3 (data model), against the same references:
+- Every stage is arrays: onsets and climatology as xarray Datasets, the
+  weekly features as `features.Weekly` (feature arrays over samples,
+  outcome codes, ids and coordinates per unit; `frame()` rebuilds the
+  legacy table exactly). Design matrices come from the arrays
+  (`design.Plan`, Patsy's columns and bits, 6x faster than Patsy); global
+  CV and the final fit share one design in shared memory (`cv`); baselines
+  and scoring read slim tables of the rows and columns they use. CV
+  predictions keep only their keys (id, time, year, lat, lon, outcome)
+  beside the probabilities.
+- Ethiopia: 20 s; India: 199 s with the system peak +13.8 GB (phase 2:
+  469 s and 66 GB). Both match the references on every artifact; the one
+  exception is the Platt-calibrated baselines, whose fits now run on one
+  BLAS thread so results do not depend on the core count: their Brier and
+  RPS move by < 1e-13, their AUC by < 3e-4 (near-ties reorder).
 
 ## Goals
 
@@ -108,8 +125,8 @@ reads from the one before.
 | observation onsets | long table of every cell-day, then a wide `(id, year)` table | `xr.Dataset[cell, year]`: onset day / date |
 | forecast onsets | 19.5M-row wide table per India file, then member aggregation | `xr.Dataset[issue, cell, lead]` per model (member stats on read) |
 | climatology | pickled frames per chunk | `xr.Dataset[issue, cell, lead]` |
-| combine + connect | 12 GB daily table → 1.2 GB weekly table, via pickles and row chunks | feature arrays `[row, feature]` + outcome codes; one slim DataFrame only for formula evaluation |
-| evaluation | spawned scripts reading pickles and YAML | functions returning a `BlendResult` (CV predictions, coefficients, metrics tables, final model) |
+| combine + connect | 12 GB daily table → 1.2 GB weekly table, via pickles and row chunks | `features.Weekly`: feature arrays over `sample`, outcome codes, ids/lat/lon per unit (done) |
+| evaluation | spawned scripts reading pickles and YAML | `evaluate()` → `Evaluation` (CV predictions, coefficients, metrics, final model); design matrices built from the arrays, one shared per formula (done) |
 
 ## Package layout
 
@@ -127,9 +144,11 @@ onset_blending/
   domain.py          units, ids, regrid weights, dissemination, area of interest
   onsets.py          onset detection: observed onsets, forecast onset probabilities
   climatology.py     KDE climatology
-  features.py        weekly features (today's combine + connect)
-  model.py           formula expansion and the fitted multinomial model
-  evaluation/        cv.py, calibration.py, metrics.py, mme.py
+  features.py        weekly features (today's combine + connect), as Weekly arrays
+  design.py          formula design matrices from the arrays (Patsy's columns and bits)
+  cv.py              global CV folds and the final fit, on one shared design
+  model.py           the fitted multinomial model; fit_final
+  evaluation.py      evaluate(): CV, baselines, calibration, MME, scores
   training.py        train(config) -> TrainingResult, holding a TrainedBlend
   blend.py           TrainedBlend: recipe + fitted model + reference data
   forecast.py        TrainedBlend.forecast(...) -> Forecast: the operational path

@@ -18,16 +18,13 @@ import pandas as pd
 import patsy
 from sklearn.preprocessing import StandardScaler
 
-from ._legacy.blend_evaluation_utils import (
-    _make_multinom_clf,
-    apply_formula_sample_support,
-    build_formulas_from_spec,
-    restrict_to_allowed,
-)
+from . import cv, design
+from ._legacy.blend_evaluation_utils import _make_multinom_clf, build_formulas_from_spec
 from ._legacy.misc import interval_bins
-from .evaluation import RunSettings, log_sample_support, prepare_inputs
+from .evaluation import RunSettings, in_cells, log_sample_support, prepare_inputs, sample_support
+from .features import Weekly
 
-__all__ = ["FittedModel", "design_matrix", "fit", "fit_final"]
+__all__ = ["FittedModel", "design_matrix", "fit", "fit_final", "fit_samples"]
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +120,21 @@ class FittedModel:
             exp_s = np.exp(s)
             probs[~bad] = exp_s / exp_s.sum(axis=1, keepdims=True)
         return pd.DataFrame(probs, columns=[f"cv_{c}" for c in self.classes], index=design.index)
+
+    @classmethod
+    def from_estimators(cls, formula: str, features, clf, scaler) -> FittedModel:
+        """From the fitted classifier and the scaler of its features."""
+        return cls(
+            formula=formula,
+            features=features,
+            classes=clf.classes_,
+            coef=clf.coef_,
+            intercept=clf.intercept_,
+            scaler_mean=scaler.mean_,
+            scaler_scale=scaler.scale_,
+            scaler_var=scaler.var_,
+            n_samples=int(scaler.n_samples_seen_),
+        )
 
     def to_legacy_bundle(self) -> dict:
         """The coefficient bundle 3_fit_final_model.py pickles: coefs, scaler,
@@ -241,29 +253,36 @@ def fit(formula: str, train: pd.DataFrame) -> FittedModel:
     X_fit, y_fit = X[mask], y[mask]
     if len(np.unique(y_fit)) < 2:
         raise ValueError("Fewer than 2 outcome classes in training data — cannot fit model.")
-    log.info("  Training rows used : %d / %d", mask.sum(), len(train))
-    log.info("  Outcome classes    : %s", sorted(np.unique(y_fit)))
-    log.info("  Feature columns    : %d", len(features))
+    log_fit(int(mask.sum()), len(train), np.unique(y_fit), features)
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_fit)
     clf = _make_multinom_clf()
     clf.fit(X_scaled, y_fit)
-    return FittedModel(
-        formula=formula,
-        features=features,
-        classes=clf.classes_,
-        coef=clf.coef_,
-        intercept=clf.intercept_,
-        scaler_mean=scaler.mean_,
-        scaler_scale=scaler.scale_,
-        scaler_var=scaler.var_,
-        n_samples=int(scaler.n_samples_seen_),
+    return FittedModel.from_estimators(formula, features, clf, scaler)
+
+
+def log_fit(used: int, rows: int, classes, features) -> None:
+    log.info("  Training rows used : %d / %d", used, rows)
+    log.info("  Outcome classes    : %s", sorted(classes))
+    log.info("  Feature columns    : %d", len(features))
+
+
+def fit_samples(formula: str, weekly: Weekly, rows: np.ndarray) -> FittedModel:
+    """`fit` on samples of the weekly features (positions), from the arrays
+    when the formula has a design plan, with the same numerics."""
+    plan = design.plan(formula, weekly.column_dtypes())
+    if plan is None:
+        return fit(formula, weekly.frame(rows))
+    clf, scaler, used, total = cv.fit_final_rows(
+        lambda j: plan.column(j, weekly.take, rows), len(plan.columns), weekly.take("outcome", rows)
     )
+    log_fit(used, total, clf.classes_, plan.columns)
+    return FittedModel.from_estimators(formula, plan.columns, clf, scaler)
 
 
 def fit_final(
-    weekly: pd.DataFrame,
+    weekly: Weekly | pd.DataFrame,
     cv_spec: dict,
     dissemination: pd.DataFrame,
     model_name: str = "blended_model",
@@ -271,7 +290,9 @@ def fit_final(
     """Fit `model_name`'s formula on every training year that is not a true
     holdout, on the dissemination cells, after the evaluation's sample support.
 
-    `dissemination` is the table as read from its CSV (see `prepare_inputs`).
+    `weekly` is a `features.Weekly` or the legacy table; `dissemination` is
+    the table as read from its CSV (see `prepare_inputs`). Training fits
+    this alongside the CV instead (`evaluate(..., final_model=...)`).
     """
     run = RunSettings.from_spec(cv_spec)
     weekly, cells, n_bins = prepare_inputs(weekly, cv_spec, dissemination)
@@ -280,17 +301,25 @@ def fit_final(
         raise ValueError(
             f"Model '{model_name}' not found in spec formulas. Available: {list(formulas)}"
         )
-    weekly, support = apply_formula_sample_support(weekly, formulas)
+    rows, support = sample_support(weekly, formulas)
     log_sample_support(support)
+    train = final_rows(weekly, rows, cells, run, n_bins)
+    log.info("\nFormula : %s", formulas[model_name])
+    log.info("\nFitting %s on all %d training years...", model_name, len(run.fit_years))
+    return fit_samples(formulas[model_name], weekly, train)
 
-    allowed = restrict_to_allowed(weekly, cells)
+
+def final_rows(weekly: Weekly, rows: np.ndarray, cells: pd.DataFrame, run: RunSettings, n_bins: int) -> np.ndarray:
+    """The final fit's samples (positions): the supported `rows` in the
+    dissemination cells and the fit years, with every outcome class."""
     fit_years = run.fit_years
-    train = allowed[allowed["year"].isin(fit_years)].copy()
-    if train.empty:
+    candidates = rows[in_cells(weekly, cells)[rows]]
+    train = candidates[np.isin(weekly.take("year", candidates), fit_years)]
+    if not len(train):
         raise ValueError(
             "Final fit has no rows in the configured training years and dissemination cells."
         )
-    present = {value for value in train["outcome"].unique() if isinstance(value, str)}
+    present = {value for value in pd.unique(weekly.take("outcome", train)) if isinstance(value, str)}
     missing = [value for value in interval_bins(n_bins) if value not in present]
     if missing:
         raise ValueError(
@@ -298,6 +327,4 @@ def fit_final(
         )
     log.info("  Training years        : %s", sorted(fit_years))
     log.info("  Training rows (allowed cells) : %d", len(train))
-    log.info("\nFormula : %s", formulas[model_name])
-    log.info("\nFitting %s on all %d training years...", model_name, len(fit_years))
-    return fit(formulas[model_name], train)
+    return train

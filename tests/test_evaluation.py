@@ -43,7 +43,7 @@ from onset_blending._legacy.spatial_id_utils import (
     resolve_grid_id_convention,
     validate_id_coordinate_consistency,
 )
-from onset_blending.evaluation import evaluate
+from onset_blending.evaluation import PREDICTION_KEYS, evaluate
 
 BINS = interval_bins(2)
 
@@ -460,7 +460,13 @@ def assert_same_files(old_dir, new_dir):
     differ = [name for name in old if old[name] != new[name]]
     assert [name for name in differ if not name.endswith(".pkl")] == []
     for name in differ:
-        assert_same_object(pickle.loads(old[name]), pickle.loads(new[name]))
+        old_object, new_object = pickle.loads(old[name]), pickle.loads(new[name])
+        if name.startswith("cv_preds_"):
+            # CV predictions keep only their keys beside the probabilities.
+            keys = [c for c in old_object.columns if c in PREDICTION_KEYS or c.startswith("cv_")]
+            assert list(new_object.columns) == keys
+            old_object = old_object[keys]
+        assert_same_object(old_object, new_object)
 
 
 def assert_same_object(old, new):
@@ -480,6 +486,10 @@ def assert_same_object(old, new):
             assert_same_object(a, b)
     elif isinstance(old, np.ndarray):
         np.testing.assert_array_equal(new, old, strict=True)
+    elif hasattr(old, "__dict__") and not isinstance(old, type):
+        # Estimators (a fold's scaler): the same attributes, in the same order.
+        assert list(vars(new)) == list(vars(old))
+        assert_same_object(vars(old), vars(new))
     else:
         assert new == old
 

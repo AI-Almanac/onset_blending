@@ -67,22 +67,30 @@ class SharedArrays:
 
         with SharedArrays(p=probabilities, years=years) as shared:
             pool.submit(task, shared.specs)          # task calls attach(specs)
+
+    `empty` allocates one to fill in place (in either memory order).
     """
 
     def __init__(self, **arrays):
-        from multiprocessing import shared_memory
-
         self._blocks, self.specs = [], {}
         try:
             for name, array in arrays.items():
                 array = np.ascontiguousarray(array)
-                block = shared_memory.SharedMemory(create=True, size=max(array.nbytes, 1))
-                self._blocks.append(block)
-                np.ndarray(array.shape, array.dtype, buffer=block.buf)[...] = array
-                self.specs[name] = (block.name, array.shape, array.dtype.str)
+                self.empty(name, array.shape, array.dtype)[...] = array
         except BaseException:
             self.close()
             raise
+
+    def empty(self, name: str, shape, dtype=float, order: str = "C") -> np.ndarray:
+        """A new shared array, writable here and read-only in workers."""
+        from multiprocessing import shared_memory
+
+        dtype = np.dtype(dtype)
+        size = int(np.prod(shape)) * dtype.itemsize
+        block = shared_memory.SharedMemory(create=True, size=max(size, 1))
+        self._blocks.append(block)
+        self.specs[name] = (block.name, tuple(shape), dtype.str, order)
+        return np.ndarray(shape, dtype, buffer=block.buf, order=order)
 
     def __enter__(self):
         return self
@@ -105,10 +113,21 @@ def attach(specs: dict) -> dict:
     from multiprocessing import shared_memory
 
     out = {}
-    for name, (block_name, shape, dtype) in specs.items():
+    for name, (block_name, shape, dtype, *order) in specs.items():
         if block_name not in _ATTACHED:
             _ATTACHED[block_name] = shared_memory.SharedMemory(name=block_name)
-        view = np.ndarray(shape, dtype, buffer=_ATTACHED[block_name].buf)
+        view = np.ndarray(shape, dtype, buffer=_ATTACHED[block_name].buf, order=(order or ["C"])[0])
         view.flags.writeable = False
         out[name] = view
     return out
+
+
+def detach(specs: dict) -> None:
+    """Close a worker's views of these SharedArrays (once nothing uses them)."""
+    for block_name, *_ in specs.values():
+        block = _ATTACHED.pop(block_name, None)
+        if block is not None:
+            try:
+                block.close()
+            except BufferError:  # a view is still alive (an exception's frame): it goes with the view
+                pass

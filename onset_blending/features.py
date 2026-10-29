@@ -1,20 +1,22 @@
-"""Features: the weekly table the blend trains on, built from the stage arrays.
+"""Features: the weekly features the blend trains on, built from the stage arrays.
 
-A row is a unit and issue date that the climatology and every model cover
-(the inner join of today's combine), in the climatology's order (units, then
-issue dates), dropping issue dates after the observed onset. Its weekly
-features (climatology logits, binned forecast probabilities, rain
-predictors, the outcome) are computed from the arrays directly; the
+A sample is a unit and issue date that the climatology and every model
+cover (the inner join of today's combine), in the climatology's order
+(units, then issue dates), dropping issue dates after the observed onset.
+Its weekly features (climatology logits, binned forecast probabilities,
+rain predictors, the outcome) are computed from the arrays directly and
+held as arrays (`Weekly`); the legacy table is `Weekly.frame()`, and the
 day-level table the legacy pipeline joined first is `daily`, built only on
 request.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+import xarray as xr
 
 from . import _specs
 from ._legacy import combine_forecasts_utils as combine_utils
@@ -117,16 +119,146 @@ def _week_sums(daily: np.ndarray, days_per_bin: int, n_bins: int) -> list[np.nda
     return [daily[:, (w - 1) * days_per_bin : w * days_per_bin].sum(axis=1) for w in range(1, n_bins + 1)]
 
 
-def _outcome(lead: np.ndarray, days_per_bin: int, n_bins: int) -> pd.Series:
-    """assign_lead_bin for every row: week<w>, later, or missing."""
-    labels = np.full(len(lead), None, dtype=object)
+def _outcome_codes(lead: np.ndarray, days_per_bin: int, n_bins: int) -> tuple[np.ndarray, list[str]]:
+    """assign_lead_bin for every row, as positions into the labels (week<w>,
+    later), -1 where it is missing."""
+    labels = [f"week{w}" for w in range(1, n_bins + 1)] + ["later"]
+    codes = np.full(len(lead), -1, dtype=np.int8)
     remaining = ~np.isnan(lead) & (lead > 0)
     for w in range(1, n_bins + 1):
         hit = remaining & (lead <= w * days_per_bin)
-        labels[hit] = f"week{w}"
+        codes[hit] = w - 1
         remaining &= ~hit
-    labels[remaining] = "later"
-    return pd.Series(labels, dtype=object).astype(str).where(pd.Series(labels).notna(), None)
+    codes[remaining] = n_bins
+    return codes, labels
+
+
+def _outcome_series(codes: np.ndarray, labels: list[str]) -> pd.Series:
+    """The legacy table's outcome column: the labels, missing where code is -1."""
+    values = np.array([*labels, None], dtype=object)[codes]
+    return pd.Series(values, dtype=object).astype(str).where(pd.Series(values).notna(), None)
+
+
+# Names a Weekly uses for its dimensions and bookkeeping.
+_RESERVED = ("sample", "unit", "sample_unit")
+
+
+@dataclass
+class Weekly:
+    """The weekly features as arrays: one sample per unit and issue date.
+
+    `data` holds each feature over `sample`, with the sample's position in
+    the `unit` dimension (sample_unit), its issue time and year and its
+    outcome (positions into the outcome labels, -1 without one); the unit
+    ids and the per-unit columns (lat, lon, onset_threshold) are over
+    `unit`. A column reads as an array per sample (`weekly["diff_x_week1"]`)
+    and `frame()` builds the legacy table from them, for export and the
+    code that still reads tables. `from_frame` takes a legacy table,
+    keeping every column as it is."""
+
+    data: xr.Dataset
+    columns: list[str]                   # the legacy table's columns, in order
+    attrs: dict = field(default_factory=dict)
+    dtypes: dict = field(default_factory=dict)   # legacy dtypes, for tables taken by from_frame
+
+    def __len__(self) -> int:
+        return self.data.sizes["sample"]
+
+    def __contains__(self, name) -> bool:
+        return name in self.columns
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        return self.take(name)
+
+    @property
+    def units(self) -> np.ndarray:
+        return self.data["unit"].values
+
+    @property
+    def sample_unit(self) -> np.ndarray:
+        return self.data["sample_unit"].values
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.data.nbytes)
+
+    def take(self, name: str, rows: np.ndarray | None = None) -> np.ndarray:
+        """A column's values per sample, for `rows` (positions) or every sample."""
+        if name not in self.columns:
+            raise KeyError(name)
+        unit = self.sample_unit if rows is None else self.sample_unit[rows]
+        if name == "id":
+            return self.units[unit]
+        variable = self.data[name]
+        if variable.dims == ("unit",):
+            return variable.values[unit]
+        values = variable.values if rows is None else variable.values[rows]
+        if "labels" in variable.attrs:
+            return _outcome_series(values, list(variable.attrs["labels"])).to_numpy()
+        return values
+
+    def column_dtypes(self) -> dict[str, np.dtype]:
+        """Each column's dtype as `take` returns it (labels are objects)."""
+        out = {}
+        for name in self.columns:
+            if name == "id" or "labels" in self.data[name].attrs:
+                out[name] = np.dtype(object)
+            else:
+                out[name] = self.data[name].dtype
+        return out
+
+    def frame(self, rows: np.ndarray | None = None, columns=None) -> pd.DataFrame:
+        """The legacy table, or some rows (positions) and columns of it, on a
+        fresh 0..n-1 index."""
+        wanted = self.columns if columns is None else [c for c in self.columns if c in set(columns)]
+        out = {name: self._series(name, rows) for name in wanted}
+        table = pd.DataFrame(out) if out else pd.DataFrame(index=pd.RangeIndex(len(self) if rows is None else len(rows)))
+        table.attrs.update(self.attrs)
+        return table
+
+    def _series(self, name: str, rows):
+        if name in self.dtypes:
+            return pd.Series(self.take(name, rows), dtype=self.dtypes[name])
+        variable = None if name == "id" else self.data[name]
+        if variable is not None and "labels" in variable.attrs:
+            codes = variable.values if rows is None else variable.values[rows]
+            return _outcome_series(codes, list(variable.attrs["labels"]))
+        values = self.take(name, rows)
+        if name == "id":
+            return pd.Series(values, dtype=str)
+        if name == "time":
+            return pd.Series(pd.DatetimeIndex(values).date, dtype=object)
+        return values
+
+    def with_units(self, ids: np.ndarray) -> "Weekly":
+        """The same samples with these unit ids (one per unit)."""
+        data = self.data.assign_coords(unit=np.asarray(ids, dtype=object))
+        return Weekly(data=data, columns=self.columns, attrs=self.attrs, dtypes=self.dtypes)
+
+    @classmethod
+    def from_frame(cls, frame: pd.DataFrame) -> "Weekly":
+        """A legacy table: its ids as units, every other column as it is."""
+        if "id" not in frame.columns:
+            raise ValueError("the weekly table has no id column")
+        reserved = [c for c in frame.columns if c in _RESERVED]
+        if reserved:
+            raise ValueError(f"weekly table columns {reserved} clash with the Weekly layout")
+        codes, units = pd.factorize(frame["id"], use_na_sentinel=False)
+        variables = {"sample_unit": ("sample", codes.astype(np.int32))}
+        for name in frame.columns:
+            if name != "id":
+                variables[name] = ("sample", frame[name].to_numpy())
+        data = xr.Dataset(variables, coords={"unit": np.asarray(units, dtype=object)})
+        return cls(
+            data=data,
+            columns=[str(c) for c in frame.columns],
+            attrs=dict(frame.attrs),
+            dtypes={name: frame[name].dtype for name in frame.columns},
+        )
+
+    @classmethod
+    def of(cls, table) -> "Weekly":
+        return table if isinstance(table, cls) else cls.from_frame(table)
 
 
 def _grid_lat_lon(units: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -141,29 +273,34 @@ def _grid_lat_lon(units: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def weekly(config: BlendConfig, climatology: Climatology, observed: ObservedOnsets,
-           forecasts: dict[str, ForecastOnsets], *, trim: bool | None = None) -> pd.DataFrame:
-    """The weekly table the legacy connector builds from the day-level table.
+           forecasts: dict[str, ForecastOnsets], *, trim: bool | None = None) -> Weekly:
+    """The weekly features the legacy connector builds from the day-level table.
 
     trim overrides features.trim_after_true_onset (a forecast never trims)."""
     if config.features.join == "full":
-        return weekly_from_daylevel(daily(config, climatology, observed, forecasts), _specs.connect_spec(config))
+        table = weekly_from_daylevel(daily(config, climatology, observed, forecasts), _specs.connect_spec(config))
+        return Weekly.from_frame(table)
     spec = _specs.connect_spec(config)
-    day_max, dpb, n_bins = spec["day_max"], spec["days_per_bin"], spec["n_bins"]
+    dpb, n_bins = spec["days_per_bin"], spec["n_bins"]
     r = rows(config, climatology, observed, forecasts, trim=trim)
     first = spec["forecast_models"][0]["name"]
     threshold = forecasts[first].data["onset_threshold"].values[r.model_unit[first]]
-    lat, lon = _grid_lat_lon(r.units)
+    units, sample_unit = np.unique(r.units, return_inverse=True)
+    lat, lon = _grid_lat_lon(units)
+    unit_threshold = np.full(len(units), np.nan)
+    unit_threshold[sample_unit] = threshold  # one model unit per id
     lead = (r.true_onset - r.times.astype("datetime64[D]")).astype("timedelta64[D]").astype(float)
     lead[np.isnat(r.true_onset)] = np.nan
+    codes, labels = _outcome_codes(lead, dpb, n_bins)
 
-    columns: dict[str, object] = {
-        "id": pd.Series(r.units, dtype=str),
-        "time": pd.Series(pd.DatetimeIndex(r.times).date, dtype=object),
-        "year": pd.DatetimeIndex(r.times).year,
-        "lat": lat,
-        "lon": lon,
-        "onset_threshold": threshold,
-        "outcome": _outcome(lead, dpb, n_bins),
+    variables: dict[str, tuple] = {
+        "sample_unit": ("sample", sample_unit.astype(np.int32)),
+        "time": ("sample", r.times),
+        "year": ("sample", pd.DatetimeIndex(r.times).year.to_numpy()),
+        "lat": ("unit", lat),
+        "lon": ("unit", lon),
+        "onset_threshold": ("unit", unit_threshold),
+        "outcome": ("sample", codes, {"labels": labels}),
     }
     # Every feature of a row comes from that row alone, so they are built a
     # chunk of rows at a time into preallocated columns, which bounds the
@@ -176,10 +313,11 @@ def weekly(config: BlendConfig, climatology: Climatology, observed: ObservedOnse
             if name not in features:
                 features[name] = np.empty(len(r), dtype=values.dtype)
             features[name][rows_here] = values
-    columns.update(features)
-    table = pd.DataFrame(columns)
-    table.attrs.update(attrs)
-    return table
+    for name, values in features.items():
+        variables[name] = ("sample", values)
+    data = xr.Dataset(variables, coords={"unit": units.astype(object)})
+    columns = ["id", "time", "year", "lat", "lon", "onset_threshold", "outcome", *features]
+    return Weekly(data=data, columns=columns, attrs=attrs)
 
 
 def _row_features(spec, config, climatology, forecasts, r: Rows, rows_here: slice, threshold, attrs) -> dict:

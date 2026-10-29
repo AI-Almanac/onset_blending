@@ -1,10 +1,16 @@
 """Cross-validated evaluation of the blend formulas and their baselines.
 
 A port of the body of 1_blend_evaluation.py (phase 2 of
-docs/pipeline-redesign.md): the same steps on the same legacy functions, with
-the weekly table, the cv_models spec and the dissemination table passed in,
-and every artifact the script writes returned in an `Evaluation`. Results are
-bit-identical to the script's.
+docs/pipeline-redesign.md): the same steps and numerics, with the weekly
+features, the cv_models spec and the dissemination table passed in, and
+every artifact the script writes returned in an `Evaluation`. Results are
+bit-identical to the script's; CV predictions keep only their keys
+(id, time, year, lat, lon, outcome) beside the probabilities.
+
+The weekly features stay arrays (`features.Weekly`): the formulas' sample
+support and the dissemination cells are positions into them, global CV
+fits on one shared design matrix (`cv`), and the baselines read slim
+tables of just the rows and columns they use.
 
 The steps, in the script's order (which is also the row order of the summary
 tables): cross-validate each enabled formula with each CV method; score
@@ -15,10 +21,12 @@ forecasts; the MME blend.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 import os
 import pickle
+import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,9 +34,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from . import cv, design
 from ._legacy.blend_evaluation_utils import (
     _present_weeks,
-    apply_formula_sample_support,
     build_formulas_from_spec,
     clean_probs5,
     compute_cell_metrics_fast,
@@ -39,6 +47,7 @@ from ._legacy.blend_evaluation_utils import (
     configured_holdout_years,
     fit_platt_weights_export,
     forecast_label,
+    formula_sample_support,
     get_forecast_variant_suffix,
     load_external_predictions,
     make_calibrated_preds_from_wide,
@@ -58,11 +67,16 @@ from ._legacy.blend_evaluation_utils import (
 from ._legacy.misc import coalesce, interval_bins
 from ._legacy.spatial_id_utils import (
     ensure_spatial_id_col,
+    normalize_id_series,
     resolve_grid_id_convention,
     validate_id_coordinate_consistency,
 )
+from .features import Weekly
 
-__all__ = ["Evaluation", "RunSettings", "evaluate", "prepare_inputs"]
+__all__ = ["Evaluation", "RunSettings", "evaluate", "prepare_inputs", "sample_support"]
+
+# The columns CV predictions keep beside their probabilities.
+PREDICTION_KEYS = ("id", "time", "year", "lat", "lon", "outcome")
 
 log = logging.getLogger(__name__)
 
@@ -107,19 +121,25 @@ class RunSettings:
 
 
 def prepare_inputs(
-    weekly: pd.DataFrame, cv_spec: dict, dissemination: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.DataFrame, int]:
-    """The weekly table with normalised ids, the dissemination cells under the
-    weekly table's id convention, and the number of week bins.
+    weekly: Weekly | pd.DataFrame, cv_spec: dict, dissemination: pd.DataFrame
+) -> tuple[Weekly, pd.DataFrame, int]:
+    """The weekly features with normalised ids (a legacy table is taken as
+    a Weekly), the dissemination cells under their id convention, and the
+    number of week bins.
 
     `dissemination` is the table as read from its CSV (`dtype=str`); its id
     column is `cell.id_col` (or `cell.dissemination_id_col`) when the spec
     names one, else `id`, `adm3_name` or lat/lon.
     """
-    weekly = ensure_spatial_id_col(weekly, spec=cv_spec, context="blend input IDs")
+    if isinstance(weekly, Weekly):
+        # Normalised once per unit: normalisation maps each id on its own.
+        ids = normalize_id_series(pd.Series(weekly.units, dtype=object), context="blend input IDs")
+        weekly = weekly.with_units(ids.to_numpy(dtype=object))
+    else:
+        weekly = Weekly.from_frame(ensure_spatial_id_col(weekly, spec=cv_spec, context="blend input IDs"))
     convention = resolve_grid_id_convention(
         spec=cv_spec,
-        authoritative_ids=weekly["id"],
+        authoritative_ids=pd.Series(weekly.units, dtype=object),
         context="blend input/dissemination ID handoff",
     )
     cell_cfg = cv_spec.get("cell") or {}
@@ -137,6 +157,19 @@ def prepare_inputs(
     # The week bins are the configured climatology columns the connect stage wrote.
     _, clim_weeks = resolve_climatology_weeks(cv_spec, weekly)
     return weekly, cells.drop_duplicates("id"), max(clim_weeks)
+
+
+def sample_support(weekly: Weekly, formulas: dict[str, str]) -> tuple[np.ndarray, dict]:
+    """The samples every enabled formula's predictors are finite for (as
+    positions) and the diagnostics apply_formula_sample_support gives."""
+    keep, diagnostics = formula_sample_support(weekly, formulas)
+    return np.flatnonzero(keep), diagnostics
+
+
+def in_cells(weekly: Weekly, cells: pd.DataFrame) -> np.ndarray:
+    """Per sample: whether its unit is one of the cells (restrict_to_allowed)."""
+    ids = set(cells["id"])
+    return np.fromiter((unit in ids for unit in weekly.units), dtype=bool, count=len(weekly.units))[weekly.sample_unit]
 
 
 def log_sample_support(support: dict) -> None:
@@ -166,10 +199,12 @@ class Evaluation:
     cell_metrics: pd.DataFrame | None = None  # summary_models{tag}
     pooled: pd.DataFrame | None = None  # summary_models_pooled{tag}
     yearly: pd.DataFrame | None = None  # yearly_metrics_global{tag}
+    # (model, method) -> the PREDICTION_KEYS and cv_<class> probabilities
     cv_preds: dict[tuple[str, str], pd.DataFrame] = field(default_factory=dict)
     coefs_by_year: dict[tuple[str, str], dict[int, dict]] = field(default_factory=dict)
     platt_weights: dict[str, pd.DataFrame] = field(default_factory=dict)  # file stem -> weights
     mme_weights: dict[str, pd.DataFrame] = field(default_factory=dict)  # file stem -> weights
+    final_model: object = None  # model.FittedModel, when evaluate() was asked for it (not saved here)
 
     def save(self, directory: str | os.PathLike) -> list[Path]:
         """Write the script's files into `directory`; returns the paths written."""
@@ -210,21 +245,27 @@ class Evaluation:
 
 
 def evaluate(
-    weekly: pd.DataFrame,
+    weekly: Weekly | pd.DataFrame,
     cv_spec: dict,
     dissemination: pd.DataFrame,
     *,
     workers: int = 1,
     results_dir: str | os.PathLike | None = None,
+    budget_bytes: int | None = None,
+    final_model: str | None = None,
 ) -> Evaluation:
-    """Cross-validate the spec's formulas and score its baselines on `weekly`.
+    """Cross-validate the spec's formulas and score its baselines on `weekly`
+    (a `features.Weekly`, or the legacy table).
 
     `dissemination` is the dissemination table as read from its CSV (see
     `prepare_inputs`): models train and are scored on its cells only, and
-    predict every cell. `workers` processes fit the global CV folds; results
-    do not depend on it. `results_dir` is where the script read files from:
-    relative `extras.external_predictions` files and, when MME weights are
-    not optimised, the saved weights.
+    predict every cell. Up to `workers` processes fit the global CV folds,
+    as many as `budget_bytes` holds; results do not depend on either.
+    `results_dir` is where the script read files from: relative
+    `extras.external_predictions` files and, when MME weights are not
+    optimised, the saved weights. `final_model` names a formula to also fit
+    on every training year (`model.fit_final`), into `final_model` of the
+    result: alongside the global CV folds, on their design matrix.
 
     Formula and CV errors raise; climatology, forecast and MME source
     problems warn and skip that model, as the script does.
@@ -241,16 +282,29 @@ def evaluate(
     formulas, resolution = build_formulas_from_spec(
         cv_spec, run.cutoff_mode, data=weekly, return_resolution=True, n_bins=n_bins
     )
-    weekly, support = apply_formula_sample_support(weekly, formulas)
-    # Added in place: the supported table's attrs hold this same dict, as in the script.
+    if final_model is not None and final_model not in formulas:
+        raise ValueError(
+            f"Model '{final_model}' not found in spec formulas. Available: {list(formulas)}"
+        )
+    rows, support = sample_support(weekly, formulas)
     support["formula_resolution"] = resolution
     log_sample_support(support)
     log.info("Formulas: %s", list(formulas))
 
-    ctx = _Context(cv_spec, run, weekly, cells, n_bins)
+    ctx = _Context(cv_spec, run, weekly, rows, cells, n_bins, budget_bytes=budget_bytes)
     result = Evaluation(output_tag=run.output_tag, sample_support=support, formulas=formulas)
+    final_rows = None
+    if final_model is not None:
+        from .model import final_rows as choose_final_rows
+
+        final_rows = choose_final_rows(weekly, rows, cells, run, n_bins)
     scores = _Scores(cells, n_bins)
-    _cross_validate(ctx, formulas, cv_methods, workers, result, scores)
+    _cross_validate(ctx, formulas, cv_methods, workers, result, scores, final_model)
+    if final_model is not None and result.final_model is None:
+        from .model import fit_samples
+
+        log.info("\nFitting %s on all %d training years...", final_model, len(run.fit_years))
+        result.final_model = fit_samples(formulas[final_model], weekly, final_rows)
     # After the CV, the scoring and the Platt calibration fan out over worker
     # processes (with one BLAS thread each); scores keep their order.
     with _scoring_pool(workers) as pool:
@@ -278,10 +332,45 @@ def evaluate(
 class _Context:
     spec: dict
     run: RunSettings
-    weekly: pd.DataFrame  # the formula-supported rows of every cell
+    weekly: Weekly  # every sample
+    rows: np.ndarray  # the formula-supported samples, of every cell
     cells: pd.DataFrame  # dissemination cells
     n_bins: int
+    budget_bytes: int | None = None
     pool: object = None  # the scoring pool, once the CV is done
+
+    @functools.cached_property
+    def year(self) -> np.ndarray:
+        return self.weekly.take("year", self.rows)
+
+    @functools.cached_property
+    def allowed(self) -> np.ndarray:
+        """Per supported sample: in a dissemination cell (models train on those)."""
+        return in_cells(self.weekly, self.cells)[self.rows]
+
+    def frame(self, where: np.ndarray | None = None, columns=None) -> pd.DataFrame:
+        """The legacy table of the supported samples (where: a mask over
+        them), with the given columns or all."""
+        return self.weekly.frame(self.rows if where is None else self.rows[where], columns)
+
+    def in_years(self, years) -> np.ndarray:
+        return np.isin(self.year, list(years))
+
+    def columns_like(self, prefix: str) -> list[str]:
+        """The `<prefix>_week<n>` columns."""
+        pattern = re.compile(rf"^{re.escape(prefix)}_week\d+$")
+        return [c for c in self.weekly.columns if pattern.match(c)]
+
+
+def _keys(weekly: Weekly, *extra) -> list[str]:
+    wanted = set(PREDICTION_KEYS) | set(extra)
+    return [c for c in weekly.columns if c in wanted]
+
+
+def _slim(preds: pd.DataFrame, weekly: Weekly) -> pd.DataFrame:
+    """CV predictions with only their keys beside the probabilities."""
+    added = [c for c in preds.columns if c not in weekly.columns]
+    return preds[[c for c in preds.columns if c in PREDICTION_KEYS] + added]
 
 
 @contextlib.contextmanager
@@ -299,6 +388,11 @@ def _scoring_pool(workers: int):
         max_workers=workers, mp_context=get_context("spawn"), initializer=limit_blas_threads, initargs=(1,)
     ) as pool:
         yield pool
+
+
+def _scored(preds: pd.DataFrame) -> pd.DataFrame:
+    """The columns scoring reads, so a worker is sent no more (no dates, no inputs)."""
+    return preds[[c for c in preds.columns if c in ("id", "year", "outcome") or c.startswith("cv_")]]
 
 
 def _baseline_metrics(preds, allowed_cells, model, method):
@@ -327,7 +421,9 @@ class _Scores:
             self.cells.append(cell_metrics)
             self.yearly.extend(yearly_rows)
             return
-        future = self.pool.submit(score_model_predictions, preds, model, method, self.allowed_cells, self.n_bins)
+        future = self.pool.submit(
+            score_model_predictions, _scored(preds), model, method, self.allowed_cells, self.n_bins
+        )
         self.cells.append((future, 0))
         self.yearly.append((future, 1))
 
@@ -336,7 +432,8 @@ class _Scores:
         if self.pool is None:
             self.cells.append(_baseline_metrics(preds, self.allowed_cells, model, method))
         else:
-            self.cells.append((self.pool.submit(_baseline_metrics, preds, self.allowed_cells, model, method), None))
+            future = self.pool.submit(_baseline_metrics, _scored(preds), self.allowed_cells, model, method)
+            self.cells.append((future, None))
 
     def resolve(self) -> None:
         """Wait for the pooled scores, keeping the order they were added in."""
@@ -371,37 +468,45 @@ def _load_external_predictions(extras, results_dir, n_bins):
     ]
 
 
-def _cross_validate(ctx, formulas, methods, workers, result, scores):
-    """Section 1: each formula under each CV method."""
+def _cross_validate(ctx, formulas, methods, workers, result, scores, final_model=None):
+    """Section 1: each formula under each CV method; with the global method,
+    also the final fit of `final_model`."""
     run = ctx.run
-    # Models train on the dissemination cells only and predict every cell.
-    allowed = restrict_to_allowed(ctx.weekly, ctx.cells)
+    dtypes = ctx.weekly.column_dtypes()
     for model, formula in formulas.items():
         log.info("\nCV: %s", model)
         for method in methods:
             log.info("  Method: %s", method)
             try:
                 coefs_by_year = {}
-                if method == "global":
+                plan = design.plan(formula, dtypes) if method == "global" else None
+                if plan is not None:
+                    preds, coefs_by_year, fitted = _global_cv(ctx, plan, workers, model == final_model)
+                    if fitted is not None:
+                        result.final_model = fitted
+                elif method == "global":
+                    # Models train on the dissemination cells only and predict every cell.
+                    table = ctx.frame()
                     preds, coefs_by_year = compute_cv_global(
                         formula,
-                        allowed,
+                        restrict_to_allowed(table, ctx.cells),
                         run.holdout_years,
                         training_years=run.training_years,
                         true_holdout_years=run.true_holdout_years,
-                        data_pred=ctx.weekly,
+                        data_pred=table,
                         n_jobs=workers,
                         save_coefs=True,
                         required_classes=interval_bins(ctx.n_bins),
                     )
-                    preds = preds.reset_index(drop=True)
+                    preds = _slim(preds.reset_index(drop=True), ctx.weekly)
                 elif method == "local":
-                    preds = compute_cv_local(formula, ctx.weekly, run.holdout_years)
+                    preds = _slim(compute_cv_local(formula, ctx.frame(), run.holdout_years), ctx.weekly)
                 elif method == "neighbors":
-                    preds = compute_cv_neighbors(formula, ctx.weekly, run.holdout_years)
+                    preds = _slim(compute_cv_neighbors(formula, ctx.frame(), run.holdout_years), ctx.weekly)
                 elif method.startswith("cluster"):
                     cluster_var = ctx.spec.get("cv", {}).get("cluster_var", "cluster")
-                    preds = compute_cv_clusters(formula, ctx.weekly, run.holdout_years, cluster_var)
+                    preds = compute_cv_clusters(formula, ctx.frame(), run.holdout_years, cluster_var)
+                    preds = _slim(preds, ctx.weekly)
                 else:
                     warnings.warn(f"Unknown CV method: {method}. Skipping.")
                     continue
@@ -414,6 +519,44 @@ def _cross_validate(ctx, formulas, methods, workers, result, scores):
                     result.coefs_by_year[(model, method)] = coefs_by_year
             except Exception as e:
                 raise RuntimeError(f"Error in {model}/{method}: {e}") from e
+
+
+def _global_cv(ctx, plan, workers, with_final):
+    """compute_cv_global on the shared design: (predictions, coefficients by
+    year, the final model or None)."""
+    run = ctx.run
+    folds, final = cv.global_cv(
+        plan,
+        ctx.weekly.take,
+        ctx.rows,
+        ctx.allowed,
+        ctx.year,
+        ctx.weekly.take("outcome", ctx.rows),
+        holdout_years=run.holdout_years,
+        training_years=run.training_years,
+        true_holdout_years=run.true_holdout_years,
+        required_classes=interval_bins(ctx.n_bins),
+        save_coefs=True,
+        final_years=run.fit_years if with_final else None,
+        workers=workers,
+        budget_bytes=ctx.budget_bytes,
+    )
+    if not folds:
+        raise ValueError("Global CV produced no fold predictions.")
+    keys = _keys(ctx.weekly)
+    preds = pd.concat(
+        [pd.concat([ctx.weekly.frame(ctx.rows[test], keys), fold_preds], axis=1) for _, test, fold_preds, _ in folds],
+        ignore_index=True,
+    )
+    coefs_by_year = {year: artifact for year, _, _, artifact in folds if artifact is not None}
+    fitted = None
+    if final is not None:
+        from .model import FittedModel, log_fit
+
+        clf, scaler, used, total = final
+        log_fit(used, total, clf.classes_, plan.columns)
+        fitted = FittedModel.from_estimators(plan.formula, plan.columns, clf, scaler)
+    return preds, coefs_by_year, fitted
 
 
 def _climatology_baselines(ctx, scores):
@@ -434,6 +577,7 @@ def _climatology_baselines(ctx, scores):
         else:
             variants = [(name if s == 1900 else f"{name}_{s}_{end}", s, end) for s in starts]
 
+        holdout = ctx.in_years(ctx.run.holdout_years)
         for model, start_year, end_year in variants:
             try:
                 if model == "unc_clim_raw":
@@ -443,7 +587,7 @@ def _climatology_baselines(ctx, scores):
                             "unc_clim_raw requires extras.clim_logits.earlier_col in YAML"
                         )
                     preds = make_raw_preds_from_wide_logit(
-                        wide_df=ctx.weekly,
+                        wide_df=ctx.frame(holdout, _keys(ctx.weekly, earlier_col, *ctx.columns_like(prefix))),
                         base_col_prefix=prefix,
                         holdout_years=ctx.run.holdout_years,
                         earlier_col=earlier_col,
@@ -452,8 +596,11 @@ def _climatology_baselines(ctx, scores):
                         renormalize_6=True,
                     )
                 else:
+                    # The window suffix make_raw_preds_from_wide_logit_window reads.
+                    windowed = start_year is not None and end_year is not None and start_year != 1900
+                    window = f"_{start_year}_{end_year}" if windowed else ""
                     preds = make_raw_preds_from_wide_logit_window(
-                        wide_df=ctx.weekly,
+                        wide_df=ctx.frame(holdout, _keys(ctx.weekly, *ctx.columns_like(f"{prefix}{window}"))),
                         base_col_prefix=prefix,
                         holdout_years=ctx.run.holdout_years,
                         start_year=start_year,
@@ -478,10 +625,12 @@ def _forecast_baselines(ctx, result, scores):
         variant = coalesce(fc_cfg.get("variant"), "base")
         base_label = forecast_label(fc_name, variant)
 
+        base = f"{fc_name}_p_onset{get_forecast_variant_suffix(ctx.spec, variant)}"
         if fc_cfg.get("raw", False):
             try:
                 preds = make_raw_preds_from_wide(
-                    ctx.weekly, fc_name, variant, run.holdout_years, ctx.spec
+                    ctx.frame(ctx.in_years(run.holdout_years), _keys(ctx.weekly, *ctx.columns_like(base))),
+                    fc_name, variant, run.holdout_years, ctx.spec,
                 )
                 if preds is not None and not preds.empty:
                     scores.add_baseline(preds, f"{base_label}_raw", "raw")
@@ -491,7 +640,10 @@ def _forecast_baselines(ctx, result, scores):
         if fc_cfg.get("calibrated", False):
             try:
                 preds = make_calibrated_preds_from_wide(
-                    ctx.weekly,
+                    ctx.frame(
+                        ctx.in_years([*run.training_years, *run.holdout_years]),
+                        _keys(ctx.weekly, *ctx.columns_like(base)),
+                    ),
                     fc_name,
                     variant,
                     run.training_years,
@@ -523,7 +675,7 @@ def _platt_weights(ctx, fc_name, variant):
     weeks = _present_weeks(ctx.weekly, base)
     if not weeks:
         return None
-    frame = ctx.weekly[ctx.weekly["year"].isin([*run.training_years, *run.holdout_years])].copy()
+    frame = ctx.frame(ctx.in_years([*run.training_years, *run.holdout_years]), ["year", "outcome", *ctx.columns_like(base)])
     labels = [f"week{w}" for w in weeks]
     for w in weeks:
         frame[f"week{w}"] = frame[f"{base}_week{w}"]

@@ -126,15 +126,18 @@ def run(blend, forecasts: dict, *, issue_date=None, resources=None) -> Forecast:
     )
     # No trimming: a forecast must not know when the onset came.
     weekly = features.weekly(config, climatology, blend.observed, model_onsets, trim=False)
+    rows = np.arange(len(weekly))
     if issue_date is not None:
-        weekly = weekly[pd.to_datetime(weekly["time"]).dt.date == issue_date]
-    rows = weekly.dropna(subset=_input_columns(blend.model, weekly)).reset_index(drop=True)
-    if rows.empty:
+        rows = rows[weekly["time"].astype("datetime64[D]") == np.datetime64(issue_date, "D")]
+    for column in _input_columns(blend.model, weekly):
+        rows = rows[pd.notna(weekly.take(column, rows))]
+    if not len(rows):
         raise IncompatibleForecast(["no unit and issue date has every feature the blend needs"])
-    return Forecast(weekly=_probabilities(blend, rows), features=rows)
+    table = weekly.frame(rows)
+    return Forecast(weekly=_probabilities(blend, table), features=table)
 
 
-def _input_columns(model, weekly: pd.DataFrame) -> list[str]:
+def _input_columns(model, weekly: features.Weekly) -> list[str]:
     """The weekly columns the fitted model's terms are made of."""
     names = {part for feature in model.features for part in str(feature).split(":")}
     return [c for c in weekly.columns if c in names]
