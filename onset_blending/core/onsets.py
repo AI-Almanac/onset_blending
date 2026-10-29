@@ -13,8 +13,9 @@ import pandas as pd
 import xarray as xr
 
 from . import _specs, domain, io, parallel
-from .._legacy import nc_utils, onset_utils
+from .._legacy import nc_utils
 from ..config import BlendConfig, ForecastModel
+from .onset_rule import OnsetRule, find_onsets
 from .reference import OBSERVATIONS, Reference
 
 # Peak bytes per rainfall value of one run of issues (the float32 run, the
@@ -28,9 +29,10 @@ def _context(config: BlendConfig, spec: dict, reference: Reference, source: str,
              area: domain.AreaFilter | None) -> dict:
     return {
         "spec": spec,
-        "onset_params": onset_utils.read_onset_params(spec),
+        "onset_rule": OnsetRule.of(config.onset.definition),
         "convention": domain.id_convention(config),
         "area": area if area is not None else domain.AreaFilter(config),
+        "reference": reference,
         "thresholds": reference.thresholds,
         "reference_onset": reference.reference_onset,
         "cell_transform": reference.cell_transforms.get(source),
@@ -74,9 +76,7 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
     order = np.argsort(ids.astype(str), kind="stable")
     ids = ids[order]
     rain = rain[:, order]
-    thresholds = nc_utils.attach_thresholds_id(
-        pd.DataFrame({"id": pd.Series(ids, dtype=str)}), context["thresholds"], spec=spec
-    )["onset_thresh"].to_numpy(dtype=float)
+    thresholds = context["reference"].unit_thresholds(ids.astype(str), context["convention"])
     cutoff_md = spec["options"]["cutoff_month_day"]
     parts = []
     for year in np.unique(read.years):
@@ -87,16 +87,13 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
         if policy == "drop":
             units = ~np.isnan(series).any(axis=1)
         cutoff = dt.date.fromisoformat(f"{year}-{cutoff_md}")
-        ref = nc_utils.attach_ref_onset(
-            pd.DataFrame({"id": pd.Series(ids[units], dtype=str), "year": np.full(units.sum(), year)}),
-            context["reference_onset"],
-        )["ref_onset_date"]
-        start = np.array([max(cutoff, r) if pd.notna(r) else cutoff for r in ref], dtype=object)
+        ref = context["reference"].reference_dates(ids[units].astype(str), np.full(units.sum(), year))
+        start = np.array([max(cutoff, pd.Timestamp(r).date()) if not np.isnat(r) else cutoff for r in ref], dtype=object)
         dates = read.dates[days]
         positions = np.searchsorted(dates.astype("datetime64[D]"), start.astype("datetime64[D]"), side="left")
         start_days = np.where(positions < len(dates), positions + 1, 9999)
-        found = onset_utils.find_onsets_batch(
-            series[units], thresholds[units], start_days, context["onset_params"], reject_if_short_followup=True
+        found = find_onsets(
+            series[units], thresholds[units], start_days, context["onset_rule"], reject_if_short_followup=True
         )[0]
         has = np.isfinite(found)
         index = np.where(has, found, 1).astype(np.intp) - 1
@@ -307,21 +304,34 @@ def _kept_mask(path: Path, context: dict) -> tuple[pd.DataFrame, np.ndarray, np.
 
 
 def _unit_frame_values(context: dict, ids: np.ndarray, issues: np.ndarray):
-    """Per-unit thresholds and per-(issue, unit) reference onset dates, as the
-    legacy pipeline attaches them to its rows."""
-    spec = context["spec"]
-    thresholds = nc_utils.attach_thresholds_id(
-        pd.DataFrame({"id": pd.Series(ids, dtype=str)}), context["thresholds"], spec=spec
-    )["onset_thresh"].to_numpy(dtype=float)
-    issue_index = pd.DatetimeIndex(issues)
-    pairs = pd.DataFrame({
-        "id": pd.Series(np.tile(ids, len(issues)), dtype=str),
-        "time": np.repeat(issue_index.date, len(ids)),
-        "year": np.repeat(issue_index.year.to_numpy(dtype=int), len(ids)),
-    })
-    with_ref = nc_utils.attach_ref_onset(pairs, context["reference_onset"])
-    ref = pd.to_datetime(with_ref["ref_onset_date"]).to_numpy().reshape(len(issues), len(ids))
-    return thresholds, ref
+    """Per-unit thresholds and per-(issue, unit) reference onset dates."""
+    reference = context["reference"]
+    thresholds = reference.unit_thresholds(ids.astype(str), context["convention"])
+    years = pd.DatetimeIndex(issues).year.to_numpy(dtype=int)
+    ref = reference.reference_dates(np.tile(ids.astype(str), len(issues)), np.repeat(years, len(ids)))
+    return thresholds, ref.reshape(len(issues), len(ids))
+
+
+def _start_days(issue_dates: np.ndarray, ref_dates: np.ndarray, days: np.ndarray, fixed_cutoff: str):
+    """The first lead day an onset may fall on, per issue: on or after the
+    fixed cutoff date, and on or after the reference onset (1 without one);
+    9999 past the last lead day."""
+    issue_dates = pd.to_datetime(issue_dates).values
+    days = np.asarray(days)
+    years = pd.DatetimeIndex(issue_dates).year.to_numpy(dtype=int)
+    distinct, codes = np.unique(years, return_inverse=True)
+    cutoffs = np.array([np.datetime64(f"{year}-{fixed_cutoff}") for year in distinct])[codes.reshape(-1)]
+    offsets = (cutoffs - issue_dates).astype("timedelta64[D]").astype(int)
+    fixed = np.searchsorted(days, offsets - 1, side="right") + 1
+    fixed[fixed > len(days)] = 9999
+    ref_dates = pd.to_datetime(ref_dates).values
+    from_ref = np.ones(len(issue_dates), dtype=int)
+    has_ref = ~pd.isnull(ref_dates)
+    if np.any(has_ref):
+        ref_offsets = (ref_dates[has_ref] - issue_dates[has_ref]).astype("timedelta64[D]").astype(int)
+        from_ref[has_ref] = np.searchsorted(days, ref_offsets - 1, side="right") + 1
+        from_ref[from_ref > len(days)] = 9999
+    return fixed.astype(int), from_ref
 
 
 def _file_context(path: Path, context: dict) -> dict:
@@ -448,9 +458,8 @@ class _Summary:
         n_issue, n_unit, n_day = len(issues), len(ids), len(days)
         self.thresholds, self.ref = _unit_frame_values(context, ids, issues)
         issue_rows = np.repeat(issues, n_unit)
-        fixed, from_ref = nc_utils._forecast_start_days(
-            issue_rows, pd.DatetimeIndex(issue_rows).year, self.ref.reshape(-1), np.asarray(days),
-            context["spec"]["options"]["fixed_cutoff_month_day"],
+        fixed, from_ref = _start_days(
+            issue_rows, self.ref.reshape(-1), np.asarray(days), context["spec"]["options"]["fixed_cutoff_month_day"],
         )
         self.fixed, self.from_ref = fixed.reshape(n_issue, n_unit), from_ref.reshape(n_issue, n_unit)
         self.counts = {v: np.zeros((n_issue, n_unit, n_day), dtype=np.uint8) for v in VARIANTS}
@@ -458,7 +467,7 @@ class _Summary:
         self.rain_mean = None
 
     def add(self, start: int, stop: int, rain: np.ndarray) -> None:
-        params = self.context["onset_params"]
+        rule = self.context["onset_rule"]
         n_run, n_member, n_unit, n_day = rain.shape
         units = np.tile(np.arange(n_unit), n_member)
         thresholds = np.tile(self.thresholds, n_member)
@@ -468,9 +477,7 @@ class _Summary:
                 np.ones(n_member * n_unit, dtype=int), np.tile(self.fixed[t], n_member),
                 np.tile(self.from_ref[t], n_member),
             ))
-            found = onset_utils.find_onsets_batch(
-                rain[offset].reshape(n_member * n_unit, n_day), thresholds, starts, params
-            )
+            found = find_onsets(rain[offset].reshape(n_member * n_unit, n_day), thresholds, starts, rule)
             for variant, onset in zip(VARIANTS, found):
                 valid = np.isfinite(onset) & (onset >= 1) & (onset <= n_day)
                 np.add.at(self.counts[variant][t], (units[valid], onset[valid].astype(np.intp) - 1), 1)

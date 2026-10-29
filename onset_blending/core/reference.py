@@ -9,14 +9,17 @@ training used without reading (or writing) any file.
 from __future__ import annotations
 
 import datetime as dt
+import logging
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
-from . import _specs, domain
-from .._legacy import nc_utils, onset_utils
+from . import domain, ids
 from ..config import BlendConfig
+
+log = logging.getLogger(__name__)
 
 OBSERVATIONS = "observations"
 
@@ -31,24 +34,81 @@ class Reference:
 
     @classmethod
     def resolve(cls, config: BlendConfig) -> "Reference":
-        spec = _specs.observation_spec(config)
         cell_transforms, regrid_weights = {}, {}
-        sources = [(OBSERVATIONS, spec, None)] + [
-            (m.name, _specs.forecast_spec(config, m), m) for m in config.models
+        sources = [(OBSERVATIONS, config.observations.cell_transform, None)] + [
+            (m.name, m.cell_transform, m) for m in config.models
         ]
-        for name, source_spec, model in sources:
-            transform = nc_utils.read_cell_transform(source_spec)
+        for name, transform, model in sources:
             if transform is not None:
-                cell_transforms[name] = transform
+                cell_transforms[name] = read_cell_transform(config.path(transform))
             weights = _regrid_weights_path(config, model)
             if weights is not None:
                 regrid_weights[name] = pd.read_csv(weights, dtype={"target_id": str, "adm3_name": str})
         return cls(
-            thresholds=onset_utils.read_thresholds(spec),
-            reference_onset=onset_utils.read_ref_onset_dates(spec),
+            thresholds=read_thresholds(config),
+            reference_onset=read_reference_onset(config),
             cell_transforms=cell_transforms,
             regrid_weights=regrid_weights,
         )
+
+    def unit_thresholds(self, unit_ids: np.ndarray, explicit: ids.GridIdConvention | None) -> np.ndarray:
+        """Each unit's onset threshold (NaN without one); a table keyed by
+        lat/lon is read under the units' id convention, and must cover them."""
+        thresholds = self.thresholds
+        if thresholds is None:
+            return np.full(len(unit_ids), np.nan)
+        if not isinstance(thresholds, pd.DataFrame):
+            return np.full(len(unit_ids), float(thresholds))
+        convention = ids.resolve(explicit, authoritative_ids=pd.Series(unit_ids, dtype=str),
+                                 context="rainfall/threshold ID handoff")
+        table = thresholds.copy()
+        table.columns = table.columns.str.lower()
+        if "id" not in table.columns:
+            if "adm3_name" in table.columns:
+                table["id"] = table["adm3_name"]
+            elif {"lat", "lon"} <= set(table.columns):
+                coords = ids.with_id_column(table[["lat", "lon"]], explicit=explicit, convention=convention,
+                                            context="latitude/longitude IDs")
+                table["id"] = coords["id"].to_numpy()
+            else:
+                raise ValueError("Thresholds table must have 'id', 'adm3_name', or ('lat', 'lon').")
+        table["id"] = ids.normalize(table["id"], context="threshold IDs")
+        table["onset_thresh"] = table["onset_thresh"].astype(float)
+        table = table[["id", "onset_thresh"]].drop_duplicates()
+        conflicting = table["id"].duplicated(keep=False)
+        if conflicting.any():
+            raise ValueError(f"Threshold IDs have conflicting values: {', '.join(table.loc[conflicting, 'id'].unique()[:10])}")
+        by_id = table.set_index("id")["onset_thresh"]
+        wanted = pd.Index(pd.unique(np.asarray(unit_ids, dtype=str)))
+        missing = wanted[~wanted.isin(by_id.index)]
+        if len(missing):
+            raise ValueError(
+                f"Threshold table is missing {len(missing)} of {len(wanted)} rainfall IDs after domain "
+                f"filtering. Examples: {', '.join(map(str, missing[:10]))}"
+            )
+        return by_id.reindex(np.asarray(unit_ids, dtype=str)).to_numpy(dtype=float)
+
+    def reference_dates(self, unit_ids: np.ndarray, years: np.ndarray) -> np.ndarray:
+        """The reference onset date (datetime64[ns], NaT without one) of each
+        (unit, year) pair."""
+        years = np.asarray(years, dtype=int)
+        reference = self.reference_onset
+        if reference is None:
+            return np.full(len(years), np.datetime64("NaT"), dtype="datetime64[ns]")
+        if isinstance(reference, dict):
+            month_day = reference["month_day"]
+            distinct, codes = np.unique(years, return_inverse=True)
+            dates = pd.to_datetime(pd.Series([f"{y}-{month_day}" for y in distinct]), errors="coerce").to_numpy()
+            return dates[codes].astype("datetime64[ns]")
+        keys = [k for k in ("id", "year") if k in reference.columns]
+        if not keys:
+            return np.full(len(years), np.datetime64("NaT"), dtype="datetime64[ns]")
+        table = reference.drop_duplicates(keys + ["ref_onset_date"])
+        if table.duplicated(keys).any():
+            raise ValueError("The reference onset table gives a unit and year more than one date")
+        pairs = pd.DataFrame({"id": pd.Series(np.asarray(unit_ids, dtype=str)), "year": years})
+        found = pairs[keys].merge(table, on=keys, how="left")["ref_onset_date"]
+        return pd.to_datetime(found).to_numpy().astype("datetime64[ns]")
 
     def regridder(self, source: str) -> domain.Regridder | None:
         """The regridder onto the blend's units for a source, compiled once."""
@@ -89,6 +149,126 @@ class Reference:
             cell_transforms={k: _get(arrays, v) for k, v in meta["cell_transforms"].items()},
             regrid_weights={k: _get(arrays, v) for k, v in meta["regrid_weights"].items()},
         )
+
+
+def read_thresholds(config: BlendConfig) -> float | pd.DataFrame:
+    """The onset threshold: a constant, or a table (lat, lon, onset_thresh or
+    id, onset_thresh) from a CSV, NetCDF or MATLAB file, optionally scaled."""
+    threshold = config.onset.threshold
+    if threshold.mm is not None:
+        return float(threshold.mm)
+    path = str(config.path(threshold.file))
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Threshold file not found: {path}")
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".nc", ".nc4", ".netcdf"):
+        import netCDF4
+
+        with netCDF4.Dataset(path) as ds:
+            table = pd.DataFrame({
+                "lat": np.array(ds[threshold.lat_var][:]).flatten(),
+                "lon": np.array(ds[threshold.lon_var][:]).flatten(),
+                "onset_thresh": np.array(ds[threshold.value_var][:]).flatten(),
+            }).drop_duplicates()
+    elif ext == ".mat":
+        import scipy.io
+
+        content = scipy.io.loadmat(path)
+        lats = np.array(content[threshold.mat_lat_name]).flatten()
+        lons = np.array(content[threshold.mat_lon_name]).flatten()
+        table = pd.DataFrame([(a, b) for a in lats for b in lons], columns=["lat", "lon"])
+        table["onset_thresh"] = np.array(content[threshold.mat_value_name]).flatten()
+        table = table.drop_duplicates()
+    else:
+        table = _threshold_csv(path, threshold)
+    scale = threshold.scale
+    if scale is None:
+        return table
+    values = table["onset_thresh"].astype(float).values * float(scale.factor) + float(scale.offset)
+    if scale.min is not None:
+        values = np.maximum(values, float(scale.min))
+    if scale.max is not None:
+        values = np.minimum(values, float(scale.max))
+    return table.assign(onset_thresh=values)
+
+
+def _threshold_csv(path: str, threshold) -> pd.DataFrame:
+    table = pd.read_csv(path, dtype=str)
+    value = threshold.value_col
+    if threshold.id_col:
+        if threshold.id_col not in table.columns:
+            raise ValueError(f"Configured thresholds.id_col '{threshold.id_col}' not found. Found: {table.columns.tolist()}")
+        return table.rename(columns={threshold.id_col: "id", value: "onset_thresh"})[["id", "onset_thresh"]].drop_duplicates()
+    if "adm3_name" in table.columns:
+        return table.rename(columns={"adm3_name": "id", value: "onset_thresh"})[["id", "onset_thresh"]].drop_duplicates()
+    if "id" in table.columns:
+        return table.rename(columns={value: "onset_thresh"})[["id", "onset_thresh"]].drop_duplicates()
+    table = table.rename(columns={threshold.lat_col: "lat", threshold.lon_col: "lon", value: "onset_thresh"})
+    return table[["lat", "lon", "onset_thresh"]].drop_duplicates()
+
+
+def read_reference_onset(config: BlendConfig) -> dict | pd.DataFrame | None:
+    """The reference onset: None, a month-day every year and unit
+    ({"mode": "constant_month_day", ...}), or a table of ref_onset_date
+    keyed by id and/or year."""
+    reference = config.onset.reference_onset
+    if reference is None:
+        return None
+    if reference.month_day is not None:
+        return {"mode": "constant_month_day", "month_day": str(reference.month_day)}
+    path = str(config.path(reference.file))
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"ref_onset file not found: {path}")
+    unit_col, year_col, day_col = reference.unit_col, reference.year_col, reference.day_col
+    table = pd.read_csv(path, dtype={unit_col: str} if unit_col else None)
+    if reference.date_col and reference.date_col in table.columns:
+        table["ref_onset_date"] = pd.to_datetime(table[reference.date_col], errors="coerce").dt.date
+    elif year_col and day_col and reference.base_date and year_col in table.columns and day_col in table.columns:
+        table["ref_onset_date"] = table.apply(
+            lambda row: (pd.to_datetime(f"{int(row[year_col])}-{reference.base_date}") + pd.Timedelta(days=int(row[day_col]))).date(),
+            axis=1,
+        )
+    else:
+        raise ValueError("ref_onset file needs either a parseable 'date_col', or 'year_col'+'day_col'+'base_date'.")
+    keys = []
+    if unit_col:
+        if unit_col not in table.columns:
+            raise ValueError(f"ref_onset unit_col '{unit_col}' not in file columns {table.columns.tolist()}")
+        table = table.rename(columns={unit_col: "id"})
+        table["id"] = ids.normalize(table["id"], context="reference-onset IDs")
+        keys.append("id")
+    if year_col and year_col in table.columns:
+        table = table.rename(columns={year_col: "year"})
+        table["year"] = table["year"].astype(int)
+        keys.append("year")
+    if not keys:
+        raise ValueError("ref_onset file needs a 'year_col' and/or 'unit_col' to key on.")
+    return table[keys + ["ref_onset_date"]].drop_duplicates()
+
+
+def read_cell_transform(path) -> pd.DataFrame:
+    """Source-to-unit weights (source_id, target_id, weight): normalised ids,
+    finite non-negative weights, distinct pairs, every target weighted; rows
+    of zero weight dropped."""
+    path = str(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"cell_transform_file not found: {path}")
+    weights = pd.read_csv(path, dtype={"source_id": str, "target_id": str})
+    if any(c not in weights.columns for c in ("target_id", "source_id", "weight")):
+        raise ValueError("Transform file must have: target_id, source_id, weight")
+    if weights.empty:
+        raise ValueError("Cell-transform weights file must not be empty.")
+    weights["source_id"] = ids.normalize(weights["source_id"], context="cell-transform source IDs")
+    weights["target_id"] = ids.normalize(weights["target_id"], context="cell-transform target IDs")
+    weights["weight"] = pd.to_numeric(weights["weight"], errors="coerce")
+    if not np.isfinite(weights["weight"]).all() or (weights["weight"] < 0).any():
+        raise ValueError("Cell-transform weights must be finite and non-negative.")
+    if weights.duplicated(["source_id", "target_id"]).any():
+        raise ValueError("Cell-transform source_id/target_id pairs must be unique.")
+    totals = weights.groupby("target_id")["weight"].sum()
+    if (totals <= 0).any():
+        raise ValueError(f"Cell-transform targets have zero total weight: {', '.join(totals[totals <= 0].index.astype(str)[:10])}")
+    return weights.loc[weights["weight"] > 0].reset_index(drop=True)
 
 
 def _regrid_weights_path(config: BlendConfig, model):
