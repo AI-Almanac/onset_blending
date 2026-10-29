@@ -6,6 +6,11 @@ season (and the horizon that day has), so they are computed once per
 distinct (season day, horizon), or per (year, season day, horizon) when the
 KDE is refitted without each test year, instead of once per issue date of
 every test year.
+
+The KDE and its probabilities are the legacy climatology's (a Gaussian KDE
+with Scott's bandwidth; R density()'s 512-point CDF with approxfun's
+boundary rule; a probability floor that keeps each row's sum), operation
+for operation.
 """
 
 from __future__ import annotations
@@ -16,8 +21,10 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from scipy.interpolate import interp1d
+from scipy.stats import gaussian_kde
+
 from . import parallel
-from .._legacy import climatology_utils as clim_utils
 from ..config import BlendConfig
 
 # Units per process task: enough to amortise a task, few enough to spread.
@@ -119,7 +126,8 @@ def years(
 
 
 def _training_onsets(observed, window: tuple[int, int], min_onset_years: int):
-    onsets = clim_utils.filter_gt_training(observed.onsets(), *window)
+    onsets = observed.onsets()
+    onsets = onsets[onsets["onset_day"].notna() & onsets["year"].between(*window)].copy()
     counts = onsets.groupby("id")["onset_day"].size()
     eligible = counts[counts >= int(min_onset_years)].index
     onsets = onsets[onsets["id"].isin(eligible)].copy()
@@ -140,11 +148,42 @@ def _plan(config: BlendConfig, test: tuple[int, int], cv_by_year: bool):
         for h in settings.horizons
     ] or None
     window_days = None if horizons else config.climatology_forecast_window()
-    grid = clim_utils.build_issue_grid(test[0], test[1], config.onset.season_start, settings.issue_end)
-    plan = clim_utils._build_issue_plan(grid, config.onset.season_start, window_days, horizons)
-    grid = pd.DataFrame({"time": plan["time"], "year": plan["year"], "d0": plan["d0"], "window": plan["window"]})
+    grid = _issue_grid(test, config.onset.season_start, settings.issue_end, window_days, horizons)
+    max_h = max(h["forecast_window"] for h in horizons) if horizons else int(window_days)
     by_year = cv_by_year or bool((grid.groupby("d0")["window"].nunique() > 1).any())
-    return grid, by_year, plan["max_h"]
+    return grid, by_year, max_h
+
+
+def _issue_grid(test: tuple[int, int], season_start: str, issue_end: str, forecast_window, horizons) -> pd.DataFrame:
+    """Every issue date of the test years (time, year), with its day of the
+    season (d0) and horizon (window; -1 outside every configured horizon)."""
+    times, years, d0, windows = [], [], [], []
+    for year in range(int(test[0]), int(test[1]) + 1):
+        first, last = pd.Timestamp(f"{year}-{season_start}"), pd.Timestamp(f"{year}-{issue_end}")
+        if pd.isna(first) or pd.isna(last):
+            raise ValueError(f"Bad season dates; expected 'MM-DD'. Got: {season_start} / {issue_end}")
+        if last < first:
+            raise ValueError(f"issue_end_md is before season_start_md for year {year}")
+        days = pd.date_range(first, last, freq="D")
+        times.append(days.date)
+        years.append(np.full(len(days), year))
+        d0.append((days - first).days.to_numpy())
+        if horizons is None:
+            windows.append(np.full(len(days), int(forecast_window)))
+            continue
+        window = np.full(len(days), -1)
+        unset = np.ones(len(days), dtype=bool)
+        for h in horizons:
+            inside = unset & (days >= pd.Timestamp(f"{year}-{h['start_md']}")) & (days <= pd.Timestamp(f"{year}-{h['end_md']}"))
+            window[inside] = int(h["forecast_window"])
+            unset &= ~inside
+        windows.append(window)
+    return pd.DataFrame({
+        "time": np.concatenate(times),
+        "year": np.concatenate(years).astype(int),
+        "d0": np.concatenate(d0).astype(int),
+        "window": np.concatenate(windows).astype(int),
+    })
 
 
 def _climatology_task(task: tuple, context: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -157,18 +196,130 @@ def _climatology_task(task: tuple, context: dict) -> tuple[np.ndarray, np.ndarra
     unconditional = np.full((len(days_by_unit), len(keys), max_h + 1), np.nan)
     for u, (unit_years, onset_days) in enumerate(zip(years_by_unit, days_by_unit)):
         if not cv:
-            conditional[u], unconditional[u] = clim_utils._predict_pair_for_rows(
-                clim_utils.fit_kde(onset_days), d0, windows, max_h
-            )
+            conditional[u], unconditional[u] = _predict_pair(fit_kde(onset_days), d0, windows, max_h)
             continue
         key_years = keys["year"].to_numpy(dtype=int)
         for year in np.unique(key_years):
             rows = np.flatnonzero(key_years == year)
-            kde = clim_utils.fit_kde(onset_days[unit_years != year])
-            conditional[u, rows], unconditional[u, rows] = clim_utils._predict_pair_for_rows(
-                kde, d0[rows], windows[rows], max_h
+            kde = fit_kde(onset_days[unit_years != year])
+            conditional[u, rows], unconditional[u, rows] = _predict_pair(kde, d0[rows], windows[rows], max_h)
+    return conditional, unconditional
+
+
+# ---------------------------------------------------------------------------
+# The KDE and its onset probabilities
+# ---------------------------------------------------------------------------
+
+# Floor on a lead day's probability, and the tolerance of the sums.
+MIN_PROB = 5e-7
+EPS = 1e-12
+
+
+def fit_kde(onset_days: np.ndarray):
+    """A Gaussian KDE (Scott's bandwidth) of a unit's onset days, or None
+    with fewer than 10 of them."""
+    x = np.asarray(onset_days, dtype=float)
+    x = x[~np.isnan(x)]
+    if len(x) < 10:
+        return None
+    try:
+        return gaussian_kde(x, bw_method="scott")
+    except Exception:
+        return None
+
+
+def _cdf(kde):
+    """The KDE's CDF as R's density() + approxfun(rule=2) build it: 512 points
+    over the data +/- 3 bandwidths, the boundary values outside."""
+    data = kde.dataset.flatten()
+    bandwidth = kde.factor * np.std(data, ddof=1)
+    grid = np.linspace(data.min() - 3 * bandwidth, data.max() + 3 * bandwidth, 512)
+    pdf = kde.evaluate(grid)
+    cdf = np.cumsum(pdf) / np.sum(pdf)
+    return interp1d(grid, cdf, bounds_error=False, fill_value=(cdf[0], cdf[-1]))
+
+
+def _floored(p_raw: np.ndarray, target_sum: np.ndarray, lb: float = MIN_PROB, eps: float = EPS) -> np.ndarray:
+    """Each row's probabilities at least lb, rescaled to keep its target sum
+    (clipped to [0, 1]): the excess over the target comes off what lies above
+    the floor, in proportion."""
+    p_raw = np.asarray(p_raw, dtype=float)
+    target_sum = np.asarray(target_sum, dtype=float).copy()
+    p_raw = np.maximum(p_raw, 0.0)
+    p_raw = np.where(np.isfinite(p_raw), p_raw, 0.0)
+    target_sum = np.where(np.isfinite(target_sum) & (target_sum >= 0.0), target_sum, 0.0)
+    target_sum = np.minimum(target_sum, 1.0)
+
+    out = np.empty_like(p_raw)
+    zero = target_sum <= eps
+    small = (~zero) & (target_sum < p_raw.shape[1] * lb)
+    normal = ~(zero | small)
+    out[zero] = 0.0
+    out[small] = target_sum[small, None] / p_raw.shape[1]
+    if normal.any():
+        p = np.maximum(p_raw[normal], lb)
+        excess = p.sum(axis=1) - target_sum[normal]
+        no_reduction = excess <= eps
+        adjusted = np.empty_like(p)
+        adjusted[no_reduction] = p[no_reduction]
+        reduce = ~no_reduction
+        if reduce.any():
+            p_reduce = p[reduce]
+            reducible = p_reduce - lb
+            reducible_sum = reducible.sum(axis=1)
+            degenerate = reducible_sum <= eps
+            reduced = np.empty_like(p_reduce)
+            targets = target_sum[normal][reduce]
+            reduced[degenerate] = targets[degenerate, None] / p_raw.shape[1]
+            regular = ~degenerate
+            reduced[regular] = p_reduce[regular] - (
+                excess[reduce][regular, None] * reducible[regular] / reducible_sum[regular, None]
             )
-    clim_utils._kde_cdf.cache_clear()
+            adjusted[reduce] = np.maximum(reduced, lb)
+        out[normal] = adjusted
+    return out
+
+
+def _predict_pair(kde, d0: np.ndarray, windows: np.ndarray, max_h: int) -> tuple[np.ndarray, np.ndarray]:
+    """Conditional (rows, max_h: onset on day d0+k given none by d0) and
+    unconditional (rows, max_h + 1: none by d0, then each day) probabilities
+    from one KDE, for rows of season days and their horizons."""
+    d0 = np.asarray(d0, dtype=int)
+    windows = np.asarray(windows, dtype=int)
+    conditional = np.full((len(d0), max_h), np.nan)
+    unconditional = np.full((len(d0), max_h + 1), np.nan)
+    if kde is None:
+        return conditional, unconditional
+    cdf = _cdf(kde)
+    for horizon in np.unique(windows[windows > 0]):
+        rows = np.flatnonzero(windows == horizon)
+        days = np.arange(1, int(horizon) + 1)
+        num = cdf(d0[rows, None] + days) - cdf(d0[rows, None] + days - 1)
+        num = np.maximum(num, 0.0)
+        num = np.where(np.isfinite(num), num, 0.0)
+
+        base_prob = cdf(d0[rows])
+        unconditional[rows, 0] = base_prob
+        unconditional[rows, 1:int(horizon) + 1] = _floored(num, num.sum(axis=1))
+
+        denom = 1.0 - base_prob
+        cond = np.empty_like(num)
+        fallback = (~np.isfinite(denom)) | (denom <= EPS)
+        if fallback.any():
+            cond[fallback] = _floored(num[fallback], num[fallback].sum(axis=1))
+        regular = ~fallback
+        if regular.any():
+            p_raw = num[regular] / denom[regular, None]
+            p_raw = np.maximum(p_raw, 0.0)
+            p_raw = np.where(np.isfinite(p_raw), p_raw, 0.0)
+            target_sum = p_raw.sum(axis=1)
+            empty = (~np.isfinite(target_sum)) | (target_sum <= EPS)
+            cond_regular = np.empty_like(p_raw)
+            cond_regular[empty] = 0.0
+            if (~empty).any():
+                cond_regular[~empty] = _floored(p_raw[~empty], target_sum[~empty])
+            cond[regular] = cond_regular
+        conditional[rows, :int(horizon)] = cond
     return conditional, unconditional
 
 
