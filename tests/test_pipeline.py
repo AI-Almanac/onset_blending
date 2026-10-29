@@ -8,6 +8,7 @@ import xarray as xr
 
 from onset_blending import BlendConfig
 from onset_blending.blend import TrainedBlend
+from onset_blending import forecast as forecast_module
 from onset_blending.forecast import IncompatibleForecast
 from onset_blending.training import Resources, train
 
@@ -42,10 +43,11 @@ def write_observations(folder):
         ).to_netcdf(folder / f"{year}.nc")
 
 
-def write_forecasts(folder, years=FORECAST_YEARS, members=3):
+def write_forecasts(folder, years=FORECAST_YEARS, members=3, issues_of=None, name=None):
+    """{year}.nc season files; issues_of(year) and name(year) give other issues and file names."""
     folder.mkdir(exist_ok=True)
     for year in years:
-        issues = [dt.date(year, 5, 1) + dt.timedelta(days=7 * k) for k in range(13)]
+        issues = issues_of(year) if issues_of else [dt.date(year, 5, 1) + dt.timedelta(days=7 * k) for k in range(13)]
         data = np.zeros((len(issues), members, LEAD_DAYS, len(LATS), len(LONS)), dtype="float32")
         for t, issue in enumerate(issues):
             leads = [issue + dt.timedelta(days=d) for d in range(1, LEAD_DAYS + 1)]
@@ -57,7 +59,7 @@ def write_forecasts(folder, years=FORECAST_YEARS, members=3):
             {"tp": (("time", "number", "day", "lat", "lon"), data, {"units": "mm"})},
             coords={"time": pd.to_datetime(issues), "number": np.arange(members),
                     "day": np.arange(1, LEAD_DAYS + 1), "lat": LATS, "lon": LONS},
-        ).to_netcdf(folder / f"{year}.nc")
+        ).to_netcdf(folder / (name(year) if name else f"{year}.nc"))
 
 
 @pytest.fixture(scope="module")
@@ -104,6 +106,38 @@ def test_a_saved_blend_forecasts_like_its_model(region, tmp_path):
     assert np.array_equal(direct[probabilities.columns].to_numpy(), probabilities.to_numpy())
     one_date = blend.forecast({"ens": root / "ens" / "2013.nc"}, issue_date="2013-05-15")
     assert set(pd.to_datetime(one_date.weekly["time"]).dt.date) == {dt.date(2013, 5, 15)}
+
+
+def test_one_initialisation_per_model_is_forecast_for_its_issue_date(region, tmp_path):
+    _, _, result = region
+    init = dt.date(2014, 6, 9)
+    write_forecasts(tmp_path, years=[2014], issues_of=lambda _: [init], name=lambda _: "latest.nc")
+
+    forecast = result.blend.forecast({"ens": tmp_path / "latest.nc"})
+
+    assert set(pd.to_datetime(forecast.weekly["time"]).dt.date) == {init}
+    assert len(forecast.weekly) == len(LATS) * len(LONS)
+
+
+def test_models_initialised_on_different_dates_are_refused(region):
+    _, config, _ = region
+    held = {"ens": [dt.date(2014, 6, 9)], "det": [dt.date(2014, 6, 2)]}
+
+    issue_date, _, problems = forecast_module._issue_problems(config, None, held)
+
+    assert issue_date is None
+    assert problems == [
+        "the live files are initialised on different dates (ens 2014-06-09, det 2014-06-02); "
+        "every model needs the same one"
+    ]
+
+
+def test_an_initialisation_outside_the_season_is_refused(region):
+    _, config, _ = region
+
+    _, _, problems = forecast_module._issue_problems(config, None, {"ens": [dt.date(2014, 11, 3)]})
+
+    assert len(problems) == 1 and problems[0].startswith("issue date 2014-11-03 is outside the season")
 
 
 def test_a_forecast_with_other_members_is_refused(region, tmp_path):

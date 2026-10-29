@@ -175,13 +175,17 @@ result.save("out/")                       # evaluation tables (the output contra
 result.blend.save("india_aifs.blend")     # what operations needs, in one file
 
 blend = TrainedBlend.load("india_aifs.blend")
-forecast = blend.forecast(issue_date="2026-06-09",
-                          forecasts={"aifs_ensv2": "live/ens.nc", "aifsv2": "live/det.nc"})
+# One file per raw model, each holding one initialisation: the issue date.
+forecast = blend.forecast({"aifs_ensv2": "live/ens_2026-06-09.nc", "aifsv2": "live/det_2026-06-09.nc"})
 forecast.save("out/2026-06-09/")          # weekly + daily CSVs, maps if asked
 ```
 
 **The operational path cannot take blending parameters.** `forecast()` accepts
-the issue date and where the live forecast files are, nothing else. Every
+where the live forecast files are (and optionally an issue date), nothing
+else. Operationally each raw model gives one file with one initialisation,
+which is the issue date forecast; every model must be initialised on the
+same date, inside the season. Files holding a season of issues (a replay)
+forecast each of them, or the one `issue_date` names. Every
 parameter comes from the `TrainedBlend`, which is written by training and
 holds, in one file:
 

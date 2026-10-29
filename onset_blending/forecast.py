@@ -1,9 +1,13 @@
 """Operational forecasts: a trained blend applied to live forecast files.
 
-Only the live files and the issue date come from the caller. The recipe,
-reference data and observed onsets all come from the TrainedBlend, and the
-live files must have the structure the blend was trained on; every
-difference is reported before any work starts.
+Only the live files (and, optionally, the issue date) come from the caller.
+The recipe, reference data and observed onsets all come from the
+TrainedBlend, and the live files must have the structure the blend was
+trained on; every difference is reported before any work starts.
+
+Operationally each raw model gives one file holding one initialisation,
+and that is the issue date forecast. Files holding a season of issues (a
+replay) forecast every issue in it, or the one `issue_date` names.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import climatology as climatology_stage, config as cfg, domain, features, inputs, onsets
+from . import climatology as climatology_stage, config as cfg, domain, features, onsets
 from .blend import issue_dates
 from .config import FileSet
 
@@ -65,21 +69,57 @@ def _as_paths(value) -> list[Path]:
     return [Path(v) for v in value]
 
 
-def _season_problems(config: cfg.BlendConfig, issue_date: dt.date | None, live: dict[str, list[Path]]) -> tuple[int | None, list[str]]:
+def _held_issues(blend, live: dict[str, list[Path]]) -> tuple[dict[str, list[dt.date]], list[str]]:
+    """The issue dates each model's live files hold."""
+    held, problems = {}, []
+    for name, paths in live.items():
+        try:
+            model = blend.config.model(name)
+        except (KeyError, ValueError):
+            continue  # an unknown model: check_forecast_files reports it
+        try:
+            held[name] = sorted({d for p in paths for d in issue_dates(p, model)})
+        except (OSError, ValueError, KeyError) as error:
+            problems.append(f"{name}: cannot read the issue dates of its live files ({error})")
+            continue
+        if not held[name]:
+            problems.append(f"{name}: the live files hold no issue dates")
+    return held, problems
+
+
+def _issue_problems(config: cfg.BlendConfig, issue_date: dt.date | None,
+                    held: dict[str, list[dt.date]]) -> tuple[dt.date | None, int | None, list[str]]:
+    """(issue date, season year, problems). With no issue date given, files
+    holding one initialisation each forecast it; files holding more forecast
+    every issue of their one season."""
     problems = []
-    years = {inputs.file_year(p) for paths in live.values() for p in paths}
+    if issue_date is None and held and all(len(dates) == 1 for dates in held.values()):
+        inits = {name: dates[0] for name, dates in held.items()}
+        if len(set(inits.values())) == 1:
+            issue_date = next(iter(inits.values()))
+        else:
+            listed = ", ".join(f"{name} {date}" for name, date in inits.items())
+            problems.append(f"the live files are initialised on different dates ({listed}); every model needs the same one")
+            return None, None, problems
     if issue_date is not None:
         year = issue_date.year
         start = dt.date.fromisoformat(f"{year}-{config.onset.season_start}")
         end = dt.date.fromisoformat(f"{year}-{config.climatology.issue_end}")
         if not start <= issue_date <= end:
             problems.append(f"issue date {issue_date} is outside the season ({start} to {end})")
-    elif len(years) == 1 and None not in years:
-        year = years.pop()
-    else:
-        year = None
-        problems.append("the live files must hold one season (name them by year, or give issue_date)")
-    return year, problems
+        for name, dates in held.items():
+            if dates and issue_date not in dates:
+                nearby = [d.isoformat() for d in dates if abs((d - issue_date).days) <= 7]
+                problems.append(
+                    f"{name}: the live files have no {issue_date} issue"
+                    + (f" (nearby: {', '.join(nearby)})" if nearby else "")
+                )
+        return issue_date, year, problems
+    years = {d.year for dates in held.values() for d in dates}
+    if len(years) != 1:
+        problems.append("the live files must hold one initialisation per model, or one season (or give issue_date)")
+        return None, None, problems
+    return None, years.pop(), problems
 
 
 def run(blend, forecasts: dict, *, issue_date=None, resources=None) -> Forecast:
@@ -90,17 +130,10 @@ def run(blend, forecasts: dict, *, issue_date=None, resources=None) -> Forecast:
     if isinstance(issue_date, str):
         issue_date = dt.date.fromisoformat(issue_date)
     live = {name: _as_paths(paths) for name, paths in forecasts.items()}
-    year, problems = _season_problems(blend.config, issue_date, live)
-    problems += blend.check_forecast_files(live)
-    if issue_date is not None and not problems:
-        for name, paths in live.items():
-            dates = sorted({d for p in paths for d in issue_dates(p, blend.config.model(name))})
-            if issue_date not in dates:
-                nearby = [d.isoformat() for d in dates if abs((d - issue_date).days) <= 7]
-                problems.append(
-                    f"{name}: the live files have no {issue_date} issue"
-                    + (f" (nearby: {', '.join(nearby)})" if nearby else "")
-                )
+    problems = blend.check_forecast_files(live)
+    held, read_problems = _held_issues(blend, live)
+    issue_date, year, issue_problems = _issue_problems(blend.config, issue_date, held)
+    problems += read_problems + issue_problems
     if problems:
         raise IncompatibleForecast(problems)
 
