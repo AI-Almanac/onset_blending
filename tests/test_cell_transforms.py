@@ -8,7 +8,7 @@ import xarray as xr
 from onset_blending import BlendConfig
 from onset_blending._legacy import nc_utils
 from onset_blending.core import _specs, domain, io, onsets
-from onset_blending.core.reference import OBSERVATIONS, Reference
+from onset_blending.core.reference import Reference
 
 from test_pipeline import LATS, LEAD_DAYS, LONS, write_forecasts, write_observations
 
@@ -51,9 +51,9 @@ def region(tmp_path_factory):
     return root
 
 
-def legacy_observed(path, context, weights_file=None):
+def legacy_observed(path, context, config, weights_file=None):
     """onsets._observed_file_from_table as it was."""
-    spec = context["spec"]
+    spec = _specs.observation_spec(config)
     if weights_file is not None:
         spec = {**spec, "options": {**spec["options"], "cell_transform_file": str(weights_file)}}
     variable = spec["input"]["value_col"]
@@ -74,7 +74,7 @@ def legacy_observed(path, context, weights_file=None):
 def test_observed_onsets_under_a_cell_transform_are_the_legacy_routes(region, policy):
     config = make_config(region, policy)
     reference = Reference.resolve(config)
-    context = onsets._context(config, _specs.observation_spec(config), reference, OBSERVATIONS, None)
+    context = onsets.observation_context(config, reference)
 
     for path in io.list_files(config.observations.files, config, "observations"):
         new = onsets._observed_file(path, context)
@@ -83,18 +83,18 @@ def test_observed_onsets_under_a_cell_transform_are_the_legacy_routes(region, po
             # The legacy route refused a season whose source series was dropped
             # (the source id went missing); the season's other sources stand in.
             with pytest.raises(ValueError, match="expected weight source IDs are absent"):
-                legacy_observed(path, context)
+                legacy_observed(path, context, config)
             weights = region / "weights_without.csv"
             WEIGHTS[WEIGHTS["source_id"] != "10.00_70.25"].to_csv(weights, index=False)
-        old = legacy_observed(path, context, weights)
+        old = legacy_observed(path, context, config, weights)
         pd.testing.assert_frame_equal(new.reset_index(drop=True), old.reset_index(drop=True), check_dtype=False)
 
 
-def legacy_forecast(path, context):
+def legacy_forecast(path, context, config):
     """onsets._forecast_file_from_table as it was, without the member filters."""
-    spec = context["spec"]
+    spec = _specs.forecast_spec(config, config.models[0])
     df = nc_utils.nc_read_forecast_wide(
-        nc_path=str(path), var_name=context["variable"], dim_rename_map=spec["dimensions"]["rename"],
+        nc_path=str(path), var_name=context["variable"], dim_rename_map=context["rename"],
         spec=spec, day_dim="day", prefix="rain",
     )
     rain_cols = [c for c in df.columns if c.startswith("rain_day_")]
@@ -119,13 +119,7 @@ def legacy_forecast(path, context):
 
 
 def forecast_context(config):
-    model = config.models[0]
-    context = {
-        **onsets._context(config, _specs.forecast_spec(config, model), Reference.resolve(config), model.name, None),
-        "variable": model.variable, "dims": dict(model.dims), "fallback_unit_scale": float(model.unit_scale),
-        "keep_ids": None, "max_member": None, "member_ids": None,
-    }
-    return context
+    return onsets.forecast_context(config, config.models[0], Reference.resolve(config))
 
 
 @pytest.mark.parametrize("dissemination", [False, True])
@@ -137,7 +131,7 @@ def test_forecast_onsets_under_a_cell_transform_are_the_legacy_routes(region, di
 
     for path in io.list_files(config.models[0].files, config, "model ens"):
         new, _ = onsets._forecast_file(path, context)
-        old = legacy_forecast(path, onsets._file_context(path, context))
+        old = legacy_forecast(path, onsets._file_context(path, context), config)
         xr.testing.assert_identical(new, old)
         assert list(new["unit"].values) == (["south"] if dissemination else ["north", "south"])
 
@@ -150,6 +144,6 @@ def test_dissemination_units_restrict_a_forecasts_points(region):
 
     for path in io.list_files(config.models[0].files, config, "model ens"):
         new, _ = onsets._forecast_file(path, context)
-        old = legacy_forecast(path, onsets._file_context(path, context))
+        old = legacy_forecast(path, onsets._file_context(path, context), config)
         xr.testing.assert_identical(new.sortby("unit"), old)
         assert sorted(new["unit"].values) == cells

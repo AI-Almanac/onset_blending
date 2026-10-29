@@ -185,24 +185,24 @@ class ForecastFile:
     a time (whole storage chunks, each decompressed once, and only where a
     kept point lies or, until member spread is found, a spread-area point).
 
-        with ForecastFile(path, variable, rename, spec, keep) as f:
+        with ForecastFile(path, variable, rename, leads, keep) as f:
             for start, stop, rain in f.issue_runs():   # rain: (issue, member, point, day)
                 ...
     """
 
-    def __init__(self, path, variable: str, rename: dict, spec: dict, keep: np.ndarray, *,
+    def __init__(self, path, variable: str, rename: dict, leads: LeadSelection, keep: np.ndarray, *,
                  spread_over: np.ndarray | None = None, scale: float = 1.0):
         import netCDF4
 
         self.path, self.scale = path, scale
         self._ds = netCDF4.Dataset(path)
         try:
-            self._setup(variable, rename, spec, keep, spread_over)
+            self._setup(variable, rename, leads, keep, spread_over)
         except BaseException:
             self._ds.close()
             raise
 
-    def _setup(self, variable, rename, spec, keep, spread_over):
+    def _setup(self, variable, rename, leads, keep, spread_over):
         ds = self._ds
         if variable not in ds.variables:
             raise ValueError(f"{self.path}: no {variable!r} variable")
@@ -212,7 +212,7 @@ class ForecastFile:
         self._v = v = ds.variables[variable]
         dim_names, dim_vals = layout["dim_names"], layout["dim_vals"]
         day_idx, time_idx, member_idx = layout["day_idx"], layout["time_idx"], layout["member_idx"]
-        positions, _, day_numbers = _select_forecast_days(dim_vals[dim_names[day_idx]], spec, self.path)
+        positions, _, day_numbers = _select_forecast_days(dim_vals[dim_names[day_idx]], leads, self.path)
         self._day_positions, self.days = lead_days_in_order(positions, day_numbers, self.path)
         spatial = [dim_names[i] for i in layout["spatial_idx"]]
         shape = [len(dim_vals[d]) for d in spatial]
@@ -380,6 +380,40 @@ def read_observations(path, variable: str, rename: dict, *, shift_days: int = 0)
 # ---------------------------------------------------------------------------
 # NetCDF primitives: coordinates, times, layouts, reading in storage chunks
 # ---------------------------------------------------------------------------
+
+# Dimension names the readers know, mapped to theirs; a source's own `dims` win.
+OBSERVATION_DIMS = {
+    "TIME": "time", "time": "time",
+    "LATITUDE": "lat", "latitude": "lat", "lat": "lat",
+    "LONGITUDE": "lon", "longitude": "lon", "lon": "lon",
+    "ADM3_NAME": "adm3_name", "adm3_name": "adm3_name", "adm3": "adm3_name",
+}
+FORECAST_DIMS = {
+    "time": "time", "day": "day", "lat": "lat", "lon": "lon",
+    "adm3_name": "adm3_name", "adm3": "adm3_name", "number": "number", "sample": "number",
+}
+
+
+@dataclass(frozen=True)
+class LeadSelection:
+    """The lead days a model reads (min..max), and its strict rain horizon:
+    with rain_day_max the files must hold days 1..rain_day_max (exactly, or
+    at least under the truncate policy)."""
+
+    min_day: int | None = None
+    max_day: int | None = None
+    rain_day_max: int | None = None
+    rain_horizon_policy: str | None = None
+
+    @classmethod
+    def of(cls, model) -> LeadSelection:
+        horizon = model.rain_horizon
+        return cls(
+            min_day=model.lead_days.min,
+            max_day=model.lead_days.max,
+            rain_day_max=horizon.max_day,
+            rain_horizon_policy=horizon.resolved_policy if horizon.max_day is not None else None,
+        )
 
 _SPATIAL_DIMS = ("lat", "lon", "id")
 # Values per slab read at once (~64 MB as float32): a slab of whole storage
@@ -601,9 +635,9 @@ def _check_rain_horizon(day_values, rain_day_max: int, where: str, *, allow_extr
         raise ValueError(f"{where}: strict rainfall horizon requires {requirement}; " + "; ".join(problems))
 
 
-def _select_forecast_days(day_values, spec: dict, path) -> tuple[np.ndarray, list, list]:
+def _select_forecast_days(day_values, leads: LeadSelection, path) -> tuple[np.ndarray, list, list]:
     """(positions, labels, whole lead days) of the lead days the model reads
-    (options min_day..max_day), checking a strict rain horizon first."""
+    (min_day..max_day), checking a strict rain horizon first."""
     day_values = np.asarray(day_values).reshape(-1)
     day_numbers = []
     for value in day_values:
@@ -611,11 +645,9 @@ def _select_forecast_days(day_values, spec: dict, path) -> tuple[np.ndarray, lis
             day_numbers.append(int(value))
         except (TypeError, ValueError):
             day_numbers.append(None)
-    options = spec.get("options", {})
-    min_day, max_day = options.get("min_day"), options.get("max_day")
-    rain_day_max = options.get("rain_day_max")
+    min_day, max_day, rain_day_max = leads.min_day, leads.max_day, leads.rain_day_max
     if rain_day_max is not None:
-        policy = str(options.get("rain_horizon_policy") or "exact").strip().lower()
+        policy = str(leads.rain_horizon_policy or "exact").strip().lower()
         _check_rain_horizon(
             [value for value, day in zip(day_values, day_numbers)
              if day is not None and (min_day is None or day >= int(min_day))],

@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from . import _specs, domain, ids, io, parallel
+from . import domain, ids, io, parallel
 from ..config import BlendConfig, ForecastModel
 from .onset_rule import OnsetRule, find_onsets
 from .reference import OBSERVATIONS, Reference
@@ -24,10 +24,8 @@ _FORECAST_BYTES_PER_RUN_VALUE = 10
 _FORECAST_FIXED_BYTES = 512 * 2**20
 
 
-def _context(config: BlendConfig, spec: dict, reference: Reference, source: str,
-             area: domain.AreaFilter | None) -> dict:
+def _context(config: BlendConfig, reference: Reference, source: str, area: domain.AreaFilter | None) -> dict:
     return {
-        "spec": spec,
         "onset_rule": OnsetRule.of(config.onset.definition),
         "convention": domain.id_convention(config),
         "area": area if area is not None else domain.AreaFilter(config),
@@ -47,12 +45,8 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
     to its source series (a dropped source leaves its targets for that
     season, or the target itself when it has no other), as the legacy
     pipeline applied it on reading."""
-    spec = context["spec"]
-    policy = str(spec["options"]["missing_rain_policy"]).lower()
-    read = io.read_observations(
-        path, spec["input"]["value_col"], spec["dimensions"]["rename"],
-        shift_days=spec["options"].get("date_shift_days", 0),
-    )
+    policy = context["missing_rain"]
+    read = io.read_observations(path, context["variable"], context["rename"], shift_days=context["shift_days"])
     rain_by_point, points = read.rain, read.points
     years = np.unique(read.years)
     supported = None  # (unit, season) a cell transform's targets have sources for
@@ -97,7 +91,7 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
     if supported is not None:
         supported = supported[kept][order]
     thresholds = context["reference"].unit_thresholds(ids.astype(str), context["convention"])
-    cutoff_md = spec["options"]["cutoff_month_day"]
+    cutoff_md = context["season_start"]
     parts = []
     for y, year in enumerate(years):
         days = np.flatnonzero(read.years == year)
@@ -257,10 +251,23 @@ def observed(config: BlendConfig, *, reference: Reference | None = None, workers
              budget_bytes: int | None = None) -> ObservedOnsets:
     """Observed onsets for every observation file."""
     paths = io.list_files(config.observations.files, config, "observations")
-    reference = reference or Reference.resolve(config)
-    context = _context(config, _specs.observation_spec(config), reference, OBSERVATIONS, None)
+    context = observation_context(config, reference or Reference.resolve(config))
     parts = parallel.map_ordered(_observed_file, paths, context, workers)
     return ObservedOnsets.from_frames(parts, config.onset.season_start)
+
+
+def observation_context(config: BlendConfig, reference: Reference) -> dict:
+    """What reading an observation file and searching its onsets needs."""
+    obs = config.observations
+    return {
+        **_context(config, reference, OBSERVATIONS, None),
+        "variable": obs.variable,
+        "rename": {**io.OBSERVATION_DIMS, **obs.dims},
+        "missing_rain": str(obs.missing_rain).lower(),
+        # Observation dates moved onto the forecasts' end-of-window labels.
+        "shift_days": 1 if obs.date_marks == "start" else 0,
+        "season_start": config.onset.season_start,
+    }
 
 
 # Onset-search variants: the search starts at lead 1, the fixed cutoff date,
@@ -364,16 +371,14 @@ def _file_context(path: Path, context: dict) -> dict:
     """The context for one file, read in its own format: its dimension names
     and the scale that puts its rainfall in millimetres (see formats)."""
     fmt = io.of_file(path, context["variable"], context["dims"], context["fallback_unit_scale"])
-    dimensions = context["spec"]["dimensions"]
-    spec = {**context["spec"], "dimensions": {**dimensions, "rename": {**dimensions["rename"], **fmt.rename}}}
-    return {**context, "spec": spec, "unit_scale": fmt.scale}
+    return {**context, "rename": {**context["rename"], **fmt.rename}, "unit_scale": fmt.scale}
 
 
 def _forecast_file(path: Path, context: dict) -> tuple[xr.Dataset, bool]:
     """One forecast file's onset counts and rain summaries, a run of issues
     at a time."""
     context = _file_context(path, context)
-    points = io.forecast_points(path, context["variable"], context["spec"]["dimensions"]["rename"])
+    points = io.forecast_points(path, context["variable"], context["rename"])
     if points is None:
         raise ValueError(
             f"{path.name}: no {context['variable']!r} variable over issue time, lead day, optional member and "
@@ -388,9 +393,8 @@ def _forecast_file(path: Path, context: dict) -> tuple[xr.Dataset, bool]:
         source = domain.point_sources(points, transform)
         return _forecast_onto_units(path, transform, source, regridder.targets, context, scale_first=False)
     points, keep, in_area = _kept_mask(points, context, path)
-    spec = context["spec"]
     with io.ForecastFile(
-        path, context["variable"], spec["dimensions"]["rename"], spec, keep,
+        path, context["variable"], context["rename"], context["leads"], keep,
         spread_over=in_area, scale=context["unit_scale"],
     ) as forecast:
         selected = _selected_members(forecast.members, context, path)
@@ -426,9 +430,8 @@ def _forecast_onto_units(path: Path, transform, source: np.ndarray, targets, con
     keep = in_area & (units["id"].isin(context["keep_ids"]).to_numpy() if context["keep_ids"] is not None else True)
     kept_units = np.flatnonzero(keep)
     feeding = np.isin(source, domain.Regridder.sources_of(transform, kept_units))
-    spec = context["spec"]
     scale = context["unit_scale"]
-    with io.ForecastFile(path, context["variable"], spec["dimensions"]["rename"], spec, feeding,
+    with io.ForecastFile(path, context["variable"], context["rename"], context["leads"], feeding,
                          scale=scale if scale_first else 1.0) as forecast:
         selected = _selected_members(forecast.members, context, path)
         rows = source[feeding]
@@ -483,7 +486,7 @@ class _Summary:
         self.thresholds, self.ref = _unit_frame_values(context, ids, issues)
         issue_rows = np.repeat(issues, n_unit)
         fixed, from_ref = _start_days(
-            issue_rows, self.ref.reshape(-1), np.asarray(days), context["spec"]["options"]["fixed_cutoff_month_day"],
+            issue_rows, self.ref.reshape(-1), np.asarray(days), context["fixed_cutoff"],
         )
         self.fixed, self.from_ref = fixed.reshape(n_issue, n_unit), from_ref.reshape(n_issue, n_unit)
         self.counts = {v: np.zeros((n_issue, n_unit, n_day), dtype=np.uint8) for v in VARIANTS}
@@ -545,11 +548,31 @@ def _forecast_bytes(path: Path, context: dict) -> int:
         n_times = variable.shape[0]
     kept = 1.0
     if context["keep_ids"] is not None:
-        points = io.forecast_points(path, context["variable"], context["spec"]["dimensions"]["rename"])
+        points = io.forecast_points(path, context["variable"], context["rename"])
         if points is not None and len(points):
             kept = float(domain.with_ids(points, context["convention"])["id"].isin(context["keep_ids"]).mean())
     run_values = values * kept * min(1.0, run / max(n_times, 1))
     return int(run_values * _FORECAST_BYTES_PER_RUN_VALUE) + _FORECAST_FIXED_BYTES
+
+
+def forecast_context(config: BlendConfig, model: ForecastModel, reference: Reference, *,
+                     area: domain.AreaFilter | None = None, keep_ids: frozenset[str] | None = None,
+                     member_ids: list[int] | None = None) -> dict:
+    """What reading a model's forecast files and searching their onsets needs."""
+    return {
+        **_context(config, reference, model.name, area),
+        "variable": model.variable,
+        "rename": {**io.FORECAST_DIMS, **model.dims},
+        # Each file's own dimension names and units decide how it is read;
+        # these apply where a file does not say (see _file_context).
+        "dims": dict(model.dims),
+        "fallback_unit_scale": float(model.unit_scale),
+        "leads": io.LeadSelection.of(model),
+        "fixed_cutoff": config.onset.fixed_cutoff,
+        "keep_ids": keep_ids,
+        "max_member": model.max_member,
+        "member_ids": None if member_ids is None else [int(m) for m in member_ids],
+    }
 
 
 def forecast(
@@ -571,18 +594,8 @@ def forecast(
     member_ids limits the members read (a forecast reads the trained ones).
     """
     paths = io.list_files(model.files, config, f"model {model.name}")
-    spec = _specs.forecast_spec(config, model)
-    context = {
-        **_context(config, spec, reference or Reference.resolve(config), model.name, area),
-        "variable": model.variable,
-        # Each file's own dimension names and units decide how it is read;
-        # these apply where a file does not say (see _file_context).
-        "dims": dict(model.dims),
-        "fallback_unit_scale": float(model.unit_scale),
-        "keep_ids": keep_ids,
-        "max_member": model.max_member,
-        "member_ids": None if member_ids is None else [int(m) for m in member_ids],
-    }
+    context = forecast_context(config, model, reference or Reference.resolve(config), area=area,
+                               keep_ids=keep_ids, member_ids=member_ids)
     count = parallel.workers_within([_forecast_bytes(p, context) for p in paths], workers, budget_bytes)
     results = parallel.map_ordered(_forecast_file, paths, context, count)
     units = [tuple(data["unit"].values) for data, _ in results]

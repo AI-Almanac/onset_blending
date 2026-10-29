@@ -21,8 +21,8 @@ def test_grids_and_days_are_the_legacy_readers():
 
     days = np.arange(0, 47)
     for options in ({"min_day": 1, "max_day": 45}, {"min_day": 1, "rain_day_max": 46, "rain_horizon_policy": "truncate"}):
-        spec = {"options": options}
-        for a, b in zip(io._select_forecast_days(days, spec, "f.nc"), nc_utils._select_forecast_days(days, spec, "f.nc")):
+        new = io._select_forecast_days(days, io.LeadSelection(**options), "f.nc")
+        for a, b in zip(new, nc_utils._select_forecast_days(days, {"options": options}, "f.nc")):
             np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
     with pytest.raises(ValueError, match="strict rainfall horizon"):
-        io._select_forecast_days(days, {"options": {"min_day": 1, "rain_day_max": 40}}, "f.nc")
+        io._select_forecast_days(days, io.LeadSelection(min_day=1, rain_day_max=40), "f.nc")
