@@ -244,11 +244,9 @@ def observed(config: BlendConfig, *, reference: Reference | None = None, workers
     return ObservedOnsets.from_frames(parts, config.onset.season_start)
 
 
-# Onset-search variants: the search start (lead 1, the fixed cutoff date, the
-# reference onset) and the legacy column each probability series fills.
+# Onset-search variants: the search starts at lead 1, the fixed cutoff date,
+# or the reference onset.
 VARIANTS = ("base", "fixed_cutoff", "ref")
-_LEGACY_PREFIX = {"base": "predicted_prob", "fixed_cutoff": "predicted_prob_fixed_cutoff",
-                  "ref": "predicted_prob_ref"}
 
 
 @dataclass
@@ -258,11 +256,10 @@ class ForecastOnsets:
     - count_<variant>: members whose onset falls on each lead day (uint8);
     - members: members per issue;
     - rain_mean: the members' mean rainfall;
-    - onset_threshold (unit);
-    - for the day-level table only: rain_sd, raining (members with more than
-      1 mm, uint8) and ref_onset_date (issue, unit).
+    - onset_threshold (unit).
 
-    Probabilities and fractions are counts over members, computed on demand.
+    Probabilities are counts over members, computed on demand; has_spread
+    says whether any unit's members differ.
     """
 
     model: str
@@ -278,48 +275,9 @@ class ForecastOnsets:
         """The share of members with an onset on each lead day."""
         return self.data[f"count_{variant}"] / self.data["members"].astype(float)
 
-    def frac_raining(self) -> xr.DataArray:
-        return self.data["raining"] / self.data["members"].astype(float)
-
     def release(self) -> None:
         """Drop the arrays, keeping the summary."""
         self.data = None
-
-    def legacy_parts(self) -> list[pd.DataFrame]:
-        """The per-season tables the legacy pipeline produced, one per year."""
-        return [_legacy_part(self, year) for year in self.years]
-
-
-def _legacy_part(onsets: ForecastOnsets, year: int) -> pd.DataFrame:
-    data = onsets.data.isel(issue=np.flatnonzero(onsets.data["year"].values == year))
-    units = data["unit"].values.astype(str)
-    order = np.argsort(units, kind="stable")
-    issues = pd.DatetimeIndex(data["issue"].values)
-    n_issue, n_unit = len(issues), len(units)
-    unit_rows = np.repeat(order, n_issue)
-    issue_rows = np.tile(np.arange(n_issue), n_unit)
-    days = data["day"].values
-    columns = {
-        "id": pd.Series(units[unit_rows], dtype=str),
-        "time": pd.Series(issues.date[issue_rows], dtype=object),
-        "year": pd.Series(np.full(len(unit_rows), year, dtype=np.int64)),
-        "onset_thresh": pd.Series(data["onset_threshold"].values[unit_rows]),
-        "ref_onset_date": pd.Series(_as_dates(data["ref_onset_date"].values[issue_rows, unit_rows]), dtype=object),
-    }
-    values = {
-        "forecast_rain": data["rain_mean"].values,
-        "forecast_rain_sd": data["rain_sd"].values if "rain_sd" in data else None,
-        "frac_raining": (data["raining"] / data["members"].astype(float)).values,
-        **{_LEGACY_PREFIX[v]: (data[f"count_{v}"] / data["members"].astype(float)).values for v in VARIANTS},
-    }
-    frames = [pd.DataFrame(columns)]
-    for prefix, array in values.items():
-        if array is None:
-            array = np.full((n_issue, n_unit, len(days)), np.nan)
-        frames.append(pd.DataFrame(
-            array[issue_rows, unit_rows], columns=[f"{prefix}_day_{d}" for d in days], copy=False
-        ))
-    return pd.concat(frames, axis=1)
 
 
 def _as_dates(values: np.ndarray) -> np.ndarray:
@@ -497,7 +455,7 @@ class _Summary:
         self.fixed, self.from_ref = fixed.reshape(n_issue, n_unit), from_ref.reshape(n_issue, n_unit)
         self.counts = {v: np.zeros((n_issue, n_unit, n_day), dtype=np.uint8) for v in VARIANTS}
         self.members = np.zeros(n_issue, dtype=np.uint8)
-        self.rain_mean = self.rain_sd = self.raining = None
+        self.rain_mean = None
 
     def add(self, start: int, stop: int, rain: np.ndarray) -> None:
         params = self.context["onset_params"]
@@ -522,18 +480,6 @@ class _Summary:
             self.rain_mean = np.empty((len(self.issues), n_unit, n_day), dtype=rain.dtype)
         # One member is its own mean, with no spread.
         self.rain_mean[start:stop] = rain[:, 0] if n_member == 1 else member_mean(rain)
-        if self.context["daily"]:
-            if self.raining is None:
-                self.raining = np.zeros((len(self.issues), n_unit, n_day), dtype=np.uint8)
-                self.rain_sd = np.full((len(self.issues), n_unit, n_day), np.nan, dtype=rain.dtype)
-            self.raining[start:stop] = (rain > 1).sum(axis=1)
-            if n_member > 1:
-                # pandas' grouped std (its compiled kernel, in member order).
-                rows = rain.reshape(n_run * n_member * n_unit, n_day)
-                groups = (np.repeat(np.arange(n_run), n_member * n_unit) * n_unit
-                          + np.tile(np.arange(n_unit), n_run * n_member))
-                std = pd.DataFrame(rows, copy=False).groupby(groups, sort=True).std()
-                self.rain_sd[start:stop] = std.to_numpy().reshape(n_run, n_unit, n_day)
 
     def dataset(self) -> xr.Dataset:
         variables = {
@@ -543,11 +489,6 @@ class _Summary:
             "year": (("issue",), pd.DatetimeIndex(self.issues).year.to_numpy(dtype=np.int64)),
             **{f"count_{v}": (("issue", "unit", "day"), self.counts[v]) for v in VARIANTS},
         }
-        if self.context["daily"]:
-            # What only the day-level table reports.
-            variables["rain_sd"] = (("issue", "unit", "day"), self.rain_sd)
-            variables["raining"] = (("issue", "unit", "day"), self.raining)
-            variables["ref_onset_date"] = (("issue", "unit"), self.ref)
         return xr.Dataset(
             variables, coords={"issue": self.issues, "unit": self.ids.astype(object), "day": np.asarray(self.days)}
         )
@@ -629,7 +570,6 @@ def forecast(
     model: ForecastModel,
     *,
     keep_ids: frozenset[str] | None = None,
-    daily: bool = False,
     reference: Reference | None = None,
     area: domain.AreaFilter | None = None,
     member_ids: list[int] | None = None,
@@ -639,9 +579,7 @@ def forecast(
     """A model's forecast onsets for every one of its files.
 
     keep_ids, when given, limits the units to those (the blendable units
-    under the inner join); the results for them are unchanged. daily also
-    keeps what only the day-level table reports: the members' rain spread,
-    the raining fraction and the reference onset dates. reference and area
+    under the inner join); the results for them are unchanged. reference and area
     default to the config's (a forecast passes the trained blend's);
     member_ids limits the members read (a forecast reads the trained ones).
     """
@@ -655,7 +593,6 @@ def forecast(
         "dims": dict(model.dims),
         "fallback_unit_scale": float(model.unit_scale),
         "keep_ids": keep_ids,
-        "daily": daily,
         "max_member": model.max_member,
         "member_ids": None if member_ids is None else [int(m) for m in member_ids],
     }

@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("train", help="train and evaluate a blend from a config")
     run.add_argument("config")
     run.add_argument("-o", "--output", required=True, help="new directory for the results")
-    run.add_argument("--intermediate", action="append", choices=["observed", "combined", "weekly"],
+    run.add_argument("--intermediate", action="append", choices=["observed", "weekly"],
                      help="also save this stage's table (repeatable)")
     run.add_argument("--workers", type=int)
     run.set_defaults(handler=_train)

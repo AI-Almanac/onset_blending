@@ -158,21 +158,11 @@ def forecast_spec(config: BlendConfig, model: ForecastModel) -> dict:
 
 
 def used_variants(config: BlendConfig) -> list[str]:
-    """The forecast probability variants anything downstream reads, besides the
-    base series the connect stage always bins."""
-    variants = {
-        scoring.variant or _cutoff_variant(config) for scoring in config.forecast_evaluations()
-    }
-    variants |= {source.cal_variant for source in config.evaluation.mme.sources if source.source == "forecast"}
-    texts = [f.text for f in config.evaluation.formulas.values() if f.enabled]
-    for variant, suffix in (("fixed_cutoff", "_fixed_cutoff_"), ("ref_onset", "_ref_")):
-        if any(f"_p_onset{suffix}" in text for text in texts):
-            variants.add(variant)
-    return [v for v in ("fixed_cutoff", "ref_onset") if v in variants]
+    return cfg.probability_variants(config)
 
 
 def _cutoff_variant(config: BlendConfig) -> str:
-    return {"fixed_cutoff": "fixed_cutoff", "ref_onset": "ref_onset"}.get(config.evaluation.cutoff_mode, "base")
+    return cfg.cutoff_variant(config)
 
 
 def connect_spec(config: BlendConfig) -> dict:

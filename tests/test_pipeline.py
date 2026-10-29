@@ -279,17 +279,6 @@ def test_stage_tables_are_kept_only_when_asked(region):
     assert kept.climatology.data is not None
 
 
-def test_the_day_level_table_is_built_on_request(region):
-    _, config, result = region
-    from onset_blending.training import prepare
-
-    assert result.inputs.combined is None
-    with_daily = prepare(config, resources=Resources(workers=1, budget_bytes=None), daily=True)
-    combined = with_daily.combined
-    assert len(combined) == len(with_daily.weekly)
-    assert {"clim_p_onset_day_1", "ens_p_onset_day_41plus", "ens_rain_sd_day_1", "true_onset_date"} <= set(combined)
-
-
 def test_a_training_run_saves_netcdf_and_csv_artifacts(region, tmp_path):
     _, _, result = region
     out = result.save(tmp_path / "trained")

@@ -25,15 +25,16 @@ read only in the storage chunks that hold a kept point.
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from .._legacy import nc_utils
 from ..config import BlendConfig, FileSet
 
 # ---------------------------------------------------------------------------
@@ -205,13 +206,13 @@ class ForecastFile:
         ds = self._ds
         if variable not in ds.variables:
             raise ValueError(f"{self.path}: no {variable!r} variable")
-        layout = nc_utils._forecast_layout(ds, variable, rename, "day")
+        layout = _forecast_layout(ds, variable, rename, "day")
         if layout is None:
             raise ValueError(f"{self.path}: a layout the point reader does not support")
         self._v = v = ds.variables[variable]
         dim_names, dim_vals = layout["dim_names"], layout["dim_vals"]
         day_idx, other_idx, n_leading = layout["day_idx"], layout["other_idx"], layout["n_leading"]
-        positions, _, day_numbers = nc_utils._select_forecast_days(dim_vals[dim_names[day_idx]], spec, self.path)
+        positions, _, day_numbers = _select_forecast_days(dim_vals[dim_names[day_idx]], spec, self.path)
         self._day_positions, self.days = lead_days_in_order(positions, day_numbers, self.path)
         spatial = [dim_names[i] for i in other_idx[n_leading:]]
         shape = [len(dim_vals[d]) for d in spatial]
@@ -222,8 +223,8 @@ class ForecastFile:
         self._kept = kept = np.flatnonzero(keep)
         self._position = np.full(n_points, -1, dtype=np.int64)
         self._position[kept] = np.arange(len(kept))
-        self.points = nc_utils._named_grid(
-            nc_utils._product_frame(spatial, [dim_vals[d] for d in spatial]), rename, layout["adm3_dim_name"]
+        self.points = _named_grid(
+            _product_frame(spatial, [dim_vals[d] for d in spatial]), rename, layout["adm3_dim_name"]
         ).take(kept).reset_index(drop=True)
 
         self._n_times = len(dim_vals[dim_names[0]])
@@ -251,8 +252,8 @@ class ForecastFile:
         # The issue dimension's own units, whatever it is called.
         time_dim = dim_names[0]
         units = getattr(ds.variables[time_dim], "units", None) if time_dim in ds.variables else None
-        units = units or nc_utils.get_nc_time(ds)["units"]
-        stamps = pd.DatetimeIndex(nc_utils.nc_time_to_dates(dim_vals[time_dim], units))
+        units = units or nc_time(ds)["units"]
+        stamps = pd.DatetimeIndex(time_to_dates(dim_vals[time_dim], units))
         self.issues = stamps.normalize().to_numpy()
 
     def __enter__(self):
@@ -265,7 +266,7 @@ class ForecastFile:
         """(start, stop, rain) for consecutive runs of issues; rain holds every
         member: (issue, member, point, day), one member when deterministic."""
         runs = {}
-        for t0, t1, m0, m1 in nc_utils._leading_tiles(self._v, self._n_times, self._n_members, self._member_dim):
+        for t0, t1, m0, m1 in _leading_tiles(self._v, self._n_times, self._n_members, self._member_dim):
             runs.setdefault((t0, t1), []).append((m0, m1))
         for (t0, t1), member_ranges in runs.items():
             rain = None
@@ -287,7 +288,7 @@ class ForecastFile:
                 index[self._member_dim] = slice(m0, m1)
             for axis, (a, b) in zip(self._spatial_axes, bounds):
                 index[axis] = slice(a, b)
-            block = nc_utils._filled_with_nan(self._v[tuple(index)])
+            block = _filled_with_nan(self._v[tuple(index)])
             block = np.transpose(block, self._perm)[..., self._day_positions]
             block = block.reshape(t1 - t0, m1 - m0, len(cells), len(self.days))
             if area_here.any():
@@ -339,9 +340,9 @@ def read_observations(path, variable: str, rename: dict, *, shift_days: int = 0)
         for d in dim_names:
             if d.lower() in ("adm3_name", "adm3"):
                 adm3_dim = d
-                dim_vals[d] = nc_utils.get_nc_adm3_names(ds)
+                dim_vals[d] = adm3_names(ds)
             elif d.lower() == "time":
-                dim_vals[d] = nc_utils.get_nc_time(ds)["values"]
+                dim_vals[d] = nc_time(ds)["values"]
             elif d in ds.variables:
                 dim_vals[d] = np.array(ds[d][:]).flatten()
             else:
@@ -351,10 +352,10 @@ def read_observations(path, variable: str, rename: dict, *, shift_days: int = 0)
             raise ValueError(f"{os.path.basename(path)}: expected one time dimension in {dim_names}")
         time_dim = time_dims[0]
         others = [d for d in dim_names if d != time_dim]
-        rain = nc_utils._filled_with_nan(v[:])
+        rain = _filled_with_nan(v[:])
         rain = np.moveaxis(rain, dim_names.index(time_dim), 0).reshape(len(dim_vals[time_dim]), -1)
-        units = nc_utils.get_nc_time(ds)["units"]
-    stamps = pd.DatetimeIndex(nc_utils.nc_time_to_dates(dim_vals[time_dim], units))
+        units = nc_time(ds)["units"]
+    stamps = pd.DatetimeIndex(time_to_dates(dim_vals[time_dim], units))
     calendar = pd.Series(stamps).sort_values().reset_index(drop=True)
     name = os.path.basename(path)
     if calendar.isna().any() or calendar.duplicated().any():
@@ -367,8 +368,272 @@ def read_observations(path, variable: str, rename: dict, *, shift_days: int = 0)
             f"{name}: ground-truth time coordinate is not daily-contiguous; first gap is "
             f"{calendar.iloc[at - 1].date()} to {calendar.iloc[at].date()}."
         )
-    points = nc_utils._named_grid(
-        nc_utils._product_frame(others, [dim_vals[d] for d in others]), rename, adm3_dim
+    points = _named_grid(
+        _product_frame(others, [dim_vals[d] for d in others]), rename, adm3_dim
     )
     dates = (stamps.normalize() + pd.Timedelta(days=int(shift_days))).to_numpy()
     return ObservationArray(points=points, dates=dates, years=stamps.year.to_numpy(), rain=rain)
+
+
+# ---------------------------------------------------------------------------
+# NetCDF primitives: coordinates, times, layouts, reading in storage chunks
+# ---------------------------------------------------------------------------
+
+_SPATIAL_DIMS = ("lat", "lon", "id")
+# Values per slab read at once (~64 MB as float32): a slab of whole storage
+# chunks along the leading dimension, so each chunk is decompressed once.
+_READ_SLAB_VALUES = 1 << 24
+
+
+def adm3_names(ds) -> list[str]:
+    """The adm3_name string coordinate of a netCDF4 Dataset (any common spelling)."""
+    import netCDF4
+
+    for name in ("adm3_name", "ADM3_NAME", "Adm3_Name", "adm3"):
+        if name in ds.variables:
+            var = ds.variables[name]
+            try:
+                items = var[:].tolist()
+            except (NotImplementedError, TypeError):
+                items = netCDF4.chartostring(var[:]).tolist()  # a fixed-length char dimension
+            return [item.decode("utf-8").strip() if isinstance(item, (bytes, bytearray)) else str(item).strip()
+                    for item in items]
+    raise ValueError(
+        "Could not find adm3_name variable/dimension in NetCDF file. "
+        f"Available variables: {list(ds.variables.keys())}"
+    )
+
+
+def nc_time(ds) -> dict:
+    """The time coordinate of a netCDF4 Dataset: values, units, name, source."""
+    names = ["TIME", "time", "Time", "t", "T"]
+    for name in names:
+        if name in ds.variables:
+            return {"values": np.array(ds[name][:]).flatten(), "units": getattr(ds[name], "units", None),
+                    "name": name, "source": "var"}
+    for name in names:
+        for variable in ds.variables:
+            if variable.lower() == name.lower():
+                return {"values": np.array(ds[variable][:]).flatten(), "units": getattr(ds[variable], "units", None),
+                        "name": variable, "source": "var_ci"}
+    for name in names:
+        if name in ds.dimensions:
+            return {"values": np.arange(ds.dimensions[name].size, dtype=float), "units": None, "name": name,
+                    "source": "dim"}
+    raise ValueError("Could not find time variable/dimension in NetCDF file")
+
+
+def time_to_dates(values, units) -> pd.DatetimeIndex:
+    """Numeric NetCDF times as timestamps, from CF units ("<unit>s since <origin>")."""
+    match = re.match(r"^\s*(seconds?|minutes?|hours?|days?)\s+since\s+(.+)\s*$", str(units), re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Unrecognized NetCDF time units: {units}")
+    unit = match.group(1).lower().rstrip("s")
+    origin_text = match.group(2).strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            origin = datetime.strptime(origin_text, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        raise ValueError(f"Could not parse NetCDF time origin: {origin_text}")
+    seconds = {"second": 1, "minute": 60, "hour": 3600, "day": 86400}[unit]
+    return pd.DatetimeIndex([origin + timedelta(seconds=float(t) * seconds) for t in values])
+
+
+def _filled_with_nan(raw) -> np.ndarray:
+    """np.ma.filled(raw, NaN) for an array just read from a file, filled in
+    place rather than copied when the array is a float buffer it owns."""
+    if not np.ma.isMaskedArray(raw):
+        return np.asarray(raw)
+    data = raw.data
+    if not np.issubdtype(data.dtype, np.floating) or not data.flags.writeable or not data.flags.owndata:
+        return np.ma.filled(raw, np.nan)
+    if raw.mask is not np.ma.nomask:
+        data[np.ma.getmaskarray(raw)] = np.nan
+    return data
+
+
+def _product_frame(names, values) -> pd.DataFrame:
+    """The table of every combination of the dimensions' values (the first
+    varying slowest), each column with the dtype pandas infers for it."""
+    sizes = [len(v) for v in values]
+    if not sizes or 0 in sizes:
+        from itertools import product
+
+        return pd.DataFrame(list(product(*values)), columns=names)
+    n_rows = int(np.prod(sizes))
+    columns = {}
+    for i, (name, vals) in enumerate(zip(names, values)):
+        inner = int(np.prod(sizes[i + 1:]))
+        outer = n_rows // (sizes[i] * inner)
+        column = pd.DataFrame([(v,) for v in vals]).iloc[:, 0]
+        columns[name] = column.take(np.tile(np.repeat(np.arange(sizes[i]), inner), outer)).reset_index(drop=True)
+    return pd.DataFrame(columns)
+
+
+def _renamed(frame: pd.DataFrame, rename: Mapping[str, str] | None) -> pd.DataFrame:
+    """Columns renamed old -> new, matching old names case-insensitively."""
+    if not rename:
+        return frame
+    mapping = {}
+    for old, new in rename.items():
+        for column in frame.columns:
+            if column.lower() == old.lower():
+                mapping[column] = new
+                break
+    return frame.rename(columns=mapping)
+
+
+def _named_grid(frame: pd.DataFrame, rename, adm3_dim_name) -> pd.DataFrame:
+    """A grid table of raw dimension columns, renamed: lower case, and the
+    administrative units as `id`."""
+    frame = _renamed(frame, rename or {})
+    frame.columns = frame.columns.str.lower()
+    adm3 = adm3_dim_name.lower() if adm3_dim_name else None
+    if adm3 and adm3 in frame.columns:
+        frame = frame.rename(columns={adm3: "id"})
+    if "adm3_name" in frame.columns:
+        frame = frame.rename(columns={"adm3_name": "id"})
+    return frame
+
+
+def _forecast_layout(ds, variable: str, rename, day_dim: str) -> dict | None:
+    """The forecast variable's layout for point-wise reading, or None: leading
+    (time[, number]) dimensions, the lead day, and trailing spatial
+    dimensions (lat/lon, or adm3_name read as `id`), time first."""
+    v = ds.variables[variable]
+    dim_names = list(v.dimensions)
+    dim_vals = {}
+    adm3_dim_name = None
+    for d in dim_names:
+        lower = d.lower()
+        if lower in ("adm3_name", "adm3"):
+            adm3_dim_name = d
+            dim_vals[d] = adm3_names(ds)
+        elif lower == "time":
+            dim_vals[d] = nc_time(ds)["values"]
+        elif d in ds.variables:
+            dim_vals[d] = np.array(ds[d][:]).flatten()
+        elif d in ds.dimensions:
+            dim_vals[d] = np.arange(ds.dimensions[d].size)
+        else:
+            dim_vals[d] = np.arange(len(v))
+    renamed = list(_renamed(pd.DataFrame({d: [dim_vals[d][0]] for d in dim_names}), rename or {}).columns)
+    renamed = [c.lower() for c in renamed]
+    adm3 = adm3_dim_name.lower() if adm3_dim_name else None
+    renamed = ["id" if name in ("adm3_name", adm3) else name for name in renamed]
+    if day_dim.lower() not in renamed:
+        return None
+    day_idx = renamed.index(day_dim.lower())
+    other_idx = [i for i in range(len(dim_names)) if i != day_idx]
+    names = [renamed[i] for i in other_idx]
+    n_spatial = 0
+    for name in reversed(names):
+        if name not in _SPATIAL_DIMS:
+            break
+        n_spatial += 1
+    leading = names[: len(names) - n_spatial]
+    if not n_spatial or leading not in (["time"], ["time", "number"]) or other_idx[0] != 0:
+        return None
+    return {
+        "dim_names": dim_names,
+        "dim_vals": dim_vals,
+        "adm3_dim_name": adm3_dim_name,
+        "day_idx": day_idx,
+        "other_idx": other_idx,
+        "n_leading": len(leading),
+        "has_members": "number" in leading,
+    }
+
+
+def _whole_day(value) -> int | None:
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric) or not numeric.is_integer():
+        return None
+    return int(numeric)
+
+
+def _check_rain_horizon(day_values, rain_day_max: int, where: str, *, allow_extra: bool) -> None:
+    """A strict rain horizon needs the lead days 1..rain_day_max exactly (later
+    days too, with allow_extra)."""
+    parsed = [_whole_day(value) for value in day_values]
+    invalid = [repr(value) for value, day in zip(day_values, parsed) if day is None]
+    valid = [day for day in parsed if day is not None]
+    duplicates = sorted({day for day in valid if valid.count(day) > 1})
+    actual, required = set(valid), set(range(1, rain_day_max + 1))
+    missing = sorted(required - actual)
+    extra = sorted(actual - required)
+    problems = []
+    if invalid:
+        problems.append(f"non-integer day values={invalid[:10]}")
+    if duplicates:
+        problems.append(f"duplicate days={duplicates[:10]}")
+    if missing:
+        problems.append(f"missing days={missing[:10]}")
+    if [day for day in extra if day < 1]:
+        problems.append(f"nonpositive days={[day for day in extra if day < 1][:10]}")
+    if [day for day in extra if day > rain_day_max] and not allow_extra:
+        problems.append(f"extra days={[day for day in extra if day > rain_day_max][:10]}")
+    if problems:
+        requirement = (f"days 1..{rain_day_max}, with later days permitted" if allow_extra
+                       else f"exactly days 1..{rain_day_max}")
+        raise ValueError(f"{where}: strict rainfall horizon requires {requirement}; " + "; ".join(problems))
+
+
+def _select_forecast_days(day_values, spec: dict, path) -> tuple[np.ndarray, list, list]:
+    """(positions, labels, whole lead days) of the lead days the model reads
+    (options min_day..max_day), checking a strict rain horizon first."""
+    day_values = np.asarray(day_values).reshape(-1)
+    day_numbers = []
+    for value in day_values:
+        try:
+            day_numbers.append(int(value))
+        except (TypeError, ValueError):
+            day_numbers.append(None)
+    options = spec.get("options", {})
+    min_day, max_day = options.get("min_day"), options.get("max_day")
+    rain_day_max = options.get("rain_day_max")
+    if rain_day_max is not None:
+        policy = str(options.get("rain_horizon_policy") or "exact").strip().lower()
+        _check_rain_horizon(
+            [value for value, day in zip(day_values, day_numbers)
+             if day is not None and (min_day is None or day >= int(min_day))],
+            int(rain_day_max), f"NetCDF file {os.path.basename(path)}", allow_extra=policy == "truncate",
+        )
+    keep = np.ones(len(day_values), dtype=bool)
+    if min_day is not None:
+        keep &= np.array([day is not None and day >= int(min_day) for day in day_numbers])
+    if max_day is not None:
+        keep &= np.array([day is not None and day <= int(max_day) for day in day_numbers])
+    if not np.any(keep):
+        raise ValueError(f"Day filtering removed all columns for: {os.path.basename(path)}")
+    positions = np.flatnonzero(keep)
+    return positions, day_values[positions].tolist(), [day_numbers[position] for position in positions]
+
+
+def _leading_tiles(v, n_times: int, n_members: int, member_dim):
+    """(t0, t1, m0, m1) tiles over the leading time (and member) dimensions:
+    whole storage chunks, grown along time to about _READ_SLAB_VALUES values,
+    so each chunk is decompressed exactly once. member_dim is the member
+    dimension's position in the variable, or None."""
+    chunks = v.chunking()
+    if isinstance(chunks, list):
+        time_chunk = int(chunks[0])
+        member_step = int(chunks[member_dim]) if member_dim is not None else n_members
+    else:  # contiguous storage: any slab reads only its own bytes
+        time_chunk, member_step = 1, n_members
+    member_step = max(1, min(n_members, member_step))
+    per_time = int(np.prod(v.shape[1:])) * member_step // max(1, n_members)
+    rows = max(1, _READ_SLAB_VALUES // max(1, per_time))
+    time_step = max(1, min(n_times, max(time_chunk, -(-rows // time_chunk) * time_chunk)))
+    for t0 in range(0, n_times, time_step):
+        for m0 in range(0, n_members, member_step):
+            yield t0, min(n_times, t0 + time_step), m0, min(n_members, m0 + member_step)
+

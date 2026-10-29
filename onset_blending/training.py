@@ -43,7 +43,6 @@ class Inputs:
     forecasts: dict[str, ForecastOnsets]
     climatology: Climatology
     weekly: Weekly
-    combined: pd.DataFrame | None = None   # the day-level table, only when asked for
     timings: dict[str, float] = field(default_factory=dict)
     forest_inputs: DailyInputs | None = None   # the random forest blend's, when it is configured
 
@@ -57,10 +56,9 @@ def prepare(
     resources: Resources | None = None,
     test_years: tuple[int, int] | None = None,
     keep: tuple[str, ...] = STAGE_TABLES,
-    daily: bool = False,
 ) -> Inputs:
     """Observed and forecast onsets, the climatology and the weekly
-    features for a config; with daily, also the day-level table.
+    features for a config (and the random forest's inputs when it has one).
 
     Forecast and climatology arrays not in `keep` are released once the
     features are built; the observed onsets and weekly features are always
@@ -78,14 +76,14 @@ def prepare(
     observed = onsets.observed(config, reference=reference, workers=workers, budget_bytes=budget)
     lap("observed onsets", started)
 
-    # Under the inner join only units the climatology keeps survive, so the
-    # forecasts are read for those alone.
-    blendable = observed.blendable(config.climatology.min_onset_years) if config.features.join == "inner" else None
+    # Only units the climatology keeps make samples, so the forecasts are
+    # read for those alone.
+    blendable = observed.blendable(config.climatology.min_onset_years)
     forecasts = {}
     for model in config.models:
         started = time.perf_counter()
         forecasts[model.name] = onsets.forecast(
-            config, model, keep_ids=blendable, daily=daily, reference=reference,
+            config, model, keep_ids=blendable, reference=reference,
             workers=workers, budget_bytes=budget,
         )
         lap(f"{model.name} forecast onsets", started)
@@ -107,11 +105,6 @@ def prepare(
             config, climatology, observed, forecasts, max_day=config.evaluation.random_forest.max_day
         )
         lap("random forest inputs", started)
-    combined = None
-    if daily:
-        started = time.perf_counter()
-        combined = features.daily(config, climatology, observed, forecasts)
-        lap("day-level table", started)
     if "forecasts" not in keep:
         for model_onsets in forecasts.values():
             model_onsets.release()
@@ -123,7 +116,6 @@ def prepare(
         forecasts=forecasts,
         climatology=climatology,
         weekly=weekly,
-        combined=combined,
         timings=timings,
         forest_inputs=forest_inputs,
     )
@@ -140,7 +132,7 @@ class TrainingResult:
         """Write the evaluation, the trained blend (trained.blend) and the chosen
         intermediates into a new directory, all or nothing: the weekly
         features (Weekly.open reads them) and the observed onsets as NetCDF,
-        the day-level table ("combined", when built) as a pickle."""
+        nothing else."""
         directory = Path(directory)
         if directory.exists() and any(directory.iterdir()):
             raise FileExistsError(f"{directory} exists and is not empty")
@@ -153,10 +145,6 @@ class TrainingResult:
             for name in intermediates:
                 if name == "observed":
                     self.inputs.observed.data.to_netcdf(staging / "observed_onsets.nc")
-                elif name == "combined":
-                    if self.inputs.combined is None:
-                        raise ValueError("the day-level table was not built (train(..., daily=True))")
-                    self.inputs.combined.to_pickle(staging / "combined_wide.pkl")
                 elif name == "weekly":
                     self.inputs.weekly.to_netcdf(staging / "weekly_features.nc")
                 else:
@@ -173,15 +161,15 @@ class TrainingResult:
 TRAINED_BLEND_FILENAME = "trained.blend"
 
 
-def train(config: BlendConfig, *, resources: Resources | None = None, daily: bool = False) -> TrainingResult:
+def train(config: BlendConfig, *, resources: Resources | None = None) -> TrainingResult:
     """Every stage of a blend, in memory: inputs, cross-validated evaluation,
-    and the operational model fitted on every training year. daily also
-    builds the day-level table (for export or day-level models)."""
+    and the operational model (and the random forest, when configured)
+    fitted on every training year."""
     from .evaluation import evaluate
     from .trained import TrainedBlend
 
     resources = resources or Resources.default()
-    inputs = prepare(config, resources=resources, keep=("observed", "weekly"), daily=daily)
+    inputs = prepare(config, resources=resources, keep=("observed", "weekly"))
 
     # The final fit runs alongside the global CV folds, on their design matrix.
     started = time.perf_counter()

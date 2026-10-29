@@ -795,12 +795,16 @@ class _Converter:
         self.agree("the number of week bins", {"connect": int(n_bins), "cv_models": cv_bins})
         days = c.get("days_per_bin") if c.has("days_per_bin") else c.get("days_per_week", 7)
         join = self.combine.get("options.join", "inner")
-        if join not in ("inner", "full"):
+        if join == "full":
+            self.problems.append(
+                "combine: options.join 'full' (an outer join of the day-level table) has no counterpart: "
+                "the samples are the units and issue dates every source covers"
+            )
+        elif join != "inner":
             self.notes.append(f"combine: options.join {join!r} (the old combine read anything but 'full' as inner)")
         return {
             "bins": {"count": int(n_bins), "days": int(days)},
             "probability_days": int(c.get("day_max", 28)),
-            "join": "full" if join == "full" else "inner",
             "trim_after_true_onset": bool(self.combine.get("options.trim_forecasts_after_true_onset", False)),
             "rain_transform": _rain_transform(c.get("rain_transform", "identity")),
         }

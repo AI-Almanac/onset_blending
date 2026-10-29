@@ -438,8 +438,8 @@ class Bins:
 class Features:
     bins: Bins = _field(factory=Bins)
     probability_days: int = _field(28, doc="Lead days of onset probability summed into the bins.")
-    join: Literal["inner", "full"] = _field(
-        "inner", doc="inner: rows every source has; full: all rows."
+    join: Literal["inner"] = _field(
+        "inner", doc="Samples are the units and issue dates every source has (the legacy outer join is gone)."
     )
     trim_after_true_onset: bool = _field(True, doc="Drop issue dates after the observed onset.")
     rain_transform: str | float = _field("identity", doc="identity, sqrt, fourth_root, log1p, power:<p>.")
@@ -565,7 +565,7 @@ class Evaluation:
 class Outputs:
     dir: str | None = None
     intermediates: tuple[
-        Literal["observations", "forecasts", "climatology", "combined", "features"], ...
+        Literal["observations", "forecasts", "climatology", "features"], ...
     ] = _field(factory=tuple, doc="Stage results to save for debugging.")
     pickles: bool = _field(False, doc="Also write .pkl twins of the CSV tables.")
 
@@ -871,6 +871,23 @@ def rain_feature_base(model: str, predictor: RainPredictor, onset: OnsetDefiniti
 
 def probability_feature_base(model: str, variant: str) -> str:
     return f"{model}_p_onset{VARIANT_SUFFIX[variant]}"
+
+
+def cutoff_variant(config: BlendConfig) -> str:
+    """The forecast probability variant the cutoff mode scores by default."""
+    return {"fixed_cutoff": "fixed_cutoff", "ref_onset": "ref_onset"}.get(config.evaluation.cutoff_mode, "base")
+
+
+def probability_variants(config: BlendConfig) -> list[str]:
+    """The forecast probability variants anything reads (scoring, MME sources,
+    formulas), besides the base series the features always bin."""
+    variants = {scoring.variant or cutoff_variant(config) for scoring in config.forecast_evaluations()}
+    variants |= {source.cal_variant for source in config.evaluation.mme.sources if source.source == "forecast"}
+    texts = [f.text for f in config.evaluation.formulas.values() if f.enabled]
+    for variant, suffix in (("fixed_cutoff", "_fixed_cutoff_"), ("ref_onset", "_ref_")):
+        if any(f"_p_onset{suffix}" in text for text in texts):
+            variants.add(variant)
+    return [v for v in ("fixed_cutoff", "ref_onset") if v in variants]
 
 
 def feature_bases(config: BlendConfig) -> set[str]:
