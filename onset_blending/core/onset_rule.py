@@ -29,6 +29,7 @@ class OnsetRule:
     mode: str                   # consecutive_dry | window_sum
     min_dry_days: int
     dry_day_min_mm: float
+    dry_run_contained: bool     # the dry run wholly within the follow-up, not just starting in it
     sum_window: int
     sum_min_mm: float
 
@@ -46,6 +47,7 @@ class OnsetRule:
             mode=spell.mode,
             min_dry_days=int(spell.min_dry_days),
             dry_day_min_mm=float(spell.dry_day_min_mm if spell.dry_day_min_mm is not None else definition.wet_day_min_mm),
+            dry_run_contained=bool(spell.contained),
             sum_window=int(spell.sum_window),
             sum_min_mm=float(spell.sum_min_mm),
         )
@@ -132,10 +134,21 @@ def find_onsets(series: np.ndarray, thresholds: np.ndarray, start_days: np.ndarr
                 if all_dry.shape[1] > 1:
                     first_dry[:, 1:] &= ~dry[:, :all_dry.shape[1] - 1]
                 dry_starts[:, :all_dry.shape[1]] = first_dry
-            dry_prefix = _prefix_sums(dry_starts, dtype=np.int32)
             lower = candidate_days - 1 + follow_start_offset
-            upper = np.minimum(n_days, full_end)
-            has_dry_spell = (dry_prefix[:, upper] - dry_prefix[:, lower]) > 0
+            if rule.dry_run_contained:
+                # Any run of dry_days dry days inside the follow-up period: a
+                # run starting at (0-based) s covers days s+1..s+dry_days.
+                spans = np.zeros_like(dry, dtype=np.int8)
+                if n_days >= dry_days:
+                    spans[:, :all_dry.shape[1]] = all_dry
+                span_prefix = _prefix_sums(spans, dtype=np.int32)
+                upper = np.minimum(full_end_unclipped, n_days) - dry_days + 1
+                upper = np.maximum(upper, lower)
+                has_dry_spell = (span_prefix[:, upper] - span_prefix[:, lower]) > 0
+            else:
+                dry_prefix = _prefix_sums(dry_starts, dtype=np.int32)
+                upper = np.minimum(n_days, full_end)
+                has_dry_spell = (dry_prefix[:, upper] - dry_prefix[:, lower]) > 0
         elif rule.mode == "window_sum":
             sum_window = rule.sum_window
             if n_days >= sum_window:

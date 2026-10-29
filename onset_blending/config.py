@@ -317,6 +317,9 @@ class DrySpell:
     mode: Literal["consecutive_dry", "window_sum"] = "consecutive_dry"
     min_dry_days: int = _field(7, doc="consecutive_dry: dry days in a row that veto an onset.")
     dry_day_min_mm: float | None = _field(None, doc="Below this a day is dry; default wet_day_min_mm.")
+    contained: bool = _field(
+        False, doc="consecutive_dry: the dry run lies wholly within the follow-up period (else it need only start in it)."
+    )
     sum_window: int = _field(10, doc="window_sum: window length.")
     sum_min_mm: float = _field(5.0, doc="window_sum: a window below this vetoes an onset.")
 

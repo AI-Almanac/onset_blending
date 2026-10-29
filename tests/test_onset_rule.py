@@ -50,3 +50,39 @@ def test_a_total_that_reaches_the_threshold_triggers_only_with_gte():
 
     assert find_onsets(series, np.array([25.0]), starts, OnsetRule.of(reaches))[0, 0] == 3
     assert np.isnan(find_onsets(series, np.array([25.0]), starts, OnsetRule.of(exceeds))[0, 0])
+
+
+ICPAC_WITH_DRY_SPELL = cfg.OnsetDefinition(
+    window=3, trigger_rule="first_day_wet", follow_days=21, followup_anchor="onset_day",
+    dry_spell=cfg.DrySpell(min_dry_days=7, dry_day_min_mm=1.0, contained=True),
+)
+
+
+@pytest.mark.parametrize(("dry_from", "vetoed"), [(6, True), (15, True), (16, False)])
+def test_a_contained_dry_run_must_lie_within_the_days_after_the_onset(dry_from, vetoed):
+    # A 25 mm onset on the first day, then wet but for 7 dry days starting
+    # `dry_from` days after it: within the 21 days after the onset day only
+    # when they end by day 21 after it.
+    series = np.full((1, 60), 2.0)
+    series[0, :3] = [10.0, 10.0, 5.0]
+    series[0, dry_from:dry_from + 7] = 0.0
+    found = find_onsets(series, np.array([20.0]), np.ones(1), OnsetRule.of(ICPAC_WITH_DRY_SPELL))[0, 0]
+    assert bool(found != 1) is vetoed
+
+
+def test_a_contained_dry_run_matches_a_direct_check():
+    rng = np.random.default_rng(3)
+    series = np.where(rng.random((400, 70)) < 0.45, 0.0, rng.gamma(0.8, 8.0, size=(400, 70)))
+    found = find_onsets(series, np.full(400, 20.0), np.ones(400), OnsetRule.of(ICPAC_WITH_DRY_SPELL))[0]
+
+    for row, onset in zip(series, found):
+        expected = np.nan
+        for d in range(len(row) - 2):  # 0-based candidate
+            if row[d] < 1.0 or row[d:d + 3].sum() <= 20.0:
+                continue
+            after = row[d + 1:d + 22] < 1.0
+            runs = np.convolve(after, np.ones(7, dtype=int), "valid") == 7 if len(after) >= 7 else []
+            if not np.any(runs):
+                expected = d + 1
+                break
+        assert (np.isnan(onset) and np.isnan(expected)) or onset == expected
