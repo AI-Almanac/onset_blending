@@ -328,6 +328,9 @@ class DrySpell:
 class OnsetDefinition:
     window: int = _field(5, doc="Trigger window, days.")
     trigger_rule: Literal["all_days_wet", "first_day_wet"] = "all_days_wet"
+    min_wet_days: int | None = _field(
+        None, doc="first_day_wet: also at least this many wet days in the trigger window."
+    )
     wet_day_min_mm: float = 1.0
     wet_day_comparison: Literal["gte", "gt"] = "gte"
     threshold_comparison: Literal["gt", "gte"] = _field(
@@ -763,6 +766,15 @@ class BlendConfig:
                     problems.append(f"{where}.rain_predictors[{p_index}].window must be >= 1")
             if model.rain_transform is not None:
                 _check_rain_transform(model.rain_transform, f"{where}.rain_transform", problems)
+
+        definition = self.onset.definition
+        if definition.min_wet_days is not None:
+            if definition.trigger_rule != "first_day_wet":
+                problems.append("onset.definition.min_wet_days: needs trigger_rule first_day_wet")
+            elif not 1 <= definition.min_wet_days <= definition.window:
+                problems.append(
+                    f"onset.definition.min_wet_days must be between 1 and the window ({definition.window})"
+                )
 
         climatology = self.climatology
         if climatology.horizons and climatology.forecast_window is not None:

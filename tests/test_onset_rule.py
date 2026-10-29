@@ -86,3 +86,31 @@ def test_a_contained_dry_run_matches_a_direct_check():
                 expected = d + 1
                 break
         assert (np.isnan(onset) and np.isnan(expected)) or onset == expected
+
+
+ICPAC = cfg.OnsetDefinition(window=5, trigger_rule="first_day_wet", min_wet_days=3, threshold_comparison="gte",
+                            follow_days=0)
+
+
+@pytest.mark.parametrize(("series", "onset"), [
+    ([8, 0, 6, 0, 6, 0, 0], 1),        # 20 mm over 5 days, 3 rain days, from a rain day
+    ([8, 0, 6, 0, 5.9, 0, 0], np.nan),  # 19.9 mm
+    ([18, 0, 0, 0, 2, 0, 0], np.nan),   # 2 rain days
+    ([0, 8, 6, 6, 0, 0, 0], 2),        # not from the dry first day: from the next, a rain day
+])
+def test_icpac_needs_20_mm_over_5_days_with_3_rain_days_from_a_rain_day(series, onset):
+    found = find_onsets(np.array([series], dtype=float), np.array([20.0]), np.ones(1), OnsetRule.of(ICPAC))[0, 0]
+    assert (np.isnan(found) and np.isnan(onset)) or found == onset
+
+
+def test_min_wet_days_matches_a_direct_check():
+    rng = np.random.default_rng(4)
+    series = np.where(rng.random((500, 60)) < 0.5, 0.0, rng.gamma(0.7, 7.0, size=(500, 60)))
+    found = find_onsets(series, np.full(500, 20.0), np.ones(500), OnsetRule.of(ICPAC))[0]
+    for row, onset in zip(series, found):
+        expected = next(
+            (d + 1 for d in range(len(row) - 4)
+             if row[d] >= 1 and row[d:d + 5].sum() >= 20 and (row[d:d + 5] >= 1).sum() >= 3),
+            np.nan,
+        )
+        assert (np.isnan(onset) and np.isnan(expected)) or onset == expected

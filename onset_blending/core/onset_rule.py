@@ -22,6 +22,7 @@ class OnsetRule:
     window: int                 # trigger window, days
     wet_day_min_mm: float
     trigger_rule: str           # all_days_wet | first_day_wet
+    min_wet_days: int | None    # first_day_wet: also this many wet days in the window
     wet_day_comparison: str     # gte | gt
     threshold_comparison: str   # gt | gte: the window total against the threshold
     follow_days: int
@@ -40,6 +41,7 @@ class OnsetRule:
             window=int(definition.window),
             wet_day_min_mm=float(definition.wet_day_min_mm),
             trigger_rule=definition.trigger_rule,
+            min_wet_days=definition.min_wet_days,
             wet_day_comparison=definition.wet_day_comparison,
             threshold_comparison=definition.threshold_comparison,
             follow_days=int(definition.follow_days),
@@ -113,6 +115,9 @@ def find_onsets(series: np.ndarray, thresholds: np.ndarray, start_days: np.ndarr
 
         if rule.trigger_rule == "first_day_wet":
             wet_ok = compare_wet(rain[:, :max_candidate], rule.wet_day_min_mm)
+            if rule.min_wet_days is not None:
+                wet_cumsum = _prefix_sums(compare_wet(rain, rule.wet_day_min_mm), dtype=np.int32)
+                wet_ok &= (wet_cumsum[:, win:] - wet_cumsum[:, :-win]) >= rule.min_wet_days
         elif rule.trigger_rule == "all_days_wet":
             wet_cumsum = _prefix_sums(compare_wet(rain, rule.wet_day_min_mm), dtype=np.int32)
             wet_ok = (wet_cumsum[:, win:] - wet_cumsum[:, :-win]) == win
