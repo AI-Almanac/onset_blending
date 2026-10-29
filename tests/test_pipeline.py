@@ -152,6 +152,31 @@ def test_the_order_of_a_files_dimensions_does_not_matter(region, tmp_path):
     pd.testing.assert_frame_equal(got.weekly, expected.weekly, check_exact=True)
 
 
+def test_observation_dates_that_mark_the_day_itself_move_to_the_forecasts_labels(region, tmp_path):
+    # A calendar-day product (date = the day the rain fell) labels each day a
+    # day earlier than forecasts do (the UTC day ending at issue + d).
+    _, config, _ = region
+    start = dataclasses.replace(config, observations=dataclasses.replace(config.observations, date_marks="start"))
+
+    marked_end = onsets.observed(config).frame().set_index(["id", "year"])
+    marked_start = onsets.observed(start).frame().set_index(["id", "year"])
+
+    shifted = pd.to_datetime(marked_start["onset_date"]) - pd.to_datetime(marked_end["onset_date"])
+    assert (shifted == pd.Timedelta(days=1)).all()
+    assert (marked_start["onset_day"] - marked_end["onset_day"] == 1).all()
+
+
+def test_shifted_observation_dates_keep_their_season(tmp_path):
+    times = pd.date_range("2010-12-30", periods=3, freq="D")
+    xr.Dataset({"precip": (("time", "lat", "lon"), np.zeros((3, 1, 1), dtype="float32"))},
+               coords={"time": times, "lat": [10.0], "lon": [70.0]}).to_netcdf(tmp_path / "obs.nc")
+
+    read = readers.read_observations(tmp_path / "obs.nc", "precip", {}, shift_days=1)
+
+    assert pd.DatetimeIndex(read.dates).strftime("%m-%d").tolist() == ["12-31", "01-01", "01-02"]
+    assert read.years.tolist() == [2010, 2010, 2011]
+
+
 def test_lead_days_must_be_consecutive_and_distinct():
     positions, days = readers.lead_days_in_order(np.arange(3), [3, 1, 2], "f.nc")
     assert days == [1, 2, 3] and positions.tolist() == [1, 2, 0]

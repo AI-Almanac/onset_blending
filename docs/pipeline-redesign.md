@@ -291,6 +291,25 @@ weekly-feature settings fall back to code defaults (day_max, days_per_week,
 n_weeks, rain_window). Those match training only because training never
 overrides them.
 
+**Dates of observations and forecasts.** Forecast lead day d is the UTC day
+ending at issue + d (the archives declare it; the reforecast inference sums the
+native accumulations over (24(d−1), 24d] hours), and the blend scores it
+against an observed onset on issue + d. Observation files do not say which
+window their date covers, so each observation dataset declares it
+(`observations.date_marks`): `end` when the date ends its window (IMD: the
+24 h to 08:30 IST), `start` when the date is the day the rain fell
+(calendar-day products such as CHIRPS), which moves its dates a day later to
+the forecasts' labels; each day keeps the season of the day it covers.
+
+A lag check settled the two registered datasets: forecast lead day d
+correlates best with IMD's date issue + d (0.69, against 0.61 a day earlier)
+and with CHIRPS's issue + d − 1 (0.70, against 0.59). India's blend was aligned
+already; Ethiopia's was scoring forecasts a day late. Aligned (`start`),
+Ethiopia's pooled RPS skill against the unconditional climatology rises for the
+blend (0.141 → 0.157) and for every forecast (AIFS-ENS raw −0.015 → +0.040,
+calibrated −0.020 → +0.029; AIFS v2 raw −0.647 → −0.574), while the
+observation-only climatology stays put (0.076 → 0.078).
+
 Existing operational blends (a coefficient pickle plus a spec set) import once
 with `TrainedBlend.from_legacy(coef_pkl, config)`. It builds the reference data
 from the config's inputs and refuses if the coefficients' feature names are

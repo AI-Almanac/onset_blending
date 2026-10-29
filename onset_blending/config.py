@@ -242,6 +242,14 @@ class Observations:
         "keep", doc="keep: NaN stays; drop: drop any series with a NaN; zero: treat as 0 mm."
     )
     cell_transform: str | None = _field(None, doc="Source-to-unit weights CSV (source_id, target_id, weight).")
+    date_marks: Literal["end", "start"] = _field(
+        "end",
+        doc="Which end of its 24-hour window an observation's date marks. end: the window "
+        "ends on the date (IMD: the 24 h to 08:30 IST); start: the date is the day the "
+        "rain fell (calendar-day products such as CHIRPS). Forecast lead day d marks the "
+        "end of its window (the UTC day ending at issue + d), so start dates move a day "
+        "later to align with it.",
+    )
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -172,9 +172,13 @@ class ObservationArray:
     rain: np.ndarray       # (time, point), the file's dtype, NaN where masked
 
 
-def read_observations(path, variable: str, rename: dict) -> ObservationArray:
+def read_observations(path, variable: str, rename: dict, *, shift_days: int = 0) -> ObservationArray:
     """The rainfall of an observation file, as nc_read_groundtruth_long reads it
-    but as a (time, point) array; the calendar must be daily without gaps."""
+    but as a (time, point) array; the calendar must be daily without gaps.
+
+    shift_days moves the dates onto the forecasts' labels (1 for files whose
+    date is the day the rain fell; see Observations.date_marks); each day keeps
+    the season of the calendar day it covers."""
     import os
 
     import netCDF4
@@ -220,5 +224,5 @@ def read_observations(path, variable: str, rename: dict) -> ObservationArray:
     points = nc_utils._named_grid(
         nc_utils._product_frame(others, [dim_vals[d] for d in others]), rename, adm3_dim
     )
-    dates = stamps.normalize().to_numpy()
+    dates = (stamps.normalize() + pd.Timedelta(days=int(shift_days))).to_numpy()
     return ObservationArray(points=points, dates=dates, years=stamps.year.to_numpy(), rain=rain)

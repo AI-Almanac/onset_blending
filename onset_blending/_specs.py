@@ -125,6 +125,8 @@ def observation_spec(config: BlendConfig) -> dict:
             **_onset_options(config),
             "cutoff_month_day": config.onset.season_start,
             "missing_rain_policy": obs.missing_rain,
+            # Observation dates moved onto the forecasts' end-of-window labels.
+            "date_shift_days": 1 if obs.date_marks == "start" else 0,
             **_cell_transform(config, obs.cell_transform),
         },
         "output": {"write_long": False},

@@ -47,7 +47,8 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
     if context["cell_transform"] is not None:
         return _observed_file_from_table(path, context)
     read = readers.read_observations(
-        path, context["spec"]["input"]["value_col"], context["spec"]["dimensions"]["rename"]
+        path, context["spec"]["input"]["value_col"], context["spec"]["dimensions"]["rename"],
+        shift_days=context["spec"]["options"].get("date_shift_days", 0),
     )
     rain_by_point, points = read.rain, read.points
     regridder = context["regridder"]
@@ -130,6 +131,13 @@ def _observed_file_from_table(path: Path, context: dict) -> pd.DataFrame:
         with netCDF4.Dataset(path) as ds:
             found = ", ".join(ds.variables)
         raise ValueError(f"{path.name} has no {variable!r} variable (it has: {found})")
+    shift = int(spec["options"].get("date_shift_days", 0))
+    if shift:
+        # As read_observations does: dates onto the forecasts' labels, each day
+        # keeping the season (year) of the calendar day it covers.
+        codes, distinct = pd.factorize(df["time"])
+        moved = (pd.to_datetime(pd.Index(distinct)) + pd.Timedelta(days=shift)).date
+        df["time"] = pd.Series(np.asarray(moved, dtype=object)[codes], index=df.index, dtype=object)
     df = domain.with_ids(df, context["convention"])
     if context["cell_transform"] is not None:
         df = nc_utils.transform_groundtruth_long(df, context["cell_transform"], variable.lower(), spec=spec)
