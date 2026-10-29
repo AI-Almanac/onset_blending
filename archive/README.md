@@ -2,7 +2,8 @@
 
 What onset_blending was before it became a package, kept for reference and
 for converting old spec sets. Nothing here is installed or imported by the
-package.
+package. The scripts import `onset_blending._legacy`, whose modules now live
+in `tests/_legacy` as the tests' oracle, so they are kept to read, not to run.
 
 - `python/`, `predict/`, `utils/`, `benchmark/`: the pipeline scripts (data
   preparation, `1_blend_evaluation.py`, `3_fit_final_model.py`, the

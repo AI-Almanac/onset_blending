@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from onset_blending._legacy import climatology_utils as legacy
+from _legacy import climatology_utils as legacy
 from onset_blending.core import climatology
 
 

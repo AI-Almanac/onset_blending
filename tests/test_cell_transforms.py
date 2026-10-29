@@ -6,11 +6,12 @@ import pytest
 import xarray as xr
 
 from onset_blending import BlendConfig
-from onset_blending._legacy import nc_utils
-from onset_blending.core import _specs, domain, io, onsets
+from _legacy import nc_utils
+import _specs
+from onset_blending.core import domain, io, onsets
 from onset_blending.core.reference import Reference
 
-from test_pipeline import LATS, LEAD_DAYS, LONS, write_forecasts, write_observations
+from test_pipeline import LEAD_DAYS, write_forecasts, write_observations
 
 WEIGHTS = pd.DataFrame({
     "source_id": ["10.00_70.00", "10.00_70.25", "10.25_70.00", "10.25_70.25", "10.25_70.25"],

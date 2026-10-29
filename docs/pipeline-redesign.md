@@ -1,7 +1,9 @@
 # Redesign: onset_blending owns the blend pipeline, in memory
 
-Status: phase 1 (config) done. Phases 2 and 3: the package side is done;
-ai-almanac's side (the live writer, switching its runners) is next.
+Status: phases 1-4 done. The package runs on arrays from the config and
+imports none of the legacy code, which lives on in `tests/_legacy` as the
+tests' oracle (with `tests/_specs.py`, the legacy spec sets a config stands
+for); ai-almanac's local runners train and forecast with it.
 
 Phase 2 verification, against the cached references:
 - Ethiopia: `train()` reproduces every artifact exactly (combined and weekly
@@ -32,6 +34,23 @@ Phase 3 (data model), against the same references:
   predictions, fold coefficients) and CSV (scores, weights); no pickles.
   The legacy script, run on `_specs.cv_spec(config)`, stays the oracle in
   the tests: every artifact has the same content.
+
+Phase 4 (the old interface removed), against the same references:
+- Every legacy helper the stages called is ported into core, operation for
+  operation, each with an oracle test: the NetCDF primitives (io), unit ids
+  (ids), area and dissemination filters, regrid weights and the sparse
+  weighted mean (domain), the onset search (onset_rule), thresholds and
+  reference onsets (reference), the KDE climatology, and the connector's
+  feature helpers (features).
+- The legacy table routes are gone: cell transforms, dissemination units
+  that restrict the inputs and files with their dimensions in any order run
+  on the arrays. Two legacy defects go with them: a season whose
+  cell-transform source series was dropped (missing rain) was refused, and
+  points sharing a unit id had their series mixed (now refused).
+- The legacy day-level table (`features.daily`, `join: full`, the
+  `combined` intermediate) is gone; the random forest reads its daily
+  inputs as arrays and grows its trees in worker processes (Ethiopia's
+  training with the forest: 137 s, was 507 s; the same trees).
 - Ethiopia: 21 s; India: 197 s (evaluation and final fit 138 s; the system
   peak was +13.8 GB before the evaluation moved to arrays, against 469 s and
   66 GB in phase 2). Both match the
@@ -149,8 +168,10 @@ onset_blending/
   config.py          BlendConfig: the one recipe
   core/              the stages every blend shares, on arrays and xarray
     io.py            files, each file's format, reading rainfall
-    domain.py        units, ids, regridding, areas of interest
+    ids.py           unit ids: grid-id conventions, normalisation
+    domain.py        areas of interest, dissemination units, regridding
     reference.py     thresholds, reference onsets, weights (resolved once)
+    onset_rule.py    the onset search
     onsets.py        observed and forecast onsets
     climatology.py   KDE onset climatology
     features.py      the weekly samples (Weekly)
@@ -391,7 +412,9 @@ does about each:
 | no threshold configured gives no onsets, silently | the threshold is required |
 | unquoted `window_tags: [2000_2024]` reads as 20002024 | windows are year pairs; the converter explains the old value |
 | `run.MR`, `include_baseline_1900`, `fair_brier`, `mc_cores`, `plus_label_template`, `default_prob_col`, combine `climatology.*`, `sources[].prob_col`, connect `mode`, `region_label` are read by nothing | dropped |
-| `3_produce_figures.py` reads file names nothing writes any more | removed with the scripts in phase 4 |
+| `3_produce_figures.py` reads file names nothing writes any more | archived with the scripts |
+| a cell transform with `missing_rain: drop` refuses a season whose source series was dropped | the season's other sources stand in (phase 4) |
+| two points of a file with one unit id: their series are mixed into one | refused (phase 4) |
 
 The 2026 sets (`configs/fixed_cutoff_*2026*.yml`) are operational: their
 forecasts cover 2026 only, so they describe applying a blend trained

@@ -10,7 +10,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import pandas as pd
 
 from .core import climatology as climatology_stage, features, onsets, parallel
 from .core.climatology import Climatology

@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from onset_blending import config as cfg
-from onset_blending._legacy import onset_utils
+from _legacy import onset_utils
 from onset_blending.core.onset_rule import OnsetRule, find_onsets
 
 DEFINITIONS = [

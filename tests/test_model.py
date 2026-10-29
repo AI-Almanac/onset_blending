@@ -13,7 +13,7 @@ import patsy
 import pytest
 from sklearn.preprocessing import StandardScaler
 
-from onset_blending._legacy.blend_evaluation_utils import (
+from _legacy.blend_evaluation_utils import (
     _make_multinom_clf,
     apply_formula_sample_support,
     build_formulas_from_spec,
@@ -21,11 +21,11 @@ from onset_blending._legacy.blend_evaluation_utils import (
     resolve_climatology_weeks,
     restrict_to_allowed,
 )
-from onset_blending._legacy.nc_utils import ensure_id_col
-from onset_blending._legacy.spatial_id_utils import resolve_grid_id_convention
+from _legacy.nc_utils import ensure_id_col
+from _legacy.spatial_id_utils import resolve_grid_id_convention
 from _configs import blend_config
 from onset_blending.blend.logit import FittedModel
-from onset_blending.core import _specs
+import _specs
 from onset_blending.evaluation import evaluate, fit_final
 
 BINS = ["week1", "week2", "later"]

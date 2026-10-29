@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from onset_blending._legacy import nc_utils as _nc
+from _legacy import nc_utils as _nc
 from onset_blending.core import ids as _ids
 from onset_blending.core.reference import Reference
 

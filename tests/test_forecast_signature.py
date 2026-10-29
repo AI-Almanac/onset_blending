@@ -1,7 +1,6 @@
 """A live forecast must cover what the blend was trained on: the same units,
 aggregation, resolution and issue hour, and at least the trained lead days,
 members and domain (more is trimmed)."""
-import datetime as dt
 
 import numpy as np
 import pandas as pd

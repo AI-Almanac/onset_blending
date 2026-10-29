@@ -46,8 +46,10 @@ onset_blending/
   config.py        BlendConfig
   core/            the stages every blend shares, on arrays and xarray
     io.py            files, each file's format, reading rainfall
-    domain.py        units, ids, regridding, areas of interest
+    ids.py           unit ids: grid-id conventions, normalisation
+    domain.py        areas of interest, dissemination units, regridding
     reference.py     thresholds, reference onsets, weights (resolved once)
+    onset_rule.py    the onset search
     onsets.py        observed and forecast onsets
     climatology.py   KDE onset climatology
     features.py      the weekly samples
@@ -69,7 +71,7 @@ onset_blending/
 configs/           example configs
 docs/              design notes (docs/pipeline-redesign.md)
 archive/           the retired script interface, its specs and data
-tests/
+tests/             (tests/_legacy: the replaced pipeline code, kept as the oracle)
 ```
 
 ## Develop

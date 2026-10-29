@@ -16,7 +16,7 @@ import pytest
 import xarray as xr
 
 from _configs import blend_config
-from onset_blending._legacy.blend_evaluation_utils import (
+from _legacy.blend_evaluation_utils import (
     _present_weeks,
     apply_formula_sample_support,
     build_formulas_from_spec,
@@ -44,14 +44,15 @@ from onset_blending._legacy.blend_evaluation_utils import (
     score_model_predictions,
     summarize_models_pooled,
 )
-from onset_blending._legacy.misc import coalesce, interval_bins
-from onset_blending._legacy.nc_utils import ensure_id_col
-from onset_blending._legacy.spatial_id_utils import (
+from _legacy.misc import coalesce, interval_bins
+from _legacy.nc_utils import ensure_id_col
+from _legacy.spatial_id_utils import (
     resolve_grid_id_convention,
     validate_id_coordinate_consistency,
 )
 from onset_blending.blend import logit, mme
-from onset_blending.core import _specs, design
+import _specs
+from onset_blending.core import design
 from onset_blending.core.predictions import Predictions
 from onset_blending.evaluation import evaluate
 

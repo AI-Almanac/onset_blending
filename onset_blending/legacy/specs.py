@@ -65,7 +65,7 @@ class Conversion:
 
     def to_yaml(self, sources: dict[str, str] | None = None) -> str:
         """The config as YAML, headed by where it came from and what was dropped."""
-        lines = [f"# Converted from the stage specs by onset_blending.legacy_specs."]
+        lines = ["# Converted from the stage specs by onset_blending.legacy_specs."]
         for label, path in (sources or {}).items():
             lines.append(f"#   {label}: {path}")
         if self.notes:

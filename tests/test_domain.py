@@ -6,9 +6,9 @@ import pandas as pd
 import pytest
 
 from onset_blending import BlendConfig
-from onset_blending._legacy import nc_utils
-from onset_blending._legacy.geometry_utils import normalize_regrid_weights
-from onset_blending._legacy.sparse_transform_utils import compile_sparse_cell_transform, sparse_observed_weighted_mean
+from _legacy import nc_utils
+from _legacy.geometry_utils import normalize_regrid_weights
+from _legacy.sparse_transform_utils import compile_sparse_cell_transform, sparse_observed_weighted_mean
 from onset_blending.core import domain
 
 

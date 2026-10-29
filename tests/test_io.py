@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from onset_blending._legacy import nc_utils
+from _legacy import nc_utils
 from onset_blending.core import io
 
 

@@ -11,8 +11,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from onset_blending._legacy import nc_utils
-from onset_blending._legacy.nc_utils import (
+from _legacy import nc_utils
+from _legacy.nc_utils import (
     _by_distinct,
     _later_dates,
     _product_frame,
@@ -20,7 +20,7 @@ from onset_blending._legacy.nc_utils import (
     nc_time_to_dates,
     process_ground_truth_rainfall_id,
 )
-from onset_blending._legacy.spatial_id_utils import (
+from _legacy.spatial_id_utils import (
     _distinct_stripped_ids,
     normalize_id_series,
     working_copy,

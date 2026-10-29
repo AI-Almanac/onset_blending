@@ -1,14 +1,11 @@
-"""Today's stage specs, generated from a BlendConfig.
-
-Phase 2 runs the existing stage functions, which read spec dicts. These are
-built here from the one config, and only here, so no stage can be configured
-differently from another. Phase 3 replaces the functions and this module.
-"""
+"""The legacy stage specs a BlendConfig stands for: what the legacy
+functions (tests/_legacy) read, so the tests can run them as the oracle on
+the same config. The package itself reads the config."""
 
 from __future__ import annotations
 
-from .. import config as cfg
-from ..config import BlendConfig, ForecastModel
+from onset_blending import config as cfg
+from onset_blending.config import BlendConfig, ForecastModel
 
 # Dimension names the readers know, mapped to theirs; the config's renames win.
 _OBSERVATION_DIMS = {

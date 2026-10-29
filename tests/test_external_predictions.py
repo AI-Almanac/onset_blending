@@ -5,13 +5,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from onset_blending._legacy.blend_evaluation_utils import (
+from _legacy.blend_evaluation_utils import (
     ExternalPredictions,
     load_external_predictions,
     parse_external_predictions,
     score_model_predictions,
 )
-from onset_blending._legacy.misc import interval_bins
+from _legacy.misc import interval_bins
 
 N_BINS = 4
 CV_COLS = [f"cv_{b}" for b in interval_bins(N_BINS)]
