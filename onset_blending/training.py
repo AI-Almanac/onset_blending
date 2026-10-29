@@ -71,7 +71,7 @@ def prepare(
         log.info("%s in %.1fs", stage, timings[stage])
 
     started = time.perf_counter()
-    reference = Reference.resolve(config)
+    reference = Reference.resolve(config, workers=workers)
     observed = onsets.observed(config, reference=reference, workers=workers, budget_bytes=budget)
     lap("observed onsets", started)
 

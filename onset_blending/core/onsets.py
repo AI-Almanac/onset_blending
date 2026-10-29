@@ -37,14 +37,26 @@ def _context(config: BlendConfig, reference: Reference, source: str, area: domai
     }
 
 
-def _observed_file(path: Path, context: dict) -> pd.DataFrame:
-    """One observation file's onsets: (id, year) rows with onset_day and onset_date.
+@dataclass
+class _Series:
+    """An observation file's rainfall on the blend's units, as the onset
+    search reads it."""
 
-    The file is read into one (unit, day) series per season and searched in
-    one batched call. Under a cell transform the missing-rain policy applies
-    to its source series (a dropped source leaves its targets for that
-    season, or the target itself when it has no other), as the legacy
-    pipeline applied it on reading."""
+    ids: np.ndarray        # unit ids, sorted
+    rain: np.ndarray       # (time, unit), float64
+    dates: np.ndarray      # per time step, on the forecasts' labels
+    years: np.ndarray      # the season of each time step
+    seasons: np.ndarray    # the distinct seasons
+    supported: np.ndarray | None  # (unit, season) under a cell transform
+    policy: str            # the missing-rain policy left to apply per season
+
+
+def _observed_series(path: Path, context: dict) -> _Series:
+    """One observation file's rainfall on the units: regridded or cell
+    transformed, in the area, ids sorted. Under a cell transform the
+    missing-rain policy applies to its source series (a dropped source leaves
+    its targets for that season, or the target itself when it has no other),
+    as the legacy pipeline applied it on reading."""
     policy = context["missing_rain"]
     read = io.read_observations(path, context["variable"], context["rename"], shift_days=context["shift_days"])
     rain_by_point, points = read.rain, read.points
@@ -86,16 +98,25 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
         rain = np.where(np.isnan(rain), 0.0, rain)
 
     order = np.argsort(ids.astype(str), kind="stable")
-    ids = ids[order]
-    rain = rain[:, order]
     if supported is not None:
         supported = supported[kept][order]
+    return _Series(ids=ids[order], rain=rain[:, order], dates=read.dates, years=read.years, seasons=years,
+                   supported=supported, policy=policy)
+
+
+def _observed_file(path: Path, context: dict) -> pd.DataFrame:
+    """One observation file's onsets: (id, year) rows with onset_day and onset_date.
+
+    The file is read into one (unit, day) series per season and searched in
+    one batched call."""
+    observed = _observed_series(path, context)
+    ids, rain, policy, supported = observed.ids, observed.rain, observed.policy, observed.supported
     thresholds = context["reference"].unit_thresholds(ids.astype(str), context["convention"])
     cutoff_md = context["season_start"]
     parts = []
-    for y, year in enumerate(years):
-        days = np.flatnonzero(read.years == year)
-        days = days[np.argsort(read.dates[days], kind="stable")]
+    for y, year in enumerate(observed.seasons):
+        days = np.flatnonzero(observed.years == year)
+        days = days[np.argsort(observed.dates[days], kind="stable")]
         series = rain[days].T
         units = np.ones(len(ids), dtype=bool) if supported is None else supported[:, y].copy()
         if policy == "drop":
@@ -103,7 +124,7 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
         cutoff = dt.date.fromisoformat(f"{year}-{cutoff_md}")
         ref = context["reference"].reference_dates(ids[units].astype(str), np.full(units.sum(), year))
         start = np.array([max(cutoff, pd.Timestamp(r).date()) if not np.isnat(r) else cutoff for r in ref], dtype=object)
-        dates = read.dates[days]
+        dates = observed.dates[days]
         positions = np.searchsorted(dates.astype("datetime64[D]"), start.astype("datetime64[D]"), side="left")
         start_days = np.where(positions < len(dates), positions + 1, 9999)
         found = find_onsets(
@@ -254,6 +275,51 @@ def observed(config: BlendConfig, *, reference: Reference | None = None, workers
     context = observation_context(config, reference or Reference.resolve(config))
     parts = parallel.map_ordered(_observed_file, paths, context, workers)
     return ObservedOnsets.from_frames(parts, config.onset.season_start)
+
+
+def climatological_thresholds(config: BlendConfig, reference: Reference, *, workers: int = 1) -> pd.DataFrame:
+    """Each unit's threshold from the observations (onset.threshold.climatology):
+    its mean daily rain over the start..end days of the years, finite days
+    only, times the threshold's days (default the trigger window). Units as the
+    onset search sees them: regridded or transformed, in the area.
+
+    Returns (id, onset_thresh), NaN for a unit without rain in that window."""
+    spec = config.onset.threshold.climatology
+    first, last = spec.years
+    paths = [
+        path for path in io.list_files(config.observations.files, config, "observations")
+        if io.file_year(path) is None or first <= io.file_year(path) <= last
+    ]
+    context = {**observation_context(config, reference), "threshold_window": (first, last, spec.start, spec.end)}
+    parts = [part for part in parallel.map_ordered(_threshold_sums, paths, context, workers) if part is not None]
+    if not parts:
+        raise ValueError(
+            f"onset.threshold.climatology: no observations between {spec.start} and {spec.end} "
+            f"of {first}-{last} to compute thresholds from"
+        )
+    totals = pd.concat(parts).groupby("id", sort=True)[["total", "days"]].sum()
+    days = spec.days if spec.days is not None else config.onset.definition.window
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = totals["total"].to_numpy() / totals["days"].to_numpy()
+    return pd.DataFrame({"id": totals.index.astype(str), "onset_thresh": float(days) * mean})
+
+
+def _threshold_sums(path: Path, context: dict) -> pd.DataFrame | None:
+    """A file's per-unit rain total and finite days inside the threshold window."""
+    first, last, start, end = context["threshold_window"]
+    observed = _observed_series(path, context)
+    dates = pd.DatetimeIndex(observed.dates)
+    month_day = dates.strftime("%m-%d").to_numpy()
+    inside = (observed.years >= first) & (observed.years <= last) & (month_day >= start) & (month_day <= end)
+    if not inside.any():
+        return None
+    rain = observed.rain[inside]
+    finite = np.isfinite(rain)
+    return pd.DataFrame({
+        "id": observed.ids.astype(str),
+        "total": np.where(finite, rain, 0.0).sum(axis=0),
+        "days": finite.sum(axis=0),
+    })
 
 
 def observation_context(config: BlendConfig, reference: Reference) -> dict:

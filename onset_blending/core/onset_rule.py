@@ -1,5 +1,6 @@
 """The onset rule: the first day of a rainfall series that triggers an onset
-(a wet window over the threshold) without a dry spell in its follow-up.
+(a wet window over the threshold, or reaching it) without a dry spell in its
+follow-up (none is checked with follow_days 0).
 
 `find_onsets` searches many series at once, for several earliest start days
 each, with the legacy find_onsets_batch's numerics: the trigger and the
@@ -22,6 +23,7 @@ class OnsetRule:
     wet_day_min_mm: float
     trigger_rule: str           # all_days_wet | first_day_wet
     wet_day_comparison: str     # gte | gt
+    threshold_comparison: str   # gt | gte: the window total against the threshold
     follow_days: int
     followup_anchor: str        # after_trigger | onset_day
     mode: str                   # consecutive_dry | window_sum
@@ -38,6 +40,7 @@ class OnsetRule:
             wet_day_min_mm=float(definition.wet_day_min_mm),
             trigger_rule=definition.trigger_rule,
             wet_day_comparison=definition.wet_day_comparison,
+            threshold_comparison=definition.threshold_comparison,
             follow_days=int(definition.follow_days),
             followup_anchor=definition.followup_anchor,
             mode=spell.mode,
@@ -96,6 +99,9 @@ def find_onsets(series: np.ndarray, thresholds: np.ndarray, start_days: np.ndarr
         compare_wet = np.greater_equal
     else:
         raise NotImplementedError(f"Unsupported wet_day_comparison: {rule.wet_day_comparison}")
+    compare_total = {"gt": np.greater, "gte": np.greater_equal}.get(rule.threshold_comparison)
+    if compare_total is None:
+        raise NotImplementedError(f"Unsupported threshold_comparison: {rule.threshold_comparison}")
 
     for first in range(0, len(valid_rows), int(chunk_size)):
         rows = valid_rows[first:first + int(chunk_size)]
@@ -111,7 +117,7 @@ def find_onsets(series: np.ndarray, thresholds: np.ndarray, start_days: np.ndarr
         else:
             raise NotImplementedError(f"Unsupported trigger_rule: {rule.trigger_rule}")
 
-        eligible = wet_ok & (window_sums > thresholds[rows, np.newaxis]) & ~np.isnan(rain[:, :max_candidate])
+        eligible = wet_ok & compare_total(window_sums, thresholds[rows, np.newaxis]) & ~np.isnan(rain[:, :max_candidate])
         if reject_if_short_followup:
             eligible &= full_followup[np.newaxis, :]
 

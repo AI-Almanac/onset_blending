@@ -34,6 +34,13 @@ trained on, and refuses live files that do not cover it (fewer members or
 lead days, another grid, other units or daily aggregation); anything more is
 trimmed.
 
+The onset threshold is a constant (`onset.threshold.mm`), a per-unit table
+(`file`), or computed from the observations (`climatology`: each unit's
+mean rainfall over the trigger window, e.g. Moron and Robertson's local
+5-day amount over April-October of 1991-2020). With
+`definition.threshold_comparison: gte` a window reaching the threshold
+triggers; `follow_days: 0` checks no dry spell.
+
 An evaluation writes CSV score tables (`summary_models*`,
 `yearly_metrics_global*`), each model's CV predictions and the CV folds'
 coefficients as NetCDF (`cv_preds_*.nc`: `Predictions.open`; `coefs_*.nc`:

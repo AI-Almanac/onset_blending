@@ -40,3 +40,13 @@ def test_onsets_are_the_legacy_searchs(definition, short):
     old = onset_utils.find_onsets_batch(series, thresholds, starts, legacy_params(definition),
                                         reject_if_short_followup=short, chunk_size=64)
     np.testing.assert_array_equal(new, old)
+
+
+def test_a_total_that_reaches_the_threshold_triggers_only_with_gte():
+    series = np.array([[0, 0, 5, 5, 5, 5, 5, 0, 0, 0]], dtype=float)  # a 5-day total of exactly 25
+    starts = np.ones(1)
+    reaches = cfg.OnsetDefinition(window=5, trigger_rule="first_day_wet", threshold_comparison="gte", follow_days=0)
+    exceeds = cfg.OnsetDefinition(window=5, trigger_rule="first_day_wet", follow_days=0)
+
+    assert find_onsets(series, np.array([25.0]), starts, OnsetRule.of(reaches))[0, 0] == 3
+    assert np.isnan(find_onsets(series, np.array([25.0]), starts, OnsetRule.of(exceeds))[0, 0])

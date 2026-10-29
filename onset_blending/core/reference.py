@@ -33,7 +33,9 @@ class Reference:
     _regridders: dict = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
-    def resolve(cls, config: BlendConfig) -> "Reference":
+    def resolve(cls, config: BlendConfig, *, workers: int = 1) -> "Reference":
+        """Read (or, for onset.threshold.climatology, compute from the
+        observations) everything the stages look up."""
         cell_transforms, regrid_weights = {}, {}
         sources = [(OBSERVATIONS, config.observations.cell_transform, None)] + [
             (m.name, m.cell_transform, m) for m in config.models
@@ -44,12 +46,19 @@ class Reference:
             weights = _regrid_weights_path(config, model)
             if weights is not None:
                 regrid_weights[name] = pd.read_csv(weights, dtype={"target_id": str, "adm3_name": str})
-        return cls(
+        reference = cls(
             thresholds=read_thresholds(config),
             reference_onset=read_reference_onset(config),
             cell_transforms=cell_transforms,
             regrid_weights=regrid_weights,
         )
+        if config.onset.threshold.climatology is not None:
+            from .onsets import climatological_thresholds
+
+            reference.thresholds = _scaled(climatological_thresholds(config, reference, workers=workers),
+                                           config.onset.threshold.scale)
+            log.info("Computed onset thresholds for %d units from the observations", len(reference.thresholds))
+        return reference
 
     def unit_thresholds(self, unit_ids: np.ndarray, explicit: ids.GridIdConvention | None) -> np.ndarray:
         """Each unit's onset threshold (NaN without one); a table keyed by
@@ -151,12 +160,15 @@ class Reference:
         )
 
 
-def read_thresholds(config: BlendConfig) -> float | pd.DataFrame:
+def read_thresholds(config: BlendConfig) -> float | pd.DataFrame | None:
     """The onset threshold: a constant, or a table (lat, lon, onset_thresh or
-    id, onset_thresh) from a CSV, NetCDF or MATLAB file, optionally scaled."""
+    id, onset_thresh) from a CSV, NetCDF or MATLAB file, optionally scaled;
+    None for one computed from the observations (Reference.resolve does)."""
     threshold = config.onset.threshold
     if threshold.mm is not None:
         return float(threshold.mm)
+    if threshold.climatology is not None:
+        return None
     path = str(config.path(threshold.file))
     if not os.path.exists(path):
         raise FileNotFoundError(f"Threshold file not found: {path}")
@@ -181,7 +193,11 @@ def read_thresholds(config: BlendConfig) -> float | pd.DataFrame:
         table = table.drop_duplicates()
     else:
         table = _threshold_csv(path, threshold)
-    scale = threshold.scale
+    return _scaled(table, threshold.scale)
+
+
+def _scaled(table: pd.DataFrame, scale) -> pd.DataFrame:
+    """clip(threshold * factor + offset, min, max), or the table unchanged."""
     if scale is None:
         return table
     values = table["onset_thresh"].astype(float).values * float(scale.factor) + float(scale.offset)

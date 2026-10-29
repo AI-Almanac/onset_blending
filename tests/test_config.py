@@ -104,7 +104,7 @@ def test_every_problem_is_reported_at_once():
          "needs lead_days.min of 1"),
         (lambda d: d["models"][0].update(rain_horizon={"policy": "exact"}), "needs a max_day"),
         (lambda d: d["models"][0].update(lead_days={"min": 1, "max": 30}), "read 38 lead days"),
-        (lambda d: d["onset"].update(threshold={"mm": 20, "file": "t.csv"}), "exactly one of 'mm' or 'file'"),
+        (lambda d: d["onset"].update(threshold={"mm": 20, "file": "t.csv"}), "exactly one of 'mm', 'file' or 'climatology'"),
         (lambda d: d["observations"]["files"].update(paths=["a.nc"]), "either 'folder'"),
         (lambda d: d["climatology"].update(horizons=[{"start": "05-01", "end": "06-01", "forecast_window": 30}]),
          "'forecast_window' or 'horizons'"),

@@ -327,7 +327,10 @@ class OnsetDefinition:
     trigger_rule: Literal["all_days_wet", "first_day_wet"] = "all_days_wet"
     wet_day_min_mm: float = 1.0
     wet_day_comparison: Literal["gte", "gt"] = "gte"
-    follow_days: int = _field(21, doc="Follow-up period checked for a dry spell.")
+    threshold_comparison: Literal["gt", "gte"] = _field(
+        "gt", doc="The trigger window's total must be more than the threshold (gt) or at least it (gte)."
+    )
+    follow_days: int = _field(21, doc="Follow-up period checked for a dry spell; 0: no veto.")
     followup_anchor: Literal["after_trigger", "onset_day"] = "after_trigger"
     dry_spell: DrySpell = _field(factory=DrySpell)
 
@@ -341,12 +344,27 @@ class ThresholdScale:
 
 
 @dataclass(frozen=True, kw_only=True)
+class ThresholdClimatology:
+    """Each unit's own threshold from the observations: its mean rainfall
+    over `days` days, i.e. `days` times its mean daily rain over the
+    start..end days of the years (Moron and Robertson's local climatological
+    5-day wet-spell amount)."""
+
+    days: int | None = _field(None, doc="Days the threshold totals; default the trigger window.")
+    start: str = _field("04-01", parse=_month_day, doc="First month-day averaged over, each year.")
+    end: str = _field("10-31", parse=_month_day, doc="Last month-day averaged over, each year.")
+    years: tuple[int, int] = _field(parse=_year_window, doc="First and last year averaged over.")
+
+
+@dataclass(frozen=True, kw_only=True)
 class Threshold:
     """Rain over the trigger window that counts as an onset: one value in mm,
-    or a per-unit table (CSV, NetCDF or .mat)."""
+    a per-unit table (CSV, NetCDF or .mat), or each unit's climatological
+    amount computed from the observations."""
 
     mm: float | None = None
     file: str | None = None
+    climatology: ThresholdClimatology | None = _field(None, doc="Compute each unit's threshold from the observations.")
     id_col: str | None = _field(None, doc="CSV unit-id column (then adm3_name, id, lat/lon).")
     value_col: str = _field("onset_thresh", doc="CSV threshold column.")
     lat_col: str = "lat"
@@ -360,10 +378,18 @@ class Threshold:
     scale: ThresholdScale | None = _field(None, doc="clip(t * factor + offset, min, max) for a table.")
 
     def _check(self, path: str, problems: list[str]) -> None:
-        if (self.mm is None) == (self.file is None):
-            problems.append(f"{path}: give exactly one of 'mm' or 'file'")
+        if sum(x is not None for x in (self.mm, self.file, self.climatology)) != 1:
+            problems.append(f"{path}: give exactly one of 'mm', 'file' or 'climatology'")
         if self.mm is not None and self.scale is not None:
             problems.append(f"{path}.scale: only applies to a threshold table")
+        climatology = self.climatology
+        if climatology is not None:
+            if climatology.days is not None and climatology.days < 1:
+                problems.append(f"{path}.climatology.days must be at least 1")
+            if climatology.years is not None and climatology.years[1] < climatology.years[0]:
+                problems.append(f"{path}.climatology.years: {climatology.years} ends before it starts")
+            if climatology.start and climatology.end and climatology.end < climatology.start:
+                problems.append(f"{path}.climatology: end {climatology.end} is before start {climatology.start}")
 
 
 @dataclass(frozen=True, kw_only=True)
