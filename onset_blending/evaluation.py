@@ -42,15 +42,9 @@ import pandas as pd
 from scipy.special import expit
 
 from . import config as cfg
-from ._legacy.spatial_id_utils import (
-    ensure_spatial_id_col,
-    normalize_id_series,
-    resolve_grid_id_convention,
-    validate_id_coordinate_consistency,
-)
 from .blend import logit, mme, random_forest
 from .config import BlendConfig
-from .core import calibration, design, metrics
+from .core import calibration, design, ids, metrics
 from .core.features import DailyInputs, Weekly
 from .core.predictions import Predictions
 
@@ -102,14 +96,6 @@ def dissemination_table(config: BlendConfig, weekly: Weekly) -> pd.DataFrame:
     return pd.read_csv(config.path(config.domain.dissemination.file), dtype=str)
 
 
-def _id_spec(config: BlendConfig) -> dict:
-    """The grid-id convention, as the id utilities read it."""
-    ids = config.domain.grid_ids
-    if ids.decimal_digits is None:
-        return {}
-    return {"geometry": {"grid_id_decimal_digits": ids.decimal_digits, "grid_id_format": ids.format}}
-
-
 def prepare_inputs(weekly: Weekly | pd.DataFrame, config: BlendConfig,
                    dissemination: pd.DataFrame | None = None) -> tuple[Weekly, np.ndarray]:
     """The weekly features with normalised ids (a legacy table is taken as
@@ -118,18 +104,17 @@ def prepare_inputs(weekly: Weekly | pd.DataFrame, config: BlendConfig,
     `dissemination` is the table as read from its CSV (`dtype=str`; default
     `dissemination_table`); its id column is the config's
     `domain.dissemination.id_col`, else `id`, `adm3_name` or lat/lon."""
-    spec = _id_spec(config)
+    explicit = ids.configured(config)
     if isinstance(weekly, Weekly):
         # Normalised once per unit: normalisation maps each id on its own.
-        ids = normalize_id_series(pd.Series(weekly.units, dtype=object), context="blend input IDs")
-        weekly = weekly.with_units(ids.to_numpy(dtype=object))
+        units = ids.normalize(pd.Series(weekly.units, dtype=object), context="blend input IDs")
+        weekly = weekly.with_units(units.to_numpy(dtype=object))
     else:
-        weekly = Weekly.from_frame(ensure_spatial_id_col(weekly, spec=spec, context="blend input IDs"))
+        weekly = Weekly.from_frame(ids.with_id_column(weekly, explicit=explicit, context="blend input IDs"))
     if dissemination is None:
         dissemination = dissemination_table(config, weekly)
-    convention = resolve_grid_id_convention(
-        spec=spec,
-        authoritative_ids=pd.Series(weekly.units, dtype=object),
+    convention = ids.resolve(
+        explicit, authoritative_ids=pd.Series(weekly.units, dtype=object),
         context="blend input/dissemination ID handoff",
     )
     id_col = config.domain.dissemination.id_col if config.domain.dissemination is not None else None
@@ -137,8 +122,9 @@ def prepare_inputs(weekly: Weekly | pd.DataFrame, config: BlendConfig,
         if id_col not in dissemination.columns:
             raise ValueError(f"cell.id_col '{id_col}' not found. Found: {dissemination.columns.tolist()}")
         dissemination = dissemination.rename(columns={id_col: "id"})
-    cells = ensure_spatial_id_col(dissemination, spec=spec, convention=convention, context="blend dissemination IDs")
-    validate_id_coordinate_consistency(cells, context="blend dissemination IDs")
+    cells = ids.with_id_column(dissemination, explicit=explicit, convention=convention,
+                               context="blend dissemination IDs")
+    ids.check_coordinates(cells, context="blend dissemination IDs")
     weeks = _present_weeks(weekly.columns, cfg.CLIMATOLOGY_FEATURE)
     n_bins = config.features.bins.count
     if weeks != list(range(1, n_bins + 1)):
@@ -686,10 +672,6 @@ def _climatology_baselines(ctx: _Context, scores: _Scores) -> dict[str, Predicti
     return out
 
 
-def _cutoff_variant(config: BlendConfig) -> str:
-    return {"fixed_cutoff": "fixed_cutoff", "ref_onset": "ref_onset"}.get(config.evaluation.cutoff_mode, "base")
-
-
 def _forecast_baselines(ctx: _Context, result: Evaluation, scores: _Scores) -> dict[str, Predictions]:
     """Each model's probabilities, raw and Platt-calibrated. Returns the
     calibrated predictions by MME key."""
@@ -697,7 +679,7 @@ def _forecast_baselines(ctx: _Context, result: Evaluation, scores: _Scores) -> d
     calibrated_by_key = {}
     for scoring in ctx.config.forecast_evaluations():
         name = scoring.model
-        variant = scoring.variant or _cutoff_variant(ctx.config)
+        variant = scoring.variant or cfg.cutoff_variant(ctx.config)
         label = name if variant == "base" else f"{name}_{variant}"
         base = cfg.probability_feature_base(name, variant)
         if scoring.raw:
