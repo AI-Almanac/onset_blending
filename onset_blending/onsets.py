@@ -556,6 +556,10 @@ def _forecast_file_from_table(path: Path, context: dict) -> tuple[xr.Dataset, bo
     if df is None:
         raise ValueError(f"{path.name} has no {context['variable']!r} variable")
     rain_cols = [c for c in df.columns if c.startswith("rain_day_")]
+    _, ordered = readers.lead_days_in_order(
+        np.arange(len(rain_cols)), [int(c.rsplit("_", 1)[1]) for c in rain_cols], path.name
+    )
+    rain_cols = [f"rain_day_{d}" for d in ordered]
     if context["unit_scale"] != 1.0:
         df[rain_cols] = df[rain_cols].to_numpy() * context["unit_scale"]
     df = domain.with_ids(df, context["convention"])
@@ -659,4 +663,17 @@ def forecast(
         if results
         else None
     )
+    if data is not None:
+        # Issues are looked up by date later, so they must be distinct and in
+        # order, whatever order the files hold them in. Issue times of day
+        # fold onto their date (the signature records the hour).
+        issues = pd.DatetimeIndex(data["issue"].values)
+        repeated = sorted({d.date().isoformat() for d in issues[issues.duplicated()]})
+        if repeated:
+            raise ValueError(
+                f"model {model.name}: several issues on the same date ({', '.join(repeated[:5])}"
+                f"{'…' if len(repeated) > 5 else ''}): one initialisation per date"
+            )
+        if not issues.is_monotonic_increasing:
+            data = data.sortby("issue")
     return ForecastOnsets(model=model.name, data=data, has_spread=any(spread for _, spread in results))

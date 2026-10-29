@@ -1,4 +1,5 @@
 """The whole package on a small synthetic region: train, save, load, forecast."""
+import dataclasses
 import datetime as dt
 
 import numpy as np
@@ -6,8 +7,9 @@ import pandas as pd
 import pytest
 import xarray as xr
 
-from onset_blending import BlendConfig
+from onset_blending import BlendConfig, onsets, readers
 from onset_blending.blend import TrainedBlend
+from onset_blending.config import FileSet
 from onset_blending import forecast as forecast_module
 from onset_blending.forecast import IncompatibleForecast
 from onset_blending.training import Resources, train
@@ -51,7 +53,8 @@ def write_forecasts(folder, years=FORECAST_YEARS, members=3, issues_of=None, nam
         issues = issues_of(year) if issues_of else [dt.date(year, 5, 1) + dt.timedelta(days=7 * k) for k in range(13)]
         data = np.zeros((len(issues), members, lead_days, len(lats), len(lons)), dtype="float32")
         for t, issue in enumerate(issues):
-            leads = [issue + dt.timedelta(days=d) for d in range(1, lead_days + 1)]
+            day = dt.date(issue.year, issue.month, issue.day)  # issues may carry a time of day
+            leads = [day + dt.timedelta(days=d) for d in range(1, lead_days + 1)]
             for m in range(members):
                 for i in range(len(lats)):
                     for j in range(len(lons)):
@@ -132,6 +135,38 @@ def test_a_live_file_holding_more_forecasts_what_was_trained(region, tmp_path):
     bigger = result.blend.forecast({"ens": tmp_path / "bigger" / "2014.nc"})
 
     pd.testing.assert_frame_equal(bigger.weekly, trained.weekly, check_exact=True)
+
+
+def test_the_order_of_a_files_dimensions_does_not_matter(region, tmp_path):
+    # Lead days, latitudes and issues reversed: the same forecast.
+    _, _, result = region
+    write_forecasts(tmp_path / "sorted", years=[2014])
+    with xr.open_dataset(tmp_path / "sorted" / "2014.nc") as ds:
+        reversed_ = ds.isel(day=slice(None, None, -1), lat=slice(None, None, -1), time=slice(None, None, -1)).load()
+    (tmp_path / "reversed").mkdir()
+    reversed_.to_netcdf(tmp_path / "reversed" / "2014.nc")
+
+    expected = result.blend.forecast({"ens": tmp_path / "sorted" / "2014.nc"})
+    got = result.blend.forecast({"ens": tmp_path / "reversed" / "2014.nc"})
+
+    pd.testing.assert_frame_equal(got.weekly, expected.weekly, check_exact=True)
+
+
+def test_lead_days_must_be_consecutive_and_distinct():
+    positions, days = readers.lead_days_in_order(np.arange(3), [3, 1, 2], "f.nc")
+    assert days == [1, 2, 3] and positions.tolist() == [1, 2, 0]
+    for bad in ([1, 2, 4], [1, 1, 2], [1, None, 2]):
+        with pytest.raises(ValueError, match="f.nc: lead days"):
+            readers.lead_days_in_order(np.arange(3), bad, "f.nc")
+
+
+def test_two_issues_on_one_date_are_refused(region, tmp_path):
+    root, config, _ = region
+    write_forecasts(tmp_path, years=[2014], issues_of=lambda _: [dt.datetime(2014, 6, 9), dt.datetime(2014, 6, 9, 12)])
+    model = dataclasses.replace(config.models[0], files=FileSet(paths=(str(tmp_path / "2014.nc"),)))
+
+    with pytest.raises(ValueError, match="several issues on the same date \\(2014-06-09\\)"):
+        onsets.forecast(config, model)
 
 
 def test_models_initialised_on_different_dates_are_refused(region):

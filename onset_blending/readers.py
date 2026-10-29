@@ -16,6 +16,19 @@ import pandas as pd
 from ._legacy import nc_utils
 
 
+def lead_days_in_order(positions, day_numbers, where) -> tuple[np.ndarray, list[int]]:
+    """The selected lead days ascending, with their positions in the file.
+    Onsets are found over consecutive days and binned by lead day, so the
+    days must be whole, distinct and without gaps, whatever the file's order."""
+    if any(d is None for d in day_numbers):
+        raise ValueError(f"{where}: lead days must be whole numbers of days")
+    order = np.argsort(np.asarray(day_numbers), kind="stable")
+    days = [int(day_numbers[i]) for i in order]
+    if len(set(days)) != len(days) or any(b - a != 1 for a, b in zip(days, days[1:])):
+        raise ValueError(f"{where}: lead days must be consecutive and distinct, got {days[:8]}{'…' if len(days) > 8 else ''}")
+    return np.asarray(positions)[order], days
+
+
 def _ranges(chunk: int, size: int) -> list[tuple[int, int]]:
     return [(start, min(size, start + chunk)) for start in range(0, size, chunk)]
 
@@ -52,8 +65,8 @@ class ForecastFile:
         self._v = v = ds.variables[variable]
         dim_names, dim_vals = layout["dim_names"], layout["dim_vals"]
         day_idx, other_idx, n_leading = layout["day_idx"], layout["other_idx"], layout["n_leading"]
-        self._day_positions, _, day_numbers = nc_utils._select_forecast_days(dim_vals[dim_names[day_idx]], spec, self.path)
-        self.days = [int(d) for d in day_numbers]
+        positions, _, day_numbers = nc_utils._select_forecast_days(dim_vals[dim_names[day_idx]], spec, self.path)
+        self._day_positions, self.days = lead_days_in_order(positions, day_numbers, self.path)
         spatial = [dim_names[i] for i in other_idx[n_leading:]]
         shape = [len(dim_vals[d]) for d in spatial]
         n_points = int(np.prod(shape))
