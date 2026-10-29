@@ -41,13 +41,13 @@ def write(path, *, members=4, leads=4, hour=0, units="mm", lat=(10.0, 10.25), lo
     return path
 
 
-def differences(tmp_path, trained_kwargs, live_kwargs, **model_changes):
+def differences(tmp_path, trained_kwargs, live_kwargs, fewer_members=False, **model_changes):
     """As check_forecast_files compares them: the trained signature after the
     model's selection, the live one as the file holds it."""
     m = model(**model_changes)
     trained = forecast_signature(write(tmp_path / "trained_2020.nc", **trained_kwargs), m)
     live = forecast_signature(write(tmp_path / "live_2026.nc", year=2026, **live_kwargs), m, selected=False)
-    return _signature_differences(trained, live)
+    return _signature_differences(trained, live, fewer_members=fewer_members)
 
 
 def test_a_file_like_the_training_files_matches(tmp_path):
@@ -80,6 +80,13 @@ def test_members_and_lead_days_the_trained_selection_drops_do_not_count(tmp_path
     assert differences(tmp_path, {"members": 4}, {"members": 1}, max_member=1) == [
         "members [0], trained on [0, 1] (missing [1])"
     ]
+
+
+def test_fewer_members_may_be_allowed(tmp_path):
+    # Some of the trained members will do; a file with no members still refuses.
+    assert differences(tmp_path, {}, {"members": 2}, fewer_members=True) == []
+    [found] = differences(tmp_path, {}, {"members": 0}, fewer_members=True)
+    assert found.startswith("members None, trained on [0, 1, 2, 3]")
 
 
 def test_a_live_file_holding_more_is_covered(tmp_path):

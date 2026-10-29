@@ -140,11 +140,13 @@ def _aggregation(ds, variable, lead_dim: str | None) -> dict:
     return {"method": method, "window": window}
 
 
-def _signature_differences(trained: dict, live: dict) -> list[str]:
+def _signature_differences(trained: dict, live: dict, *, fewer_members: bool = False) -> list[str]:
     """How a live file fails to cover the trained signature. It may hold
     more (longer leads, more members, a larger domain such as the globe):
     the blend reads only what it was trained on. It may not hold less, nor
-    another resolution, units, aggregation, issue hour or variable."""
+    another resolution, units, aggregation, issue hour or variable.
+    fewer_members: a live ensemble may hold only some of the trained members
+    (any one will do); its onset probabilities are then shares of those."""
     out = []
     for key, label in (
         ("variable", "variable"), ("units", "rainfall units"), ("aggregation", "daily aggregation"),
@@ -156,6 +158,8 @@ def _signature_differences(trained: dict, live: dict) -> list[str]:
         have, need = live.get(key), trained.get(key)
         if (have is None) != (need is None):
             out.append(f"{label} {_brief(have)}, trained on {_brief(need)}")
+        elif key == "members" and fewer_members and need is not None and set(need) & set(have):
+            continue
         elif need is not None and set(need) - set(have):
             missing = sorted(set(need) - set(have))
             out.append(f"{label} {_brief(have)}, trained on {_brief(need)} (missing {_brief(missing)})")
@@ -372,8 +376,9 @@ class TrainedBlend:
 
     # -- operations -----------------------------------------------------------
 
-    def check_forecast_files(self, forecasts: dict[str, list[Path]]) -> list[str]:
-        """Every way the live files differ from what the blend was trained on."""
+    def check_forecast_files(self, forecasts: dict[str, list[Path]], *, fewer_members: bool = False) -> list[str]:
+        """Every way the live files differ from what the blend was trained on
+        (fewer_members: see _signature_differences)."""
         problems = []
         trained = set(self.config.model_names)
         given = set(forecasts)
@@ -393,13 +398,16 @@ class TrainedBlend:
                 except (OSError, ValueError) as exc:
                     problems.append(f"{name}: {Path(path).name}: {exc}")
                     continue
-                differences = _signature_differences(self.signatures[name], live)
+                differences = _signature_differences(self.signatures[name], live, fewer_members=fewer_members)
                 if differences:
                     problems.append(f"{name}: {Path(path).name}: " + "; ".join(differences))
         return problems
 
-    def forecast(self, forecasts: dict[str, str | Path | list], *, issue_date=None, resources=None):
+    def forecast(self, forecasts: dict[str, str | Path | list], *, issue_date=None, resources=None,
+                 fewer_members: bool = False):
         """Blended onset probabilities from live forecast files (see forecast.run)."""
         from . import forecast as forecast_module
 
-        return forecast_module.run(self, forecasts, issue_date=issue_date, resources=resources)
+        return forecast_module.run(
+            self, forecasts, issue_date=issue_date, resources=resources, fewer_members=fewer_members
+        )

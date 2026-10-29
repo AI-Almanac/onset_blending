@@ -258,6 +258,16 @@ def test_a_forecast_with_other_members_is_refused(region, tmp_path):
     assert any("members [0, 1], trained on [0, 1, 2]" in p for p in refused.value.problems)
 
 
+def test_a_forecast_with_fewer_members_may_be_allowed(region, tmp_path):
+    root, _, result = region
+    write_forecasts(tmp_path / "live", years=[2014], members=2)
+
+    forecast = result.blend.forecast({"ens": tmp_path / "live" / "2014.nc"}, fewer_members=True)
+
+    probabilities = forecast.weekly.filter(like="cv_")
+    assert len(probabilities) and np.allclose(probabilities.sum(axis=1), 1.0)
+
+
 def test_a_damaged_blend_is_refused(region, tmp_path):
     _, _, result = region
     path = result.blend.save(tmp_path / "trained.blend")

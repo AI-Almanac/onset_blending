@@ -129,15 +129,18 @@ def _issue_problems(config: cfg.BlendConfig, issue_date: dt.date | None,
     return None, years.pop(), problems
 
 
-def run(blend, forecasts: dict, *, issue_date=None, resources=None) -> Forecast:
-    """Blended probabilities for the live forecasts (model name -> file or files)."""
+def run(blend, forecasts: dict, *, issue_date=None, resources=None, fewer_members: bool = False) -> Forecast:
+    """Blended probabilities for the live forecasts (model name -> file or files).
+    fewer_members lets an ensemble's live files hold only some of the members
+    the blend was trained on: its onset probabilities are shares of fewer
+    members, so coarser and noisier than the blend's training saw."""
     from .training import Resources
 
     resources = resources or Resources.default()
     if isinstance(issue_date, str):
         issue_date = dt.date.fromisoformat(issue_date)
     live = {name: _as_paths(paths) for name, paths in forecasts.items()}
-    problems = blend.check_forecast_files(live)
+    problems = blend.check_forecast_files(live, fewer_members=fewer_members)
     held, read_problems = _held_issues(blend, live)
     issue_date, year, issue_problems = _issue_problems(blend.config, issue_date, held)
     problems += read_problems + issue_problems
