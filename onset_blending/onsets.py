@@ -346,7 +346,8 @@ def _unit_frame_values(context: dict, ids: np.ndarray, issues: np.ndarray):
 
 
 def _forecast_file(path: Path, context: dict) -> tuple[xr.Dataset, bool]:
-    """One forecast file's onset counts and rain summaries."""
+    """One forecast file's onset counts and rain summaries, a run of issues
+    at a time."""
     if context["cell_transform"] is not None or context["area"].dissemination:
         return _forecast_file_from_table(path, context)
     masks = _kept_mask(path, context)
@@ -354,71 +355,123 @@ def _forecast_file(path: Path, context: dict) -> tuple[xr.Dataset, bool]:
         return _forecast_file_from_table(path, context)
     points, keep, in_area = masks
     spec = context["spec"]
-    array = readers.read_forecast(
+    with readers.ForecastFile(
         path, context["variable"], spec["dimensions"]["rename"], spec, keep,
         spread_over=in_area, scale=context["unit_scale"],
-    )
-    rain = array.rain
-    if array.members is not None and context["max_member"] is not None:
-        selected = array.members <= context["max_member"]
-        if not selected.any():
-            raise ValueError(f"{path.name}: no members <= {context['max_member']}")
-        rain = rain[:, selected]
-    ids = points["id"].to_numpy()[keep]
-    return _summarise(rain, ids, array.issues, array.days, context), array.member_spread
+    ) as forecast:
+        selected = slice(None)
+        if forecast.members is not None and context["max_member"] is not None:
+            selected = forecast.members <= context["max_member"]
+            if not selected.any():
+                raise ValueError(f"{path.name}: no members <= {context['max_member']}")
+        summary = _Summary(points["id"].to_numpy()[keep], forecast.issues, forecast.days, context)
+        for start, stop, rain in forecast.issue_runs():
+            summary.add(start, stop, rain[:, selected])
+        return summary.dataset(), forecast.member_spread
 
 
 def _summarise(rain: np.ndarray, ids: np.ndarray, issues: np.ndarray, days: list[int], context: dict) -> xr.Dataset:
-    """Onset counts and rain summaries from (issue, member, unit, day) rainfall."""
-    params = context["onset_params"]
-    n_issue, n_member, n_unit, n_day = rain.shape
-    thresholds, ref = _unit_frame_values(context, ids, issues)
-    issue_rows = np.repeat(issues, n_unit)
-    fixed, from_ref = nc_utils._forecast_start_days(
-        issue_rows, pd.DatetimeIndex(issue_rows).year, ref.reshape(-1), np.asarray(days),
-        context["spec"]["options"]["fixed_cutoff_month_day"],
-    )
-    fixed, from_ref = fixed.reshape(n_issue, n_unit), from_ref.reshape(n_issue, n_unit)
-    counts = {v: np.zeros((n_issue, n_unit, n_day), dtype=np.uint8) for v in VARIANTS}
-    for t in range(n_issue):
-        series = rain[t].reshape(n_member * n_unit, n_day)
-        starts = np.vstack((
-            np.ones(n_member * n_unit, dtype=int), np.tile(fixed[t], n_member), np.tile(from_ref[t], n_member)
-        ))
-        found = onset_utils.find_onsets_batch(series, np.tile(thresholds, n_member), starts, params)
-        units = np.tile(np.arange(n_unit), n_member)
-        for variant, onset in zip(VARIANTS, found):
-            valid = np.isfinite(onset) & (onset >= 1) & (onset <= n_day)
-            np.add.at(counts[variant][t], (units[valid], onset[valid].astype(np.intp) - 1), 1)
+    """Onset counts and rain summaries from a file's (issue, member, unit, day) rainfall."""
+    summary = _Summary(ids, issues, days, context)
+    summary.add(0, len(issues), rain)
+    return summary.dataset()
 
-    # The members' mean and spread as the legacy pipeline computes them:
-    # pandas' compiled groupby kernels over rows in member order, which keep
-    # the rainfall's dtype. (Its float64 fast path, taken only for sorted
-    # groups without NaN, never applied to the legacy rows.) One member is its
-    # own mean, with no spread.
-    if n_member == 1:
-        rain_mean = np.ascontiguousarray(rain[:, 0])
-        rain_sd = np.full(rain_mean.shape, np.nan, dtype=rain.dtype)
-    else:
-        rows = rain.reshape(n_issue * n_member * n_unit, n_day)
-        groups = (np.repeat(np.arange(n_issue), n_member * n_unit) * n_unit
-                  + np.tile(np.arange(n_unit), n_issue * n_member))
-        grouped = pd.DataFrame(rows, copy=False).groupby(groups, sort=True)
-        rain_mean = grouped.mean().to_numpy().reshape(n_issue, n_unit, n_day)
-        rain_sd = grouped.std().to_numpy().reshape(n_issue, n_unit, n_day) if context["daily"] else None
-    variables = {
-        "rain_mean": (("issue", "unit", "day"), rain_mean),
-        "members": (("issue",), np.full(n_issue, n_member, dtype=np.uint8)),
-        "onset_threshold": (("unit",), thresholds),
-        "year": (("issue",), pd.DatetimeIndex(issues).year.to_numpy(dtype=np.int64)),
-        **{f"count_{v}": (("issue", "unit", "day"), counts[v]) for v in VARIANTS},
-    }
-    if context["daily"]:
-        # What only the day-level table reports.
-        variables["rain_sd"] = (("issue", "unit", "day"), rain_sd)
-        variables["raining"] = (("issue", "unit", "day"), (rain > 1).sum(axis=1).astype(np.uint8))
-        variables["ref_onset_date"] = (("issue", "unit"), ref)
-    return xr.Dataset(variables, coords={"issue": issues, "unit": ids.astype(object), "day": np.asarray(days)})
+
+def member_mean(rain: np.ndarray) -> np.ndarray:
+    """(issue, member, unit, day) rainfall's mean over members, as the legacy
+    pipeline computed it with pandas' compiled grouped mean: a compensated
+    (Kahan) sum over the members in order, in the rainfall's own dtype,
+    skipping NaN. (pandas' float64 fast path, taken only for sorted groups
+    without NaN, never applied to the legacy rows.)"""
+    shape = (rain.shape[0],) + rain.shape[2:]
+    total = np.zeros(shape, rain.dtype)
+    compensation = np.zeros(shape, rain.dtype)
+    count = np.zeros(shape, np.int64)
+    for member in range(rain.shape[1]):
+        value = rain[:, member]
+        present = ~np.isnan(value)
+        y = value - compensation
+        t = total + y
+        c = (t - total) - y
+        c[np.isnan(c)] = 0  # an infinite value
+        np.copyto(compensation, c, where=present)
+        np.copyto(total, t, where=present)
+        count += present
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = total / count.astype(rain.dtype)
+    out[count == 0] = np.nan
+    return out
+
+
+class _Summary:
+    """A file's onset counts and rain summaries, filled a run of issues at a time."""
+
+    def __init__(self, ids: np.ndarray, issues: np.ndarray, days: list[int], context: dict):
+        self.ids, self.issues, self.days, self.context = ids, issues, days, context
+        n_issue, n_unit, n_day = len(issues), len(ids), len(days)
+        self.thresholds, self.ref = _unit_frame_values(context, ids, issues)
+        issue_rows = np.repeat(issues, n_unit)
+        fixed, from_ref = nc_utils._forecast_start_days(
+            issue_rows, pd.DatetimeIndex(issue_rows).year, self.ref.reshape(-1), np.asarray(days),
+            context["spec"]["options"]["fixed_cutoff_month_day"],
+        )
+        self.fixed, self.from_ref = fixed.reshape(n_issue, n_unit), from_ref.reshape(n_issue, n_unit)
+        self.counts = {v: np.zeros((n_issue, n_unit, n_day), dtype=np.uint8) for v in VARIANTS}
+        self.members = np.zeros(n_issue, dtype=np.uint8)
+        self.rain_mean = self.rain_sd = self.raining = None
+
+    def add(self, start: int, stop: int, rain: np.ndarray) -> None:
+        params = self.context["onset_params"]
+        n_run, n_member, n_unit, n_day = rain.shape
+        units = np.tile(np.arange(n_unit), n_member)
+        thresholds = np.tile(self.thresholds, n_member)
+        for offset in range(n_run):
+            t = start + offset
+            starts = np.vstack((
+                np.ones(n_member * n_unit, dtype=int), np.tile(self.fixed[t], n_member),
+                np.tile(self.from_ref[t], n_member),
+            ))
+            found = onset_utils.find_onsets_batch(
+                rain[offset].reshape(n_member * n_unit, n_day), thresholds, starts, params
+            )
+            for variant, onset in zip(VARIANTS, found):
+                valid = np.isfinite(onset) & (onset >= 1) & (onset <= n_day)
+                np.add.at(self.counts[variant][t], (units[valid], onset[valid].astype(np.intp) - 1), 1)
+        self.members[start:stop] = n_member
+
+        if self.rain_mean is None:
+            self.rain_mean = np.empty((len(self.issues), n_unit, n_day), dtype=rain.dtype)
+        # One member is its own mean, with no spread.
+        self.rain_mean[start:stop] = rain[:, 0] if n_member == 1 else member_mean(rain)
+        if self.context["daily"]:
+            if self.raining is None:
+                self.raining = np.zeros((len(self.issues), n_unit, n_day), dtype=np.uint8)
+                self.rain_sd = np.full((len(self.issues), n_unit, n_day), np.nan, dtype=rain.dtype)
+            self.raining[start:stop] = (rain > 1).sum(axis=1)
+            if n_member > 1:
+                # pandas' grouped std (its compiled kernel, in member order).
+                rows = rain.reshape(n_run * n_member * n_unit, n_day)
+                groups = (np.repeat(np.arange(n_run), n_member * n_unit) * n_unit
+                          + np.tile(np.arange(n_unit), n_run * n_member))
+                std = pd.DataFrame(rows, copy=False).groupby(groups, sort=True).std()
+                self.rain_sd[start:stop] = std.to_numpy().reshape(n_run, n_unit, n_day)
+
+    def dataset(self) -> xr.Dataset:
+        variables = {
+            "rain_mean": (("issue", "unit", "day"), self.rain_mean),
+            "members": (("issue",), self.members),
+            "onset_threshold": (("unit",), self.thresholds),
+            "year": (("issue",), pd.DatetimeIndex(self.issues).year.to_numpy(dtype=np.int64)),
+            **{f"count_{v}": (("issue", "unit", "day"), self.counts[v]) for v in VARIANTS},
+        }
+        if self.context["daily"]:
+            # What only the day-level table reports.
+            variables["rain_sd"] = (("issue", "unit", "day"), self.rain_sd)
+            variables["raining"] = (("issue", "unit", "day"), self.raining)
+            variables["ref_onset_date"] = (("issue", "unit"), self.ref)
+        return xr.Dataset(
+            variables, coords={"issue": self.issues, "unit": self.ids.astype(object), "day": np.asarray(self.days)}
+        )
 
 
 def _forecast_file_from_table(path: Path, context: dict) -> tuple[xr.Dataset, bool]:

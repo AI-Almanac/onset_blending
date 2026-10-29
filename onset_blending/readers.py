@@ -16,115 +16,134 @@ import pandas as pd
 from ._legacy import nc_utils
 
 
-@dataclass
-class ForecastArray:
-    """A forecast file's rainfall at the kept points."""
-
-    issues: np.ndarray            # datetime64[ns] issue dates (time of day dropped)
-    members: np.ndarray | None    # member ids; None for a deterministic model
-    points: pd.DataFrame          # the kept points, named as forecast_points() names them
-    days: list[int]               # lead days the onset search reads
-    rain: np.ndarray              # (issue, member, point, day); one member when deterministic
-    member_spread: bool           # some spread-area point has two members for one issue and day
-
-
 def _ranges(chunk: int, size: int) -> list[tuple[int, int]]:
     return [(start, min(size, start + chunk)) for start in range(0, size, chunk)]
 
 
-def read_forecast(path, variable: str, rename: dict, spec: dict, keep: np.ndarray, *,
-                  spread_over: np.ndarray | None = None, scale: float = 1.0) -> ForecastArray | None:
-    """The rainfall at the kept points (a mask over forecast_points()).
+class ForecastFile:
+    """A forecast file's rainfall at the kept points, read a run of issues at
+    a time (whole storage chunks, each decompressed once, and only where a
+    kept point lies or, until member spread is found, a spread-area point).
 
-    Storage chunks are decompressed once each, and only where a kept point
-    lies (or, until member spread is found, a spread-area point). None for a
-    layout the point reader does not support."""
-    import netCDF4
+        with ForecastFile(path, variable, rename, spec, keep) as f:
+            for start, stop, rain in f.issue_runs():   # rain: (issue, member, point, day)
+                ...
+    """
 
-    with netCDF4.Dataset(path) as ds:
+    def __init__(self, path, variable: str, rename: dict, spec: dict, keep: np.ndarray, *,
+                 spread_over: np.ndarray | None = None, scale: float = 1.0):
+        import netCDF4
+
+        self.path, self.scale = path, scale
+        self._ds = netCDF4.Dataset(path)
+        try:
+            self._setup(variable, rename, spec, keep, spread_over)
+        except BaseException:
+            self._ds.close()
+            raise
+
+    def _setup(self, variable, rename, spec, keep, spread_over):
+        ds = self._ds
         if variable not in ds.variables:
-            return None
+            raise ValueError(f"{self.path}: no {variable!r} variable")
         layout = nc_utils._forecast_layout(ds, variable, rename, "day")
         if layout is None:
-            return None
-        v = ds.variables[variable]
+            raise ValueError(f"{self.path}: a layout the point reader does not support")
+        self._v = v = ds.variables[variable]
         dim_names, dim_vals = layout["dim_names"], layout["dim_vals"]
         day_idx, other_idx, n_leading = layout["day_idx"], layout["other_idx"], layout["n_leading"]
-        day_positions, _, day_numbers = nc_utils._select_forecast_days(dim_vals[dim_names[day_idx]], spec, path)
-        days = [int(d) for d in day_numbers]
+        self._day_positions, _, day_numbers = nc_utils._select_forecast_days(dim_vals[dim_names[day_idx]], spec, self.path)
+        self.days = [int(d) for d in day_numbers]
         spatial = [dim_names[i] for i in other_idx[n_leading:]]
         shape = [len(dim_vals[d]) for d in spatial]
         n_points = int(np.prod(shape))
         keep = np.asarray(keep, dtype=bool)
         if keep.shape != (n_points,):
             raise ValueError(f"keep must have one entry per point ({n_points}).")
-        kept = np.flatnonzero(keep)
-        position = np.full(n_points, -1, dtype=np.int64)
-        position[kept] = np.arange(len(kept))
-        points = nc_utils._named_grid(
+        self._kept = kept = np.flatnonzero(keep)
+        self._position = np.full(n_points, -1, dtype=np.int64)
+        self._position[kept] = np.arange(len(kept))
+        self.points = nc_utils._named_grid(
             nc_utils._product_frame(spatial, [dim_vals[d] for d in spatial]), rename, layout["adm3_dim_name"]
         ).take(kept).reset_index(drop=True)
 
-        n_times = len(dim_vals[dim_names[0]])
-        member_dim = other_idx[1] if layout["has_members"] else None
-        n_members = len(dim_vals[dim_names[member_dim]]) if member_dim is not None else 1
-        spread_area = np.zeros(n_points, dtype=bool)
-        if spread_over is not None and member_dim is not None:
-            spread_area[np.asarray(spread_over, dtype=bool)] = True
-        member_spread = False
-        present = None  # members present per (time, point, day), when chunks split the members
+        self._n_times = len(dim_vals[dim_names[0]])
+        self._member_dim = other_idx[1] if layout["has_members"] else None
+        self._n_members = len(dim_vals[dim_names[self._member_dim]]) if self._member_dim is not None else 1
+        self.members = (
+            np.asarray(dim_vals[dim_names[self._member_dim]]).astype(int) if self._member_dim is not None else None
+        )
+        self._spread_area = np.zeros(n_points, dtype=bool)
+        if spread_over is not None and self._member_dim is not None:
+            self._spread_area[np.asarray(spread_over, dtype=bool)] = True
+        self.member_spread = False
+        self._present = None  # members present per (time, point, day), when chunks split the members
 
         chunks = v.chunking()
-        spatial_axes = [dim_names.index(d) for d in spatial]
-        tile_sizes = [int(chunks[a]) for a in spatial_axes] if isinstance(chunks, list) else shape
+        self._spatial_axes = [dim_names.index(d) for d in spatial]
+        tile_sizes = [int(chunks[a]) for a in self._spatial_axes] if isinstance(chunks, list) else shape
         grid_index = np.arange(n_points).reshape(shape)
-        tiles = []
-        for corner in np.ndindex(*[len(_ranges(t, s)) for t, s in zip(tile_sizes, shape)]):
-            bounds = [_ranges(t, s)[c] for t, s, c in zip(tile_sizes, shape, corner)]
-            tiles.append((bounds, grid_index[tuple(slice(a, b) for a, b in bounds)].reshape(-1)))
-
-        rain = None
-        perm = other_idx + [day_idx]
-        for t0, t1, m0, m1 in nc_utils._leading_tiles(v, n_times, n_members, member_dim):
-            for bounds, cells in tiles:
-                kept_here = position[cells] >= 0
-                area_here = spread_area[cells] if not member_spread else np.zeros(len(cells), dtype=bool)
-                if not kept_here.any() and not area_here.any():
-                    continue
-                index = [slice(None)] * len(dim_names)
-                index[0] = slice(t0, t1)
-                if member_dim is not None:
-                    index[member_dim] = slice(m0, m1)
-                for axis, (a, b) in zip(spatial_axes, bounds):
-                    index[axis] = slice(a, b)
-                block = nc_utils._filled_with_nan(v[tuple(index)])
-                block = np.transpose(block, perm)[..., day_positions]
-                block = block.reshape(t1 - t0, m1 - m0, len(cells), len(days))
-                if area_here.any():
-                    counts = (~np.isnan(block[:, :, area_here, :])).sum(axis=1, dtype=np.int32)
-                    if m1 - m0 < n_members:
-                        if present is None:
-                            present = np.zeros((n_times, n_points, len(days)), dtype=np.int32)
-                        present[t0:t1, cells[area_here]] += counts
-                        counts = present[t0:t1, cells[area_here]]
-                    member_spread = bool((counts >= 2).any())
-                if kept_here.any():
-                    part = block[:, :, kept_here, :]
-                    if scale != 1.0:
-                        part = part * scale
-                    if rain is None:
-                        rain = np.empty((n_times, n_members, len(kept), len(days)), dtype=part.dtype)
-                    rain[t0:t1, m0:m1, position[cells[kept_here]], :] = part
-                del block
-        if rain is None:
-            rain = np.empty((n_times, n_members, 0, len(days)), dtype=np.float32)
+        self._tiles = []
+        for corner in np.ndindex(*[len(_ranges(t, size)) for t, size in zip(tile_sizes, shape)]):
+            bounds = [_ranges(t, size)[c] for t, size, c in zip(tile_sizes, shape, corner)]
+            self._tiles.append((bounds, grid_index[tuple(slice(a, b) for a, b in bounds)].reshape(-1)))
+        self._perm = other_idx + [day_idx]
+        self._dim_names = dim_names
         tinfo = nc_utils.get_nc_time(ds)
         stamps = pd.DatetimeIndex(nc_utils.nc_time_to_dates(dim_vals[dim_names[0]], tinfo["units"]))
-        issues = stamps.normalize().to_numpy()
-        members = np.asarray(dim_vals[dim_names[member_dim]]).astype(int) if member_dim is not None else None
-    return ForecastArray(
-        issues=issues, members=members, points=points, days=days, rain=rain, member_spread=member_spread
-    )
+        self.issues = stamps.normalize().to_numpy()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._ds.close()
+
+    def issue_runs(self):
+        """(start, stop, rain) for consecutive runs of issues; rain holds every
+        member: (issue, member, point, day), one member when deterministic."""
+        runs = {}
+        for t0, t1, m0, m1 in nc_utils._leading_tiles(self._v, self._n_times, self._n_members, self._member_dim):
+            runs.setdefault((t0, t1), []).append((m0, m1))
+        for (t0, t1), member_ranges in runs.items():
+            rain = None
+            for m0, m1 in member_ranges:
+                rain = self._read(t0, t1, m0, m1, rain)
+            if rain is None:
+                rain = np.empty((t1 - t0, self._n_members, 0, len(self.days)), dtype=np.float32)
+            yield t0, t1, rain
+
+    def _read(self, t0, t1, m0, m1, rain):
+        for bounds, cells in self._tiles:
+            kept_here = self._position[cells] >= 0
+            area_here = self._spread_area[cells] if not self.member_spread else np.zeros(len(cells), dtype=bool)
+            if not kept_here.any() and not area_here.any():
+                continue
+            index = [slice(None)] * len(self._dim_names)
+            index[0] = slice(t0, t1)
+            if self._member_dim is not None:
+                index[self._member_dim] = slice(m0, m1)
+            for axis, (a, b) in zip(self._spatial_axes, bounds):
+                index[axis] = slice(a, b)
+            block = nc_utils._filled_with_nan(self._v[tuple(index)])
+            block = np.transpose(block, self._perm)[..., self._day_positions]
+            block = block.reshape(t1 - t0, m1 - m0, len(cells), len(self.days))
+            if area_here.any():
+                counts = (~np.isnan(block[:, :, area_here, :])).sum(axis=1, dtype=np.int32)
+                if m1 - m0 < self._n_members:
+                    if self._present is None:
+                        self._present = np.zeros((self._n_times, len(self._spread_area), len(self.days)), dtype=np.int32)
+                    self._present[t0:t1, cells[area_here]] += counts
+                    counts = self._present[t0:t1, cells[area_here]]
+                self.member_spread = bool((counts >= 2).any())
+            if kept_here.any():
+                part = block[:, :, kept_here, :]
+                if self.scale != 1.0:
+                    part = part * self.scale
+                if rain is None:
+                    rain = np.empty((t1 - t0, self._n_members, len(self._kept), len(self.days)), dtype=part.dtype)
+                rain[:, m0:m1, self._position[cells[kept_here]], :] = part
+        return rain
 
 
 @dataclass
