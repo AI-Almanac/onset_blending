@@ -130,6 +130,19 @@ class FittedForest:
         )
 
 
+# A tree-growing worker: its interpreter and compiled kernels, and per
+# training row the node row sets, masks and targets of a tree's deepest path.
+_WORKER_BASE_BYTES = 300 * 2**20
+_WORKER_BYTES_PER_ROW = 96
+
+
+def workers(train_rows: int, workers: int, budget_bytes: int | None) -> int:
+    """Processes to grow trees in: up to `workers`, as many as the budget holds."""
+    from ..core import parallel
+
+    return parallel.workers_within([_WORKER_BASE_BYTES + train_rows * _WORKER_BYTES_PER_ROW], workers, budget_bytes)
+
+
 def fit(X: np.ndarray, onset_lead: np.ndarray, names, params: Params) -> FittedForest:
     """onset_forest.fit on a feature matrix: the target's samples, the columns
     they observe, median-imputed."""

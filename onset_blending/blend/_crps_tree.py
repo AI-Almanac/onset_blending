@@ -6,7 +6,10 @@ itself ported from the science team's notebook
 split search, node-level feature sampling and RNG consumption order are
 unchanged, so a seeded fit grows onset-forest's (and the notebook's) trees
 exactly. Added: a fitted forest as flat arrays (`to_arrays`, `from_arrays`), so
-a trained blend stores it without pickles.
+a trained blend stores it without pickles; and trees grown in worker processes
+rather than threads (each tree has its own seed and bootstrap rows, so they are
+the same trees): the split kernel releases the GIL but the per-node bookkeeping
+does not, and threads used about a fifth of the cores.
 """
 
 from __future__ import annotations
@@ -337,7 +340,8 @@ class CRPSForest:
         self.n_samples_bootstrap_ = self._resolve_bootstrap_size(X.shape[0])
 
         seeds, idxs = self._draw_tree_seeds_and_samples(X.shape[0])
-        self.trees_ = Parallel(n_jobs=self.n_jobs, prefer="threads")(
+        # loky keeps its workers between fits and hands them X as a memory map.
+        self.trees_ = Parallel(n_jobs=self.n_jobs, backend="loky")(
             delayed(_fit_one_tree)(
                 X, y, idxs[i], self.min_samples_leaf, self.max_depth, self.max_features, seeds[i]
             )

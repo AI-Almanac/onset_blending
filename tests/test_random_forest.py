@@ -112,3 +112,23 @@ def test_the_forest_is_onset_forests():
 def test_a_crps_forest_needs_finite_inputs():
     with pytest.raises(ValueError, match="finite"):
         CRPSForest(n_estimators=2).fit(np.array([[np.nan], [1.0]]), np.array([1.0, 2.0]))
+
+
+def test_trees_grown_in_worker_processes_are_the_same_trees():
+    X, lead = samples()
+    names = [f"x{i}" for i in range(6)]
+
+    alone = random_forest.fit(X, lead, names, PARAMS)
+    pooled = random_forest.fit(X, lead, names, random_forest.Params(**{**vars(PARAMS), "n_jobs": 3}))
+
+    assert np.array_equal(random_forest.predict(pooled, X), random_forest.predict(alone, X))
+    (_, trees), (_, again) = alone.forest.to_arrays(), pooled.forest.to_arrays()
+    for name, values in trees.items():
+        np.testing.assert_array_equal(again[name], values)
+
+
+def test_tree_workers_fit_the_memory_budget():
+    assert random_forest.workers(1_000_000, 20, None) == 20
+    per_worker = 300 * 2**20 + 1_000_000 * 96
+    assert random_forest.workers(1_000_000, 20, 4 * per_worker) == 4
+    assert random_forest.workers(1_000_000, 20, 1) == 1

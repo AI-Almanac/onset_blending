@@ -536,8 +536,8 @@ def _forest(ctx: _Context, params: random_forest.Params, inputs: DailyInputs, wo
     run = ctx.run
     weekly = ctx.weekly
     models = inputs.model_names
-    params = replace(params, n_jobs=workers)
     X = random_forest.feature_matrix(weekly, inputs, np.arange(len(weekly)), models)
+    params = replace(params, n_jobs=random_forest.workers(len(X), workers, ctx.budget_bytes))
     names = random_forest.feature_names(inputs, models)
     year = weekly["year"]
     trainable = ctx.unit_allowed[weekly.sample_unit]
