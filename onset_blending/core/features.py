@@ -421,6 +421,55 @@ def _rain_predictors(spec: dict, forecasts: dict[str, ForecastOnsets], r: Rows, 
     return out
 
 
+@dataclass
+class DailyInputs:
+    """What the random forest reads for each weekly sample, in the weekly
+    samples' order: each model's ensemble-mean rainfall by lead day
+    (`rain_<model>` over `<model>_day`), the conditional climatology's onset
+    probability by lead day (`clim_p_onset` over `clim_day`), and the
+    observed onset's lead day after the issue (`onset_lead`, NaN without
+    one). `time` is each sample's issue date, to check the alignment."""
+
+    data: xr.Dataset
+
+    @property
+    def model_names(self) -> list[str]:
+        return [str(name)[len("rain_"):] for name in self.data.data_vars if str(name).startswith("rain_")]
+
+    def rain(self, model: str) -> tuple[np.ndarray, np.ndarray]:
+        """(lead days, rainfall (sample, day))."""
+        variable = self.data[f"rain_{model}"]
+        return variable[f"{model}_day"].values, variable.values
+
+    @property
+    def climatology(self) -> np.ndarray:
+        return self.data["clim_p_onset"].values
+
+    @property
+    def onset_lead(self) -> np.ndarray:
+        return self.data["onset_lead"].values
+
+
+def daily_inputs(config: BlendConfig, climatology: Climatology, observed: ObservedOnsets,
+                 forecasts: dict[str, ForecastOnsets], *, max_day: int, trim: bool | None = None) -> DailyInputs:
+    """The random forest's inputs for the samples `weekly` builds (with the same trim)."""
+    r = rows(config, climatology, observed, forecasts, trim=trim)
+    lead = (r.true_onset - r.times.astype("datetime64[D]")).astype("timedelta64[D]").astype(float)
+    lead[np.isnat(r.true_onset)] = np.nan
+    clim = climatology.at("conditional", r.clim_unit, r.years, r.season_day, leads=slice(1, max_day + 1))
+    variables: dict[str, tuple] = {
+        "time": ("sample", r.times),
+        "onset_lead": ("sample", lead),
+        "clim_p_onset": (("sample", "clim_day"), clim),
+    }
+    coords = {"clim_day": np.arange(1, clim.shape[1] + 1)}
+    for name, onsets in forecasts.items():
+        rain = onsets.data["rain_mean"]
+        variables[f"rain_{name}"] = (("sample", f"{name}_day"), rain.values[r.model_issue[name], r.model_unit[name]])
+        coords[f"{name}_day"] = rain["day"].values
+    return DailyInputs(xr.Dataset(variables, coords=coords))
+
+
 def daily(config: BlendConfig, climatology: Climatology, observed: ObservedOnsets,
           forecasts: dict[str, ForecastOnsets]) -> pd.DataFrame:
     """The legacy day-level table (combined_wide): every climatology joined to

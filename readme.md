@@ -50,6 +50,8 @@ onset_blending/
     parallel.py      worker pools, shared memory
   blend/           blending methods
     logit.py         the multinomial logistic blend
+    random_forest.py the CRPS random forest (daily probabilities too)
+    _crps_tree.py    its trees (from onset-forest)
   evaluation.py    cross-validation, baselines, scores
   training.py      train(config)
   trained.py       TrainedBlend: what operations applies

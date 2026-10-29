@@ -220,17 +220,19 @@ def _npz_load(data: bytes):
 @dataclass
 class TrainedBlend:
     config: BlendConfig                 # the recipe, derived defaults frozen
-    model: object                       # model.FittedModel
+    model: object                       # blend.logit.FittedModel
     observed: ObservedOnsets            # what the climatology is fitted on
     units: tuple[str, ...]              # the units the blend was trained and scores on
     signatures: dict[str, dict]         # model name -> forecast signature
     reference: Reference                # thresholds, reference onsets, regrid and cell weights
     provenance: dict = field(default_factory=dict)
+    forest: object = None               # blend.random_forest.FittedForest, when configured
 
     # -- building -----------------------------------------------------------
 
     @classmethod
-    def from_training(cls, config: BlendConfig, inputs, model, *, provenance: dict | None = None) -> "TrainedBlend":
+    def from_training(cls, config: BlendConfig, inputs, model, *, forest=None,
+                      provenance: dict | None = None) -> "TrainedBlend":
         """The blend a training run produced (inputs: training.Inputs)."""
 
         climatology = inputs.climatology
@@ -268,6 +270,7 @@ class TrainedBlend:
                 "training_years": list(config.evaluation.years.training),
                 **(provenance or {}),
             },
+            forest=forest,
         )
 
     # -- files --------------------------------------------------------------
@@ -281,6 +284,10 @@ class TrainedBlend:
         model_meta, model_arrays = self.model.to_arrays()
         members["model.json"] = json.dumps(model_meta, indent=1).encode()
         members["model.npz"] = _npz_bytes(model_arrays)
+        if self.forest is not None:
+            forest_meta, forest_arrays = self.forest.to_arrays()
+            members["forest.json"] = json.dumps(forest_meta, indent=1).encode()
+            members["forest.npz"] = _npz_bytes(forest_arrays)
         observed = self.observed.data
         members["observed.npz"] = _npz_bytes({
             "unit": observed["unit"].values.astype(str),
@@ -348,6 +355,11 @@ class TrainedBlend:
             season_start=config.onset.season_start,
         )
         model = FittedModel.from_arrays(json.loads(members["model.json"]), dict(_npz_load(members["model.npz"])))
+        forest = None
+        if "forest.json" in members:
+            from .blend.random_forest import FittedForest
+
+            forest = FittedForest.from_arrays(json.loads(members["forest.json"]), dict(_npz_load(members["forest.npz"])))
         return cls(
             config=config,
             model=model,
@@ -356,6 +368,7 @@ class TrainedBlend:
             signatures=json.loads(members["signatures.json"]),
             reference=Reference.from_arrays(json.loads(members["reference.json"]), _npz_load(members["reference.npz"])),
             provenance=manifest.get("provenance", {}),
+            forest=forest,
         )
 
     # -- operations -----------------------------------------------------------

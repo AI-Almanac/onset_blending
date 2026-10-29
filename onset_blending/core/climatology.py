@@ -50,10 +50,11 @@ class Climatology:
         self.data = None
         self.windows = {}
 
-    def at(self, name: str, unit, year, season_day) -> np.ndarray:
+    def at(self, name: str, unit, year, season_day, leads: slice | None = None) -> np.ndarray:
         """Probabilities (rows, lead) for rows given as unit positions, years
-        and season days."""
-        return _gather(self.data[name], unit, year, season_day)
+        and season days; leads selects lead days (positions) when given."""
+        array = self.data[name] if leads is None else self.data[name].isel(lead=leads)
+        return _gather(array, unit, year, season_day)
 
     def legacy_tables(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         """The (conditional, unconditional) tables the legacy pipeline wrote."""

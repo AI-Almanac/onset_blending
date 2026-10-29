@@ -150,7 +150,8 @@ onset_blending/
     parallel.py      worker pools, shared memory
   blend/             blending methods behind one interface
     logit.py         the multinomial logistic blend; global CV + final fit
-    random_forest.py the CRPS random forest (next: from onset-forest)
+    random_forest.py the CRPS random forest over daily rain and the climatology
+    _crps_tree.py    its trees, from onset-forest (same numerics, stored as arrays)
   evaluation.py      cross-validation, baselines, calibration, scores
   training.py        train(config) -> TrainingResult, holding a TrainedBlend
   trained.py         TrainedBlend: recipe + fitted model + reference data
@@ -293,6 +294,20 @@ today also re-supplies parameters from the job record, and the
 weekly-feature settings fall back to code defaults (day_max, days_per_week,
 n_weeks, rain_window). Those match training only because training never
 overrides them.
+
+**The random forest blend.** `evaluation.random_forest` adds the CRPS random
+forest (`blend.random_forest`, from onset-forest) beside the logistic blend.
+It reads, per weekly sample, the unit's lat/lon, each model's ensemble-mean
+rainfall for every lead day and the conditional climatology for lead days
+1..max_day (`features.daily_inputs`, from the stage arrays: no day-level
+table), learns the onset's lead day, and predicts daily probabilities whose
+week sums are scored with the other models. Its folds are the true holdouts,
+then blocks of CV years; each trains on every sample of the dissemination
+cells in its training years and predicts the samples the formulas score.
+The final forest is stored in the trained blend as arrays, and a forecast
+then also gives daily probabilities. On Ethiopia, with the same parameters,
+its feature columns, medians and daily and weekly probabilities equal
+onset-forest's on the workflow's forest frame exactly.
 
 **Dates of observations and forecasts.** Forecast lead day d is the UTC day
 ending at issue + d (the archives declare it; the reforecast inference sums the

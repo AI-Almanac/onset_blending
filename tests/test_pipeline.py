@@ -91,6 +91,34 @@ def region(tmp_path_factory):
     return root, config, result
 
 
+@pytest.fixture(scope="module")
+def forest_region(region):
+    root, config, _ = region
+    data = config.to_dict()
+    data["evaluation"]["random_forest"] = {"trees": 5, "min_samples_leaf": 5}
+    forest_config = BlendConfig.from_dict({**data, "data_root": str(root)})
+    return root, forest_config, train(forest_config, resources=Resources(workers=1, budget_bytes=None))
+
+
+def test_the_random_forest_blend_is_scored_and_forecasts_by_day(forest_region, tmp_path):
+    root, _, result = forest_region
+    pooled = result.evaluation.pooled.set_index("model")
+    assert {"blended_model", "blended_forest"} <= set(pooled.index)
+    preds = result.evaluation.cv_preds[("blended_forest", "global")]
+    assert np.allclose(preds.filter(like="cv_").sum(axis=1), 1.0)
+
+    blend = TrainedBlend.load(result.save(tmp_path / "trained") / "trained.blend")
+    forecast = blend.forecast({"ens": root / "ens" / "2013.nc"})
+
+    daily = forecast.daily
+    assert list(daily.columns[:4]) == ["id", "time", "lat", "lon"]
+    days = [f"p_day_{d}" for d in range(1, 29)] + ["p_later"]
+    assert np.allclose(daily[days].sum(axis=1), 1.0)
+    assert np.allclose(daily["cv_week1"], daily[[f"p_day_{d}" for d in range(1, 8)]].sum(axis=1))
+    saved = forecast.save(tmp_path / "forecast")
+    assert (saved / "daily_onset_probabilities.csv").exists()
+
+
 def test_training_scores_the_blend_against_climatology(region):
     _, _, result = region
     pooled = result.evaluation.pooled.set_index("model")

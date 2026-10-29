@@ -15,7 +15,7 @@ import pandas as pd
 from .core import climatology as climatology_stage, features, onsets, parallel
 from .core.climatology import Climatology
 from .config import BlendConfig
-from .core.features import Weekly
+from .core.features import DailyInputs, Weekly
 from .core.onsets import ForecastOnsets, ObservedOnsets
 from .core.reference import Reference
 
@@ -45,6 +45,7 @@ class Inputs:
     weekly: Weekly
     combined: pd.DataFrame | None = None   # the day-level table, only when asked for
     timings: dict[str, float] = field(default_factory=dict)
+    forest_inputs: DailyInputs | None = None   # the random forest blend's, when it is configured
 
 
 STAGE_TABLES = ("observed", "forecasts", "climatology", "weekly")
@@ -99,6 +100,13 @@ def prepare(
     started = time.perf_counter()
     weekly = features.weekly(config, climatology, observed, forecasts)
     lap("weekly features", started)
+    forest_inputs = None
+    if config.evaluation.random_forest is not None:
+        started = time.perf_counter()
+        forest_inputs = features.daily_inputs(
+            config, climatology, observed, forecasts, max_day=config.evaluation.random_forest.max_day
+        )
+        lap("random forest inputs", started)
     combined = None
     if daily:
         started = time.perf_counter()
@@ -117,6 +125,7 @@ def prepare(
         weekly=weekly,
         combined=combined,
         timings=timings,
+        forest_inputs=forest_inputs,
     )
 
 
@@ -178,6 +187,7 @@ def train(config: BlendConfig, *, resources: Resources | None = None, daily: boo
     builds the day-level table (for export or day-level models)."""
     from .core import _specs
     from .trained import TrainedBlend
+    from .blend import random_forest
     from .evaluation import evaluate
 
     resources = resources or Resources.default()
@@ -187,13 +197,16 @@ def train(config: BlendConfig, *, resources: Resources | None = None, daily: boo
 
     # The final fit runs alongside the global CV folds, on their design matrix.
     started = time.perf_counter()
+    forest = config.evaluation.random_forest
     evaluation = evaluate(
         inputs.weekly, cv_spec, dissemination, workers=resources.workers,
         budget_bytes=_budget_now(resources), final_model=config.final_formula(),
+        forest=None if forest is None else random_forest.Params.from_config(forest, config.features.bins.days),
+        forest_inputs=inputs.forest_inputs,
     )
     inputs.timings["evaluation and final fit"] = time.perf_counter() - started
     log.info("evaluation and final fit in %.1fs", inputs.timings["evaluation and final fit"])
-    blend = TrainedBlend.from_training(config, inputs, evaluation.final_model)
+    blend = TrainedBlend.from_training(config, inputs, evaluation.final_model, forest=evaluation.final_forest)
     return TrainingResult(config=config, inputs=inputs, evaluation=evaluation, blend=blend)
 
 

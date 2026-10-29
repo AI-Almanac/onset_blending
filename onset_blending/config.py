@@ -503,6 +503,25 @@ class MmeSource:
 
 
 @dataclass(frozen=True, kw_only=True)
+class RandomForest:
+    """The CRPS random forest blend (blend.random_forest): daily onset
+    probabilities from each model's daily rainfall and the climatology."""
+
+    name: str = _field("blended_forest", doc="Its name in the scores.")
+    trees: int = _field(100, doc="Trees in the forest.")
+    min_samples_leaf: int = _field(20, doc="Fewest training samples a leaf may hold.")
+    max_depth: int | None = _field(None, doc="Deepest a tree may grow; unset for no limit.")
+    max_samples: float = _field(1.0, doc="Share of the training samples each tree's bootstrap draws.")
+    max_features: Literal["sqrt", "all"] = _field("sqrt", doc="Features tried at each split: the square root of their number, or all.")
+    random_state: int = _field(123, doc="Seed; CV fold i uses random_state + i + 1.")
+    max_day: int = _field(28, doc="Lead days with their own probability (the week bins' days); later ones pool.")
+    missing_onset: Literal["after_week4", "drop"] = _field(
+        "after_week4", doc="Seasons without an onset: a lead day past max_day, or left out."
+    )
+    years_per_fold: int = _field(1, doc="CV holdout years held out together per fold, in contiguous blocks.")
+
+
+@dataclass(frozen=True, kw_only=True)
 class Mme:
     """A multi-model ensemble with RPS-optimised weights."""
 
@@ -539,6 +558,7 @@ class Evaluation:
     )
     mme: Mme = _field(factory=Mme)
     external_predictions: tuple[ExternalPrediction, ...] = _field(factory=tuple)
+    random_forest: RandomForest | None = _field(None, doc="Also blend with the CRPS random forest.")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -735,6 +755,17 @@ class BlendConfig:
             problems.append("evaluation.years: no cv_holdout or true_holdout years to score")
         if evaluation.cutoff_mode == "ref_onset" and self.onset.reference_onset is None:
             problems.append("evaluation.cutoff_mode 'ref_onset' needs onset.reference_onset")
+        forest = evaluation.random_forest
+        if forest is not None:
+            bins = self.features.bins
+            if forest.max_day != bins.count * bins.days:
+                problems.append(
+                    f"evaluation.random_forest.max_day must span the week bins ({bins.count} x {bins.days} days)"
+                )
+            if forest.trees < 1 or forest.min_samples_leaf < 1 or forest.years_per_fold < 1:
+                problems.append("evaluation.random_forest: trees, min_samples_leaf and years_per_fold must be at least 1")
+            if not 0.0 < forest.max_samples <= 1.0:
+                problems.append("evaluation.random_forest.max_samples must be in (0, 1]")
         enabled = {name: f for name, f in evaluation.formulas.items() if f.enabled}
         if not enabled:
             problems.append("evaluation.formulas: at least one enabled formula is required")

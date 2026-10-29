@@ -29,6 +29,7 @@ from .trained import issue_dates
 from .config import FileSet
 
 WEEKLY_FILENAME = "blended_forecast_probabilities.csv"
+DAILY_FILENAME = "daily_onset_probabilities.csv"
 
 
 class IncompatibleForecast(ValueError):
@@ -45,6 +46,9 @@ class Forecast:
 
     weekly: pd.DataFrame        # id, time, onset_threshold, lat, lon, cv_week1..N, cv_later, clim_*
     features: pd.DataFrame      # the weekly feature rows the probabilities come from
+    # The random forest blend's, when the blend has one: id, time, lat, lon,
+    # p_day_1..D, p_later and their week bins cv_week1..N, cv_later.
+    daily: pd.DataFrame | None = None
 
     def save(self, directory: str | Path) -> Path:
         """Write the forecast's files into a new directory, all or nothing."""
@@ -55,6 +59,8 @@ class Forecast:
         staging = Path(tempfile.mkdtemp(prefix=f".{directory.name}.", dir=directory.parent))
         try:
             self.weekly.to_csv(staging / WEEKLY_FILENAME, index=False)
+            if self.daily is not None:
+                self.daily.to_csv(staging / DAILY_FILENAME, index=False)
             if directory.exists():
                 directory.rmdir()
             os.replace(staging, directory)
@@ -167,12 +173,40 @@ def run(blend, forecasts: dict, *, issue_date=None, resources=None) -> Forecast:
     rows = np.arange(len(weekly))
     if issue_date is not None:
         rows = rows[weekly["time"].astype("datetime64[D]") == np.datetime64(issue_date, "D")]
+    issue_rows = rows
     for column in _input_columns(blend.model, weekly):
         rows = rows[pd.notna(weekly.take(column, rows))]
     if not len(rows):
         raise IncompatibleForecast(["no unit and issue date has every feature the blend needs"])
     table = weekly.frame(rows)
-    return Forecast(weekly=_probabilities(blend, table), features=table)
+    daily = None
+    if blend.forest is not None:
+        # Every sample of the issue dates: the forest imputes missing inputs.
+        daily = _daily(blend, config, climatology, model_onsets, weekly, issue_rows)
+    return Forecast(weekly=_probabilities(blend, table), features=table, daily=daily)
+
+
+def _daily(blend, config, climatology, model_onsets, weekly, rows) -> pd.DataFrame:
+    """The random forest blend's daily and weekly probabilities for `rows`."""
+    from .blend import random_forest
+
+    fitted = blend.forest
+    inputs = features.daily_inputs(
+        config, climatology, blend.observed, model_onsets, max_day=fitted.params.max_day, trim=False
+    )
+    models = list(config.model_names)
+    names = random_forest.feature_names(inputs, models)
+    if [names[i] if i < len(names) else None for i in fitted.columns] != list(fitted.features):
+        raise IncompatibleForecast(["the live forecasts do not give the random forest's trained inputs"])
+    probabilities = random_forest.predict(fitted, random_forest.feature_matrix(weekly, inputs, rows, models))
+    out = weekly.frame(rows, ["id", "time", "lat", "lon"])
+    for day in range(probabilities.shape[1] - 1):
+        out[f"p_day_{day + 1}"] = probabilities[:, day]
+    out["p_later"] = probabilities[:, -1]
+    weeks = random_forest.weekly_from_daily(probabilities, fitted.params.days_per_week)
+    for week, label in enumerate(cfg.outcome_labels(blend.config)):
+        out[f"cv_{label}"] = weeks[:, week]
+    return out
 
 
 def _input_columns(model, weekly: features.Weekly) -> list[str]:

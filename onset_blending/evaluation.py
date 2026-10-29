@@ -28,13 +28,13 @@ import os
 import pickle
 import re
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from .blend import logit
+from .blend import logit, random_forest
 from .core import design
 from ._legacy.blend_evaluation_utils import (
     _present_weeks,
@@ -72,7 +72,7 @@ from ._legacy.spatial_id_utils import (
     resolve_grid_id_convention,
     validate_id_coordinate_consistency,
 )
-from .core.features import Weekly
+from .core.features import DailyInputs, Weekly
 
 __all__ = ["Evaluation", "RunSettings", "evaluate", "prepare_inputs", "sample_support"]
 
@@ -206,6 +206,7 @@ class Evaluation:
     platt_weights: dict[str, pd.DataFrame] = field(default_factory=dict)  # file stem -> weights
     mme_weights: dict[str, pd.DataFrame] = field(default_factory=dict)  # file stem -> weights
     final_model: object = None  # blend.logit.FittedModel, when evaluate() was asked for it (not saved here)
+    final_forest: object = None  # blend.random_forest.FittedForest, likewise
 
     def save(self, directory: str | os.PathLike) -> list[Path]:
         """Write the script's files into `directory`; returns the paths written."""
@@ -254,6 +255,8 @@ def evaluate(
     results_dir: str | os.PathLike | None = None,
     budget_bytes: int | None = None,
     final_model: str | None = None,
+    forest: random_forest.Params | None = None,
+    forest_inputs: DailyInputs | None = None,
 ) -> Evaluation:
     """Cross-validate the spec's formulas and score its baselines on `weekly`
     (a `features.Weekly`, or the legacy table).
@@ -265,8 +268,12 @@ def evaluate(
     `results_dir` is where the script read files from: relative
     `extras.external_predictions` files and, when MME weights are not
     optimised, the saved weights. `final_model` names a formula to also fit
-    on every training year (`model.fit_final`), into `final_model` of the
-    result: alongside the global CV folds, on their design matrix.
+    on every training year (`fit_final`), into `final_model` of the
+    result: alongside the global CV folds, on their design matrix. `forest`
+    (random_forest.Params) also cross-validates the random forest blend on
+    `forest_inputs` (features.daily_inputs, for these weekly samples) and
+    scores it with the rest; with final_model, its final fit goes into
+    `final_forest`.
 
     Formula and CV errors raise; climatology, forecast and MME source
     problems warn and skip that model, as the script does.
@@ -299,6 +306,10 @@ def evaluate(
         chosen_final_rows = final_rows(weekly, rows, cells, run, n_bins)
     scores = _Scores(cells, n_bins)
     _cross_validate(ctx, formulas, cv_methods, workers, result, scores, final_model)
+    if forest is not None:
+        if forest_inputs is None:
+            raise ValueError("the random forest blend needs its inputs (features.daily_inputs)")
+        _forest(ctx, forest, forest_inputs, workers, result, scores, with_final=final_model is not None)
     if final_model is not None and result.final_model is None:
         log.info("\nFitting %s on all %d training years...", final_model, len(run.fit_years))
         result.final_model = logit.fit_samples(formulas[final_model], weekly, chosen_final_rows)
@@ -603,6 +614,52 @@ def _global_cv(ctx, plan, workers, with_final):
         logit.log_fit(used, total, clf.classes_, plan.columns)
         fitted = logit.FittedModel.from_estimators(plan.formula, plan.columns, clf, scaler)
     return preds, coefs_by_year, fitted
+
+
+def _forest(ctx, forest: random_forest.Params, inputs: DailyInputs, workers: int, result, scores, *,
+            with_final: bool) -> None:
+    """The random forest blend: out-of-fold weekly probabilities for the
+    samples the formulas score, from forests fitted on every sample of the
+    dissemination cells in each fold's training years; then the final fit."""
+    run = ctx.run
+    weekly = ctx.weekly
+    models = inputs.model_names
+    params = replace(forest, n_jobs=workers)
+    every = np.arange(len(weekly))
+    X = random_forest.feature_matrix(weekly, inputs, every, models)
+    names = random_forest.feature_names(inputs, models)
+    year = weekly["year"]
+    trainable = in_cells(weekly, ctx.cells)
+    scoreable = np.zeros(len(weekly), dtype=bool)
+    scoreable[ctx.rows] = True
+    true_holdouts = set(run.true_holdout_years)
+    fold_years = random_forest.folds(
+        run.training_years,
+        [y for y in run.holdout_years if y not in true_holdouts],
+        run.true_holdout_years,
+        params.years_per_fold,
+    )
+    log.info("\nCV: %s (%d folds)", params.name, len(fold_years))
+    folds = random_forest.cross_validate(X, inputs.onset_lead, names, year, trainable, scoreable, fold_years, params)
+    keys = _keys(weekly)
+    bins = interval_bins(ctx.n_bins)
+    parts = []
+    for test, daily in folds:
+        frame = weekly.frame(test, keys)
+        weekly_probs = random_forest.weekly_from_daily(daily, params.days_per_week)
+        for j, label in enumerate(bins):
+            frame[f"cv_{label}"] = weekly_probs[:, j]
+        for d in range(daily.shape[1] - 1):
+            frame[f"p_day_{d + 1}"] = daily[:, d]
+        frame["p_later"] = daily[:, -1]
+        parts.append(frame)
+    preds = pd.concat(parts, ignore_index=True)
+    scores.add_model(preds, params.name, "global")
+    result.cv_preds[(params.name, "global")] = preds
+    if with_final:
+        train = np.flatnonzero(trainable & np.isin(year, run.fit_years))
+        log.info("\nFitting %s on all %d training years...", params.name, len(run.fit_years))
+        result.final_forest = random_forest.fit(X[train], inputs.onset_lead[train], names, params)
 
 
 def _climatology_baselines(ctx, scores):
