@@ -19,8 +19,8 @@ import pandas as pd
 import xarray as xr
 
 from . import _specs
-from ._legacy import combine_forecasts_utils as combine_utils
-from ._legacy.connect_utils import (
+from .._legacy import combine_forecasts_utils as combine_utils
+from .._legacy.connect_utils import (
     logit_winsor,
     make_rain_transform,
     resolve_onset_window_map,
@@ -30,9 +30,9 @@ from ._legacy.connect_utils import (
     weekly_from_daylevel,
     _resolve_window,
 )
-from ._legacy.rain_horizon_utils import resolve_rain_day_max, valid_week_start_days
+from .._legacy.rain_horizon_utils import resolve_rain_day_max, valid_week_start_days
 from .climatology import Climatology
-from .config import BlendConfig
+from ..config import BlendConfig
 from .onsets import ForecastOnsets, ObservedOnsets
 
 _CHUNK_ROWS = 1_000_000

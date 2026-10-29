@@ -12,8 +12,8 @@ import argparse
 import logging
 import sys
 
-from . import legacy_specs
-from .blend import TrainedBlend
+from .legacy import specs as legacy_specs
+from .trained import TrainedBlend
 from .config import BlendConfig, ConfigError
 from .forecast import IncompatibleForecast
 from .training import Resources, train

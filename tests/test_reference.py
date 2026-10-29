@@ -5,7 +5,7 @@ import io
 import numpy as np
 import pandas as pd
 
-from onset_blending.reference import Reference
+from onset_blending.core.reference import Reference
 
 
 def round_trip(reference: Reference) -> Reference:

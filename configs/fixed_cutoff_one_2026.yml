@@ -41,7 +41,7 @@
 #   - cv_models: models.window_variants[0] (disabled)
 #   - cv_models: mme.mc_cores (no code reads it)
 name: fixed_cutoff_one_2026
-data_root: ..
+data_root: ../archive
 domain:
   dissemination:
     file: Monsoon_Data/dissemination_cells.csv

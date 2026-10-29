@@ -7,8 +7,9 @@ import pandas as pd
 import pytest
 import xarray as xr
 
-from onset_blending import BlendConfig, onsets, readers
-from onset_blending.blend import TrainedBlend
+from onset_blending import BlendConfig
+from onset_blending.core import io as readers, onsets
+from onset_blending.trained import TrainedBlend
 from onset_blending.config import FileSet
 from onset_blending import forecast as forecast_module
 from onset_blending.forecast import IncompatibleForecast

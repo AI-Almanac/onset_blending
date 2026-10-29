@@ -41,7 +41,7 @@
 #   - cv_models: extras.forecasts[0].fair_brier (no code reads it)
 #   - cv_models: mme.mc_cores (no code reads it)
 name: fixed_cutoff_2026_ngcm
-data_root: ..
+data_root: ../archive
 domain:
   dissemination:
     file: Monsoon_Data/dissemination_cells.csv

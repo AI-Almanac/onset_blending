@@ -33,9 +33,9 @@ import pandas as pd
 import xarray as xr
 import yaml
 
-from . import formats
-from .onsets import ObservedOnsets
-from .reference import Reference
+from .core import io as core_io
+from .core.onsets import ObservedOnsets
+from .core.reference import Reference
 from .config import BlendConfig, ConfigError, ForecastModel
 
 # Bump whenever the numbers the features are computed from change: a blend
@@ -63,7 +63,7 @@ def forecast_signature(path: str | Path, model: ForecastModel, *, selected: bool
     with netCDF4.Dataset(path) as ds:
         if model.variable not in ds.variables:
             raise ValueError(f"{Path(path).name} has no {model.variable!r} variable")
-        fmt = formats.forecast_format(ds, model.variable, model.dims, model.unit_scale, where=Path(path).name)
+        fmt = core_io.forecast_format(ds, model.variable, model.dims, model.unit_scale, where=Path(path).name)
         variable = ds.variables[model.variable]
         names = {d: fmt.rename.get(d, d) for d in variable.dimensions}
 
@@ -111,7 +111,7 @@ def issue_dates(path: str | Path, model: ForecastModel) -> list[dt.date]:
     with netCDF4.Dataset(path) as ds:
         if model.variable not in ds.variables:
             return []
-        rename = formats.forecast_format(ds, model.variable, model.dims, model.unit_scale, where=Path(path).name).rename
+        rename = core_io.forecast_format(ds, model.variable, model.dims, model.unit_scale, where=Path(path).name).rename
         for dim in ds.variables[model.variable].dimensions:
             if rename.get(dim) == "time" and dim in ds.variables:
                 times = ds.variables[dim]
@@ -232,7 +232,6 @@ class TrainedBlend:
     @classmethod
     def from_training(cls, config: BlendConfig, inputs, model, *, provenance: dict | None = None) -> "TrainedBlend":
         """The blend a training run produced (inputs: training.Inputs)."""
-        from . import inputs as input_files
 
         climatology = inputs.climatology
         resolved = dataclasses.replace(
@@ -243,7 +242,7 @@ class TrainedBlend:
         )
         signatures, problems = {}, []
         for model_config in config.models:
-            files = input_files.list_files(model_config.files, config, f"model {model_config.name}")
+            files = core_io.list_files(model_config.files, config, f"model {model_config.name}")
             seen = {}
             for path in files:
                 seen.setdefault(json.dumps(forecast_signature(path, model_config), sort_keys=True), []).append(path.name)
@@ -324,7 +323,7 @@ class TrainedBlend:
     @classmethod
     def load(cls, path: str | Path) -> "TrainedBlend":
         """Read a saved blend; refuses a damaged file or other feature numerics."""
-        from .model import FittedModel
+        from .blend.logit import FittedModel
 
         with zipfile.ZipFile(path) as archive:
             manifest = json.loads(archive.read(_MANIFEST))

@@ -16,9 +16,9 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from . import _parallel
-from ._legacy import climatology_utils as clim_utils
-from .config import BlendConfig
+from . import parallel
+from .._legacy import climatology_utils as clim_utils
+from ..config import BlendConfig
 
 # Units per process task: enough to amortise a task, few enough to spread.
 _UNITS_PER_TASK = 200
@@ -188,7 +188,7 @@ def _probabilities(onsets: pd.DataFrame, grid: pd.DataFrame, by_year: bool, max_
         )
         for start in range(0, len(per_unit), _UNITS_PER_TASK)
     ]
-    results = _parallel.map_ordered(_climatology_task, tasks, context, workers)
+    results = parallel.map_ordered(_climatology_task, tasks, context, workers)
     conditional = np.concatenate([r[0] for r in results])
     unconditional = np.concatenate([r[1] for r in results])
 

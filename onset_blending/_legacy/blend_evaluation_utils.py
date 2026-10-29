@@ -594,7 +594,7 @@ def platt_cv_multibin(df, prob_cols, holdout_years, true_holdout_years=(),
     if executor is None:
         folds = [_platt_fold(arrays, test_year) for test_year in holdout_years]
     else:
-        from .._parallel import SharedArrays
+        from ..core.parallel import SharedArrays
 
         with SharedArrays(**arrays) as shared:
             futures = [executor.submit(_platt_fold, shared.specs, test_year) for test_year in holdout_years]
@@ -630,7 +630,7 @@ def _platt_fold(arrays, test_year):
     from threadpoolctl import threadpool_limits
 
     if not isinstance(arrays["p"], np.ndarray):
-        from .._parallel import attach, detach
+        from ..core.parallel import attach, detach
 
         specs = arrays
         try:

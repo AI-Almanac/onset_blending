@@ -12,12 +12,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import _parallel, climatology as climatology_stage, features, onsets
-from .climatology import Climatology
+from .core import climatology as climatology_stage, features, onsets, parallel
+from .core.climatology import Climatology
 from .config import BlendConfig
-from .features import Weekly
-from .onsets import ForecastOnsets, ObservedOnsets
-from .reference import Reference
+from .core.features import Weekly
+from .core.onsets import ForecastOnsets, ObservedOnsets
+from .core.reference import Reference
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class Resources:
 
     @classmethod
     def default(cls) -> "Resources":
-        return cls(*_parallel.default_resources())
+        return cls(*parallel.default_resources())
 
 
 @dataclass
@@ -176,8 +176,8 @@ def train(config: BlendConfig, *, resources: Resources | None = None, daily: boo
     """Every stage of a blend, in memory: inputs, cross-validated evaluation,
     and the operational model fitted on every training year. daily also
     builds the day-level table (for export or day-level models)."""
-    from . import _specs
-    from .blend import TrainedBlend
+    from .core import _specs
+    from .trained import TrainedBlend
     from .evaluation import evaluate
 
     resources = resources or Resources.default()
@@ -200,5 +200,5 @@ def train(config: BlendConfig, *, resources: Resources | None = None, daily: boo
 def _budget_now(resources: Resources) -> int | None:
     """The memory budget, within half of what is available now that the
     stage arrays exist."""
-    budgets = [b for b in (resources.budget_bytes, _parallel.default_resources()[1]) if b is not None]
+    budgets = [b for b in (resources.budget_bytes, parallel.default_resources()[1]) if b is not None]
     return min(budgets) if budgets else None

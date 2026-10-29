@@ -7,8 +7,8 @@ differently from another. Phase 3 replaces the functions and this module.
 
 from __future__ import annotations
 
-from . import config as cfg
-from .config import BlendConfig, ForecastModel
+from .. import config as cfg
+from ..config import BlendConfig, ForecastModel
 
 # Dimension names the readers know, mapped to theirs; the config's renames win.
 _OBSERVATION_DIMS = {

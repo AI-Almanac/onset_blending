@@ -1,20 +1,166 @@
-"""Reading rainfall NetCDF files into arrays.
+"""NetCDF input: a config's files, each file's format, and its rainfall as arrays.
 
-Values come out as the legacy table readers produce them (same dtype, NaN
-for masked values, the same scaling), but as arrays over the file's
-dimensions rather than one table row per value, and a forecast is read only
-in the storage chunks that hold a kept point.
+Files: the files a FileSet names, in year order.
+
+Formats: the files of one model need not be laid out alike. The archives a
+blend trains on and the live files it forecasts from may name their
+dimensions differently and store rainfall in other units, so each file's
+format is resolved when it is read, by the rules ai-almanac registers
+datasets by:
+
+- a dimension's role (time, day, number, lat, lon, adm3_name) comes from
+  the model's configured `dims`, else its name (case-insensitive aliases),
+  else its coordinate (a lead dimension counted in days);
+- rainfall is converted to millimetres from the variable's declared
+  `units`; the model's `unit_scale` applies only to files declaring none.
+
+Everything downstream, the forecast signature included, sees the resolved
+dimension names and millimetres.
+
+Reading: values come out as the legacy table readers produce them (same
+dtype, NaN for masked values, the same scaling), but as arrays over the
+file's dimensions rather than one table row per value, and a forecast is
+read only in the storage chunks that hold a kept point.
 """
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from ._legacy import nc_utils
+from .._legacy import nc_utils
+from ..config import BlendConfig, FileSet
 
+# ---------------------------------------------------------------------------
+# Files
+# ---------------------------------------------------------------------------
+
+_YEAR = re.compile(r"(19|20)\d{2}")
+
+
+def file_year(path: str | Path) -> int | None:
+    """The season a file holds: the first 19xx/20xx in its name."""
+    match = _YEAR.search(Path(path).name)
+    return int(match.group()) if match else None
+
+
+def list_files(files: FileSet, config: BlendConfig, what: str) -> list[Path]:
+    """The files a FileSet names, in year order."""
+    if files.paths:
+        paths = [config.path(p) for p in files.paths]
+        missing = [str(p) for p in paths if not p.is_file()]
+        if missing:
+            raise FileNotFoundError(f"{what}: missing files: {', '.join(missing)}")
+    else:
+        folder = config.path(files.folder)
+        if not folder.is_dir():
+            raise FileNotFoundError(f"{what}: {folder} is not a directory")
+        pattern = re.compile(files.pattern)
+        paths = [p for p in folder.iterdir() if p.is_file() and pattern.search(p.name)]
+    if files.years:
+        wanted = set(files.years)
+        paths = [p for p in paths if file_year(p) in wanted]
+    if not paths:
+        raise FileNotFoundError(f"{what}: no files match {files}")
+    return sorted(paths, key=lambda p: (file_year(p) or 0, str(p)))
+
+
+# ---------------------------------------------------------------------------
+# Formats
+# ---------------------------------------------------------------------------
+
+# Millimetres per unit of a rainfall total's declared (CF) units.
+MILLIMETRES_PER_UNIT = {
+    "m": 1000.0,
+    "metres": 1000.0,
+    "meters": 1000.0,
+    "m/day": 1000.0,
+    "mm": 1.0,
+    "mm/day": 1.0,
+    "mm day-1": 1.0,
+    "mm d-1": 1.0,
+    "kg m-2": 1.0,
+    "kg m**-2": 1.0,
+    "kg/m2": 1.0,
+}
+
+# Dimension names by role, lower case.
+_ALIASES = {
+    "time": "time", "init_time": "time", "initial_time": "time", "forecast_reference_time": "time",
+    "day": "day", "lead_day": "day", "lead_days": "day", "prediction_timedelta_daily": "day",
+    "number": "number", "member": "number", "members": "number", "ensemble": "number",
+    "ensemble_member": "number", "realization": "number", "sample": "number",
+    "lat": "lat", "latitude": "lat",
+    "lon": "lon", "longitude": "lon",
+    "adm3": "adm3_name", "adm3_name": "adm3_name",
+}
+_DAY_UNITS = ("day", "days")
+
+
+@dataclass(frozen=True)
+class ForecastFormat:
+    """How one file is read: its dimensions' roles and its rainfall scale."""
+
+    rename: dict[str, str]   # file dimension -> role, for every dimension with one
+    scale: float             # multiplies the file's rainfall into millimetres
+    declared_units: str | None
+
+    @property
+    def units(self) -> str:
+        """The rainfall units the blend reads: millimetres, or how they were taken."""
+        return "mm" if self.declared_units is not None else f"undeclared (x{self.scale:g})"
+
+
+def forecast_format(ds, variable: str, dims: Mapping[str, str], unit_scale: float, where="") -> ForecastFormat:
+    """The format of an open netCDF4 Dataset's forecast variable."""
+    if variable not in ds.variables:
+        raise ValueError(f"{where}: no {variable!r} variable")
+    var = ds.variables[variable]
+    configured = {str(k).lower(): v for k, v in dims.items()}
+    rename: dict[str, str] = {}
+    for dim in var.dimensions:
+        role = configured.get(dim.lower()) or _ALIASES.get(dim.lower())
+        if role is None and dim in ds.variables:
+            units = str(getattr(ds.variables[dim], "units", "")).strip().lower()
+            if units in _DAY_UNITS:
+                role = "day"
+        if role is not None:
+            rename[dim] = role
+    roles = list(rename.values())
+    repeated = sorted({role for role in roles if roles.count(role) > 1})
+    if repeated:
+        raise ValueError(f"{where}: several dimensions of {variable!r} read as {', '.join(repeated)}")
+    declared = getattr(var, "units", None)
+    declared = str(declared).strip() if declared is not None and str(declared).strip() else None
+    return ForecastFormat(rename=rename, scale=rainfall_scale(declared, unit_scale, where), declared_units=declared)
+
+
+def rainfall_scale(units: str | None, fallback: float, where="") -> float:
+    """Millimetres per unit of rainfall declared in `units`; fallback when undeclared."""
+    if units is None:
+        return float(fallback)
+    try:
+        return MILLIMETRES_PER_UNIT[units.lower()]
+    except KeyError:
+        supported = ", ".join(repr(u) for u in MILLIMETRES_PER_UNIT)
+        raise ValueError(f"{where}: unrecognised rainfall units {units!r} (supported: {supported})") from None
+
+
+def of_file(path, variable: str, dims: Mapping[str, str], unit_scale: float) -> ForecastFormat:
+    import netCDF4
+
+    with netCDF4.Dataset(path) as ds:
+        return forecast_format(ds, variable, dims, unit_scale, where=str(path))
+
+
+# ---------------------------------------------------------------------------
+# Reading
+# ---------------------------------------------------------------------------
 
 def lead_days_in_order(positions, day_numbers, where) -> tuple[np.ndarray, list[int]]:
     """The selected lead days ascending, with their positions in the file.

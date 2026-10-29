@@ -8,9 +8,9 @@ import json
 import numpy as np
 import pandas as pd
 
-from ._legacy import nc_utils
-from ._legacy.spatial_id_utils import GridIdConvention, ensure_spatial_id_col, format_coord_component
-from .config import BlendConfig
+from .._legacy import nc_utils
+from .._legacy.spatial_id_utils import GridIdConvention, ensure_spatial_id_col, format_coord_component
+from ..config import BlendConfig
 
 
 
@@ -123,7 +123,7 @@ class Regridder:
     over each unit's observed source cells), applied to arrays as read."""
 
     def __init__(self, weights: pd.DataFrame):
-        from ._legacy.geometry_utils import normalize_regrid_weights
+        from .._legacy.geometry_utils import normalize_regrid_weights
 
         mapping = normalize_regrid_weights(weights, context="regrid weights")
         mapping = mapping.rename(columns={"latitude": "lat", "longitude": "lon"})
@@ -141,7 +141,7 @@ class Regridder:
 
     def transform(self, lats: np.ndarray, lons: np.ndarray):
         """The compiled transform for a grid (latitude-major source order)."""
-        from ._legacy.sparse_transform_utils import compile_sparse_cell_transform
+        from .._legacy.sparse_transform_utils import compile_sparse_cell_transform
 
         sources = tuple((float(a), float(b)) for a in lats for b in lons)
         if sources not in self._transforms:
@@ -159,7 +159,7 @@ class Regridder:
     def apply(transform, values: np.ndarray) -> np.ndarray:
         """(source, column) values -> (target, column) weighted means; NaN
         sources are unobserved."""
-        from ._legacy.sparse_transform_utils import sparse_observed_weighted_mean
+        from .._legacy.sparse_transform_utils import sparse_observed_weighted_mean
 
         return sparse_observed_weighted_mean(transform, values)
 

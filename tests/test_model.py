@@ -24,7 +24,8 @@ from onset_blending._legacy.blend_evaluation_utils import (
 from onset_blending._legacy.nc_utils import ensure_id_col
 from onset_blending._legacy.spatial_id_utils import resolve_grid_id_convention
 from onset_blending.evaluation import evaluate
-from onset_blending.model import FittedModel, fit_final
+from onset_blending.blend.logit import FittedModel
+from onset_blending.evaluation import fit_final
 
 BINS = ["week1", "week2", "later"]
 FORMULA = "outcome ~ clim_week1 + clim_week2 + x + clim_week1:x"

@@ -6,10 +6,10 @@ import pytest
 import yaml
 
 from onset_blending import BlendConfig, ConfigError
-from onset_blending.legacy_specs import convert_spec_files, convert_specs
+from onset_blending.legacy.specs import convert_spec_files, convert_specs
 
 ROOT = Path(__file__).parents[1]
-SPECS = ROOT / "specs"
+SPECS = ROOT / "archive" / "specs"
 
 # Each ported config and the spec set it came from.
 PORTED = {
@@ -84,7 +84,7 @@ def problems(specs: dict) -> list[str]:
 
 @pytest.mark.parametrize("name", sorted(PORTED))
 def test_each_ported_config_is_its_spec_set(name):
-    converted = convert_spec_files(name=name, data_root=str(ROOT.resolve()), **spec_paths(name)).config
+    converted = convert_spec_files(name=name, data_root=str((ROOT / "archive").resolve()), **spec_paths(name)).config
     assert BlendConfig.from_yaml(ROOT / "configs" / f"{name}.yml") == converted
 
 

@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 import xarray as xr
 
-from onset_blending.blend import _signature_differences, forecast_signature
+from onset_blending.trained import _signature_differences, forecast_signature
 from onset_blending.config import ForecastModel
 
 

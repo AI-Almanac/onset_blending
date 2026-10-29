@@ -42,7 +42,7 @@
 #   - cv_models: extras.forecasts[0].fair_brier (no code reads it)
 #   - cv_models: mme.mc_cores (no code reads it)
 name: country_template
-data_root: ..
+data_root: ../archive
 domain:
   regrid:
     shapefile: Monsoon_Data/reference/example_country/admin_units.shp

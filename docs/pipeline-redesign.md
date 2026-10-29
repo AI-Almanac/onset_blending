@@ -138,22 +138,25 @@ sets one.
 
 ```
 onset_blending/
-  config.py          BlendConfig: the recipe (done)
-  inputs.py          read observation and forecast NetCDF into xarray
-  domain.py          units, ids, regrid weights, dissemination, area of interest
-  onsets.py          onset detection: observed onsets, forecast onset probabilities
-  climatology.py     KDE climatology
-  features.py        weekly features (today's combine + connect), as Weekly arrays
-  design.py          formula design matrices from the arrays (Patsy's columns and bits)
-  cv.py              global CV folds and the final fit, on one shared design
-  model.py           the fitted multinomial model; fit_final
-  evaluation.py      evaluate(): CV, baselines, calibration, MME, scores
+  config.py          BlendConfig: the one recipe
+  core/              the stages every blend shares, on arrays and xarray
+    io.py            files, each file's format, reading rainfall
+    domain.py        units, ids, regridding, areas of interest
+    reference.py     thresholds, reference onsets, weights (resolved once)
+    onsets.py        observed and forecast onsets
+    climatology.py   KDE onset climatology
+    features.py      the weekly samples (Weekly)
+    design.py        formula design matrices from the arrays
+    parallel.py      worker pools, shared memory
+  blend/             blending methods behind one interface
+    logit.py         the multinomial logistic blend; global CV + final fit
+    random_forest.py the CRPS random forest (next: from onset-forest)
+  evaluation.py      cross-validation, baselines, calibration, scores
   training.py        train(config) -> TrainingResult, holding a TrainedBlend
-  blend.py           TrainedBlend: recipe + fitted model + reference data
+  trained.py         TrainedBlend: recipe + fitted model + reference data
   forecast.py        TrainedBlend.forecast(...) -> Forecast: the operational path
-  maps.py            forecast maps (optional extra: cartopy)
-  legacy_specs.py    spec-set converter (until the specs are gone)
-  __main__.py        `python -m onset_blending train | forecast | convert-specs`
+  legacy/            spec-set converter (convert-specs)
+archive/             the retired scripts, spec sets and their reference data
 ```
 
 Each stage is a function from inputs to a result object, with no files, globals

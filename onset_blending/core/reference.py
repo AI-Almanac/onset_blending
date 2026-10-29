@@ -15,8 +15,8 @@ import numpy as np
 import pandas as pd
 
 from . import _specs, domain
-from ._legacy import nc_utils, onset_utils
-from .config import BlendConfig
+from .._legacy import nc_utils, onset_utils
+from ..config import BlendConfig
 
 OBSERVATIONS = "observations"
 

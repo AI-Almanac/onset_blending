@@ -18,9 +18,9 @@ silently. The key-by-key inventory this follows is in docs/explore1.md
 and docs/explore3.md (regrid, raw_data, climatology).
 
     python -m onset_blending.legacy_specs --name india \\
-        --ground-truth specs/raw_data/gt.yml --forecast aifs=specs/raw_data/aifs.yml \\
-        --combine specs/combine/c.yml --connect specs/2025_blend/connect.yml \\
-        --cv-models specs/2025_blend/cv_models.yml -o configs/india.yml
+        --ground-truth archive/specs/raw_data/gt.yml --forecast aifs=archive/specs/raw_data/aifs.yml \\
+        --combine archive/specs/combine/c.yml --connect archive/specs/2025_blend/connect.yml \\
+        --cv-models archive/specs/2025_blend/cv_models.yml -o configs/india.yml
 """
 
 from __future__ import annotations
@@ -35,8 +35,8 @@ from typing import Any
 
 import yaml
 
-from . import config as cfg
-from .config import BlendConfig, ConfigError
+from .. import config as cfg
+from ..config import BlendConfig, ConfigError
 
 __all__ = ["Conversion", "convert_specs", "convert_spec_files"]
 

@@ -296,7 +296,7 @@ class ForecastModel:
     dims: dict[str, str] = _field(
         factory=dict,
         doc="Rename dims to time/day/lat/lon/number, for names a file's format does not "
-        "already tell (formats.py: aliases such as prediction_timedelta_daily, member).",
+        "already tell (core/io.py: aliases such as prediction_timedelta_daily, member).",
     )
     unit_scale: float = _field(
         1.0,

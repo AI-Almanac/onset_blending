@@ -12,9 +12,9 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from . import _parallel, _specs, domain, formats, inputs, readers
-from ._legacy import nc_utils, onset_utils
-from .config import BlendConfig, ForecastModel
+from . import _specs, domain, io, parallel
+from .._legacy import nc_utils, onset_utils
+from ..config import BlendConfig, ForecastModel
 from .reference import OBSERVATIONS, Reference
 
 # Peak bytes per rainfall value of one run of issues (the float32 run, the
@@ -46,7 +46,7 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
     the legacy table route."""
     if context["cell_transform"] is not None:
         return _observed_file_from_table(path, context)
-    read = readers.read_observations(
+    read = io.read_observations(
         path, context["spec"]["input"]["value_col"], context["spec"]["dimensions"]["rename"],
         shift_days=context["spec"]["options"].get("date_shift_days", 0),
     )
@@ -237,10 +237,10 @@ class ObservedOnsets:
 def observed(config: BlendConfig, *, reference: Reference | None = None, workers: int = 1,
              budget_bytes: int | None = None) -> ObservedOnsets:
     """Observed onsets for every observation file."""
-    paths = inputs.list_files(config.observations.files, config, "observations")
+    paths = io.list_files(config.observations.files, config, "observations")
     reference = reference or Reference.resolve(config)
     context = _context(config, _specs.observation_spec(config), reference, OBSERVATIONS, None)
-    parts = _parallel.map_ordered(_observed_file, paths, context, workers)
+    parts = parallel.map_ordered(_observed_file, paths, context, workers)
     return ObservedOnsets.from_frames(parts, config.onset.season_start)
 
 
@@ -369,7 +369,7 @@ def _unit_frame_values(context: dict, ids: np.ndarray, issues: np.ndarray):
 def _file_context(path: Path, context: dict) -> dict:
     """The context for one file, read in its own format: its dimension names
     and the scale that puts its rainfall in millimetres (see formats)."""
-    fmt = formats.of_file(path, context["variable"], context["dims"], context["fallback_unit_scale"])
+    fmt = io.of_file(path, context["variable"], context["dims"], context["fallback_unit_scale"])
     dimensions = context["spec"]["dimensions"]
     spec = {**context["spec"], "dimensions": {**dimensions, "rename": {**dimensions["rename"], **fmt.rename}}}
     return {**context, "spec": spec, "unit_scale": fmt.scale}
@@ -390,7 +390,7 @@ def _forecast_file(path: Path, context: dict) -> tuple[xr.Dataset, bool]:
         return _forecast_file_from_table(path, context)
     points, keep, in_area = masks
     spec = context["spec"]
-    with readers.ForecastFile(
+    with io.ForecastFile(
         path, context["variable"], spec["dimensions"]["rename"], spec, keep,
         spread_over=in_area, scale=context["unit_scale"],
     ) as forecast:
@@ -430,7 +430,7 @@ def _regridded_forecast_file(path: Path, points: pd.DataFrame, context: dict) ->
     kept_units = np.flatnonzero(keep)
     feeding = np.isin(source, domain.Regridder.sources_of(transform, kept_units))
     spec = context["spec"]
-    with readers.ForecastFile(path, context["variable"], spec["dimensions"]["rename"], spec, feeding) as forecast:
+    with io.ForecastFile(path, context["variable"], spec["dimensions"]["rename"], spec, feeding) as forecast:
         selected = _selected_members(forecast.members, context, path)
         rows = source[feeding]
         summary = _Summary(units["id"].to_numpy()[keep], forecast.issues, forecast.days, context)
@@ -564,7 +564,7 @@ def _forecast_file_from_table(path: Path, context: dict) -> tuple[xr.Dataset, bo
     if df is None:
         raise ValueError(f"{path.name} has no {context['variable']!r} variable")
     rain_cols = [c for c in df.columns if c.startswith("rain_day_")]
-    _, ordered = readers.lead_days_in_order(
+    _, ordered = io.lead_days_in_order(
         np.arange(len(rain_cols)), [int(c.rsplit("_", 1)[1]) for c in rain_cols], path.name
     )
     rain_cols = [f"rain_day_{d}" for d in ordered]
@@ -645,7 +645,7 @@ def forecast(
     default to the config's (a forecast passes the trained blend's);
     member_ids limits the members read (a forecast reads the trained ones).
     """
-    paths = inputs.list_files(model.files, config, f"model {model.name}")
+    paths = io.list_files(model.files, config, f"model {model.name}")
     spec = _specs.forecast_spec(config, model)
     context = {
         **_context(config, spec, reference or Reference.resolve(config), model.name, area),
@@ -659,8 +659,8 @@ def forecast(
         "max_member": model.max_member,
         "member_ids": None if member_ids is None else [int(m) for m in member_ids],
     }
-    count = _parallel.workers_within([_forecast_bytes(p, context) for p in paths], workers, budget_bytes)
-    results = _parallel.map_ordered(_forecast_file, paths, context, count)
+    count = parallel.workers_within([_forecast_bytes(p, context) for p in paths], workers, budget_bytes)
+    results = parallel.map_ordered(_forecast_file, paths, context, count)
     units = [tuple(data["unit"].values) for data, _ in results]
     if len(set(units)) > 1:
         raise ValueError(f"model {model.name}: its files cover different units")

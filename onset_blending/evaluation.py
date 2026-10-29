@@ -34,7 +34,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import cv, design
+from .blend import logit
+from .core import design
 from ._legacy.blend_evaluation_utils import (
     _present_weeks,
     build_formulas_from_spec,
@@ -71,7 +72,7 @@ from ._legacy.spatial_id_utils import (
     resolve_grid_id_convention,
     validate_id_coordinate_consistency,
 )
-from .features import Weekly
+from .core.features import Weekly
 
 __all__ = ["Evaluation", "RunSettings", "evaluate", "prepare_inputs", "sample_support"]
 
@@ -204,7 +205,7 @@ class Evaluation:
     coefs_by_year: dict[tuple[str, str], dict[int, dict]] = field(default_factory=dict)
     platt_weights: dict[str, pd.DataFrame] = field(default_factory=dict)  # file stem -> weights
     mme_weights: dict[str, pd.DataFrame] = field(default_factory=dict)  # file stem -> weights
-    final_model: object = None  # model.FittedModel, when evaluate() was asked for it (not saved here)
+    final_model: object = None  # blend.logit.FittedModel, when evaluate() was asked for it (not saved here)
 
     def save(self, directory: str | os.PathLike) -> list[Path]:
         """Write the script's files into `directory`; returns the paths written."""
@@ -293,18 +294,14 @@ def evaluate(
 
     ctx = _Context(cv_spec, run, weekly, rows, cells, n_bins, budget_bytes=budget_bytes)
     result = Evaluation(output_tag=run.output_tag, sample_support=support, formulas=formulas)
-    final_rows = None
+    chosen_final_rows = None
     if final_model is not None:
-        from .model import final_rows as choose_final_rows
-
-        final_rows = choose_final_rows(weekly, rows, cells, run, n_bins)
+        chosen_final_rows = final_rows(weekly, rows, cells, run, n_bins)
     scores = _Scores(cells, n_bins)
     _cross_validate(ctx, formulas, cv_methods, workers, result, scores, final_model)
     if final_model is not None and result.final_model is None:
-        from .model import fit_samples
-
         log.info("\nFitting %s on all %d training years...", final_model, len(run.fit_years))
-        result.final_model = fit_samples(formulas[final_model], weekly, final_rows)
+        result.final_model = logit.fit_samples(formulas[final_model], weekly, chosen_final_rows)
     # After the CV, the scoring and the Platt calibration fan out over worker
     # processes (with one BLAS thread each); scores keep their order.
     with _scoring_pool(workers) as pool:
@@ -326,6 +323,57 @@ def evaluate(
     if scores.yearly:
         result.yearly = pd.DataFrame(scores.yearly)
     return result
+
+
+def fit_final(
+    weekly: Weekly | pd.DataFrame,
+    cv_spec: dict,
+    dissemination: pd.DataFrame,
+    model_name: str = "blended_model",
+) -> logit.FittedModel:
+    """Fit `model_name`'s formula on every training year that is not a true
+    holdout, on the dissemination cells, after the evaluation's sample support.
+
+    `weekly` is a `features.Weekly` or the legacy table; `dissemination` is
+    the table as read from its CSV (see `prepare_inputs`). Training fits
+    this alongside the CV instead (`evaluate(..., final_model=...)`).
+    """
+    run = RunSettings.from_spec(cv_spec)
+    weekly, cells, n_bins = prepare_inputs(weekly, cv_spec, dissemination)
+    formulas = build_formulas_from_spec(cv_spec, run.cutoff_mode, data=weekly, n_bins=n_bins)
+    if model_name not in formulas:
+        raise ValueError(
+            f"Model '{model_name}' not found in spec formulas. Available: {list(formulas)}"
+        )
+    rows, support = sample_support(weekly, formulas)
+    log_sample_support(support)
+    train = final_rows(weekly, rows, cells, run, n_bins)
+    log.info("\nFormula : %s", formulas[model_name])
+    log.info("\nFitting %s on all %d training years...", model_name, len(run.fit_years))
+    return logit.fit_samples(formulas[model_name], weekly, train)
+
+
+
+
+def final_rows(weekly: Weekly, rows: np.ndarray, cells: pd.DataFrame, run: RunSettings, n_bins: int) -> np.ndarray:
+    """The final fit's samples (positions): the supported `rows` in the
+    dissemination cells and the fit years, with every outcome class."""
+    fit_years = run.fit_years
+    candidates = rows[in_cells(weekly, cells)[rows]]
+    train = candidates[np.isin(weekly.take("year", candidates), fit_years)]
+    if not len(train):
+        raise ValueError(
+            "Final fit has no rows in the configured training years and dissemination cells."
+        )
+    present = {value for value in pd.unique(weekly.take("outcome", train)) if isinstance(value, str)}
+    missing = [value for value in interval_bins(n_bins) if value not in present]
+    if missing:
+        raise ValueError(
+            "Final-fit training rows are missing outcome classes: " + ", ".join(missing)
+        )
+    log.info("  Training years        : %s", sorted(fit_years))
+    log.info("  Training rows (allowed cells) : %d", len(train))
+    return train
 
 
 @dataclass
@@ -382,7 +430,7 @@ def _scoring_pool(workers: int):
     from concurrent.futures import ProcessPoolExecutor
     from multiprocessing import get_context
 
-    from ._parallel import limit_blas_threads
+    from .core.parallel import limit_blas_threads
 
     with ProcessPoolExecutor(
         max_workers=workers, mp_context=get_context("spawn"), initializer=limit_blas_threads, initargs=(1,)
@@ -525,7 +573,7 @@ def _global_cv(ctx, plan, workers, with_final):
     """compute_cv_global on the shared design: (predictions, coefficients by
     year, the final model or None)."""
     run = ctx.run
-    folds, final = cv.global_cv(
+    folds, final = logit.global_cv(
         plan,
         ctx.weekly.take,
         ctx.rows,
@@ -551,11 +599,9 @@ def _global_cv(ctx, plan, workers, with_final):
     coefs_by_year = {year: artifact for year, _, _, artifact in folds if artifact is not None}
     fitted = None
     if final is not None:
-        from .model import FittedModel, log_fit
-
         clf, scaler, used, total = final
-        log_fit(used, total, clf.classes_, plan.columns)
-        fitted = FittedModel.from_estimators(plan.formula, plan.columns, clf, scaler)
+        logit.log_fit(used, total, clf.classes_, plan.columns)
+        fitted = logit.FittedModel.from_estimators(plan.formula, plan.columns, clf, scaler)
     return preds, coefs_by_year, fitted
 
 

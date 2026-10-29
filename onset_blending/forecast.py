@@ -23,8 +23,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import climatology as climatology_stage, config as cfg, domain, features, onsets
-from .blend import issue_dates
+from . import config as cfg
+from .core import climatology as climatology_stage, domain, features, onsets
+from .trained import issue_dates
 from .config import FileSet
 
 WEEKLY_FILENAME = "blended_forecast_probabilities.csv"
