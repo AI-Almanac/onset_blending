@@ -20,7 +20,7 @@ from .training import Resources, train
 
 
 def _resources(args) -> Resources:
-    resources = Resources.default()
+    resources = Resources.default(cache_dir=getattr(args, "cache_dir", None))
     if args.workers:
         resources.workers = args.workers
     return resources
@@ -57,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--intermediate", action="append", choices=["observed", "weekly"],
                      help="also save this stage's table (repeatable)")
     run.add_argument("--workers", type=int)
+    run.add_argument("--cache-dir", help="keep computed onset thresholds here, to reuse in later runs")
     run.set_defaults(handler=_train)
 
     apply = commands.add_parser("forecast", help="apply a trained blend to live forecast files")

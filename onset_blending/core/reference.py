@@ -33,9 +33,10 @@ class Reference:
     _regridders: dict = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
-    def resolve(cls, config: BlendConfig, *, workers: int = 1) -> "Reference":
+    def resolve(cls, config: BlendConfig, *, workers: int = 1, cache_dir=None) -> "Reference":
         """Read (or, for onset.threshold.climatology, compute from the
-        observations) everything the stages look up."""
+        observations, kept in cache_dir when given) everything the stages
+        look up."""
         cell_transforms, regrid_weights = {}, {}
         sources = [(OBSERVATIONS, config.observations.cell_transform, None)] + [
             (m.name, m.cell_transform, m) for m in config.models
@@ -55,8 +56,8 @@ class Reference:
         if config.onset.threshold.climatology is not None:
             from .onsets import climatological_thresholds
 
-            reference.thresholds = _scaled(climatological_thresholds(config, reference, workers=workers),
-                                           config.onset.threshold.scale)
+            computed = climatological_thresholds(config, reference, workers=workers, cache_dir=cache_dir)
+            reference.thresholds = _scaled(computed, config.onset.threshold.scale)
             log.info("Computed onset thresholds for %d units from the observations", len(reference.thresholds))
         return reference
 

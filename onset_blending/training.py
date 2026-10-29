@@ -23,14 +23,16 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Resources:
-    """Processes the stages may use, and the memory their parallel work shares."""
+    """Processes the stages may use, the memory their parallel work shares,
+    and where results that outlive a run (computed onset thresholds) are kept."""
 
     workers: int
     budget_bytes: int | None
+    cache_dir: str | Path | None = None
 
     @classmethod
-    def default(cls) -> "Resources":
-        return cls(*parallel.default_resources())
+    def default(cls, *, cache_dir: str | Path | None = None) -> "Resources":
+        return cls(*parallel.default_resources(), cache_dir=cache_dir)
 
 
 @dataclass
@@ -71,7 +73,7 @@ def prepare(
         log.info("%s in %.1fs", stage, timings[stage])
 
     started = time.perf_counter()
-    reference = Reference.resolve(config, workers=workers)
+    reference = Reference.resolve(config, workers=workers, cache_dir=resources.cache_dir)
     observed = onsets.observed(config, reference=reference, workers=workers, budget_bytes=budget)
     lap("observed onsets", started)
 

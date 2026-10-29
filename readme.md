@@ -39,7 +39,9 @@ The onset threshold is a constant (`onset.threshold.mm`), a per-unit table
 mean rainfall over the trigger window, e.g. Moron and Robertson's local
 5-day amount over April-October of 1991-2020). With
 `definition.threshold_comparison: gte` a window reaching the threshold
-triggers; `follow_days: 0` checks no dry spell.
+triggers; `follow_days: 0` checks no dry spell. Computed thresholds are
+kept in `Resources(cache_dir=...)` (`train --cache-dir`) under a key of
+their settings and input files, and read back by later runs.
 
 An evaluation writes CSV score tables (`summary_models*`,
 `yearly_metrics_global*`), each model's CV predictions and the CV folds'

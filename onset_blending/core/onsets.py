@@ -4,7 +4,12 @@ probabilities per unit and issue date."""
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
+import logging
 import math
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,6 +21,8 @@ from . import domain, ids, io, parallel
 from ..config import BlendConfig, ForecastModel
 from .onset_rule import OnsetRule, find_onsets
 from .reference import OBSERVATIONS, Reference
+
+log = logging.getLogger(__name__)
 
 # Peak bytes per rainfall value of one run of issues (the float32 run, the
 # onset search's float64 copy of an issue, the summaries), and the
@@ -277,11 +284,17 @@ def observed(config: BlendConfig, *, reference: Reference | None = None, workers
     return ObservedOnsets.from_frames(parts, config.onset.season_start)
 
 
-def climatological_thresholds(config: BlendConfig, reference: Reference, *, workers: int = 1) -> pd.DataFrame:
+def climatological_thresholds(config: BlendConfig, reference: Reference, *, workers: int = 1,
+                              cache_dir: str | os.PathLike | None = None) -> pd.DataFrame:
     """Each unit's threshold from the observations (onset.threshold.climatology):
     its mean daily rain over the start..end days of the years, finite days
     only, times the threshold's days (default the trigger window). Units as the
     onset search sees them: regridded or transformed, in the area.
+
+    With a cache_dir, the thresholds are kept there under a key of everything
+    they depend on (the threshold, observation and domain settings, and the
+    size and modification time of every file those name), and read back
+    instead of recomputed.
 
     Returns (id, onset_thresh), NaN for a unit without rain in that window."""
     spec = config.onset.threshold.climatology
@@ -290,6 +303,81 @@ def climatological_thresholds(config: BlendConfig, reference: Reference, *, work
         path for path in io.list_files(config.observations.files, config, "observations")
         if io.file_year(path) is None or first <= io.file_year(path) <= last
     ]
+    cached = None
+    if cache_dir is not None:
+        cached = Path(cache_dir) / "onset-thresholds" / f"{_threshold_key(config, paths)}.nc"
+        if cached.is_file():
+            with xr.open_dataset(cached) as stored:
+                thresholds = pd.DataFrame({
+                    "id": stored["id"].values.astype(str), "onset_thresh": stored["onset_thresh"].values,
+                })
+            log.info("Read onset thresholds for %d units from %s", len(thresholds), cached)
+            return thresholds
+    thresholds = _compute_thresholds(config, reference, paths, workers)
+    if cached is not None:
+        _write_atomically(thresholds, cached)
+        log.info("Kept the onset thresholds in %s", cached)
+    return thresholds
+
+
+# Bump when the thresholds' computation changes: every cached one is stale.
+_THRESHOLD_CACHE_VERSION = 1
+
+
+def _threshold_key(config: BlendConfig, paths: list[Path]) -> str:
+    """A digest of everything the thresholds depend on."""
+    data = config.to_dict()
+    sections = {"observations": data["observations"], "domain": data["domain"]}
+    referenced = {
+        str(config.path(text)) for text in _strings(sections)
+        if text and os.path.isfile(config.path(text))
+    }
+    material = {
+        "version": _THRESHOLD_CACHE_VERSION,
+        **sections,
+        "climatology": data["onset"]["threshold"]["climatology"],
+        "window": config.onset.definition.window,
+        "observation_files": [_fingerprint(path) for path in paths],
+        "referenced_files": [_fingerprint(path) for path in sorted(referenced)],
+    }
+    return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode()).hexdigest()[:32]
+
+
+def _strings(value) -> list[str]:
+    """Every string in a nested config section."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for item in value.values() for s in _strings(item)]
+    if isinstance(value, (list, tuple)):
+        return [s for item in value for s in _strings(item)]
+    return []
+
+
+def _fingerprint(path) -> list:
+    stat = os.stat(path)
+    return [str(Path(path).resolve()), stat.st_size, stat.st_mtime_ns]
+
+
+def _write_atomically(thresholds: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = xr.Dataset(
+        {"onset_thresh": ("unit", thresholds["onset_thresh"].to_numpy(dtype=float))},
+        coords={"id": ("unit", thresholds["id"].to_numpy(dtype=str))},
+    )
+    handle, staging = tempfile.mkstemp(suffix=".nc", dir=path.parent)
+    os.close(handle)
+    try:
+        data.to_netcdf(staging)
+        os.replace(staging, path)
+    except BaseException:
+        Path(staging).unlink(missing_ok=True)
+        raise
+
+
+def _compute_thresholds(config: BlendConfig, reference: Reference, paths: list[Path], workers: int) -> pd.DataFrame:
+    spec = config.onset.threshold.climatology
+    first, last = spec.years
     context = {**observation_context(config, reference), "threshold_window": (first, last, spec.start, spec.end)}
     parts = [part for part in parallel.map_ordered(_threshold_sums, paths, context, workers) if part is not None]
     if not parts:

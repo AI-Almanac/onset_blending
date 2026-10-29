@@ -1,4 +1,6 @@
 """Onset thresholds computed from the observations (onset.threshold.climatology)."""
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -93,3 +95,38 @@ def test_a_blend_keeps_the_thresholds_it_computed(region, tmp_path):
     assert len(found) and all(pd.Timestamp(d).strftime("%m-%d") >= "06-02" for d in found)
     forecast = blend.forecast({"ens": region / "ens" / "2013.nc"})
     assert len(forecast.weekly) and forecast.weekly.filter(like="cv_").notna().all().all()
+
+
+def test_computed_thresholds_are_kept_and_reused(region, tmp_path, monkeypatch):
+    from onset_blending.core import onsets
+
+    window = {"start": "05-01", "end": "09-30", "years": "2001:2008"}
+    config = BlendConfig.from_dict(config_data(region, {"climatology": window}))
+    first = Reference.resolve(config, cache_dir=tmp_path).thresholds
+    assert len(list((tmp_path / "onset-thresholds").glob("*.nc"))) == 1
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the thresholds were recomputed")
+
+    monkeypatch.setattr(onsets, "_compute_thresholds", refuse)
+    again = Reference.resolve(config, cache_dir=tmp_path).thresholds
+    pd.testing.assert_frame_equal(again, first, check_exact=True)
+
+    # Other inputs, other thresholds: another averaging window, or a changed file.
+    other = BlendConfig.from_dict(config_data(region, {"climatology": {**window, "end": "08-31"}}))
+    with pytest.raises(AssertionError, match="recomputed"):
+        Reference.resolve(other, cache_dir=tmp_path)
+    path = region / "obs" / "2005.nc"
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+    with pytest.raises(AssertionError, match="recomputed"):
+        Reference.resolve(config, cache_dir=tmp_path)
+
+
+def test_training_keeps_its_thresholds_in_the_resources_cache(region, tmp_path):
+    window = {"start": "04-01", "end": "10-31", "years": "2001:2009"}
+    config = BlendConfig.from_dict(config_data(region, {"climatology": window}))
+
+    train(config, resources=Resources(workers=1, budget_bytes=None, cache_dir=tmp_path))
+
+    assert len(list((tmp_path / "onset-thresholds").glob("*.nc"))) == 1
