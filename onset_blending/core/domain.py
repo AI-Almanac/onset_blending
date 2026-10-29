@@ -275,6 +275,13 @@ class SparseTransform:
         )
         return cls(matrix, source_ids, target_ids)
 
+    def supported(self, present: np.ndarray) -> np.ndarray:
+        """(target, column): whether any of a target's sources is present
+        (present: a (source, column) mask)."""
+        support = self.weighted_matrix.copy()
+        support.data = np.ones_like(support.data)
+        return np.asarray(support @ np.asarray(present, dtype=float)) > 0
+
     def observed_mean(self, source_values: np.ndarray, column_chunk_size: int = 256) -> np.ndarray:
         """W @ filled / W @ observed for a (source, column) matrix, NaN where a
         target has no observed source."""

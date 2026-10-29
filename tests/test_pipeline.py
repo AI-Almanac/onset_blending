@@ -297,3 +297,17 @@ def test_a_training_run_saves_netcdf_and_csv_artifacts(region, tmp_path):
 
 def assert_same_predictions(a, b):
     xr.testing.assert_identical(a.data, b.data)
+
+
+def test_a_files_dimensions_may_come_in_any_order(region, tmp_path):
+    _, _, result = region
+    write_forecasts(tmp_path / "usual", years=[2014])
+    with xr.open_dataset(tmp_path / "usual" / "2014.nc") as ds:
+        transposed = ds.transpose("lat", "day", "number", "lon", "time").load()
+    (tmp_path / "transposed").mkdir()
+    transposed.to_netcdf(tmp_path / "transposed" / "2014.nc")
+
+    expected = result.blend.forecast({"ens": tmp_path / "usual" / "2014.nc"})
+    got = result.blend.forecast({"ens": tmp_path / "transposed" / "2014.nc"})
+
+    pd.testing.assert_frame_equal(got.weekly, expected.weekly, check_exact=True)

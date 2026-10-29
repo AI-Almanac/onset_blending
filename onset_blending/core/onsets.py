@@ -12,8 +12,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from . import _specs, domain, io, parallel
-from .._legacy import nc_utils
+from . import _specs, domain, ids, io, parallel
 from ..config import BlendConfig, ForecastModel
 from .onset_rule import OnsetRule, find_onsets
 from .reference import OBSERVATIONS, Reference
@@ -44,17 +43,39 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
     """One observation file's onsets: (id, year) rows with onset_day and onset_date.
 
     The file is read into one (unit, day) series per season and searched in
-    one batched call; a cell transform, or two points sharing an id, take
-    the legacy table route."""
-    if context["cell_transform"] is not None:
-        return _observed_file_from_table(path, context)
+    one batched call. Under a cell transform the missing-rain policy applies
+    to its source series (a dropped source leaves its targets for that
+    season, or the target itself when it has no other), as the legacy
+    pipeline applied it on reading."""
+    spec = context["spec"]
+    policy = str(spec["options"]["missing_rain_policy"]).lower()
     read = io.read_observations(
-        path, context["spec"]["input"]["value_col"], context["spec"]["dimensions"]["rename"],
-        shift_days=context["spec"]["options"].get("date_shift_days", 0),
+        path, spec["input"]["value_col"], spec["dimensions"]["rename"],
+        shift_days=spec["options"].get("date_shift_days", 0),
     )
     rain_by_point, points = read.rain, read.points
+    years = np.unique(read.years)
+    supported = None  # (unit, season) a cell transform's targets have sources for
     regridder = context["regridder"]
-    if regridder is not None and "id" not in points.columns:
+    if context["cell_transform"] is not None:
+        transform, source = _cell_transform(points, context["cell_transform"], context["convention"], path.name)
+        values = np.full((len(transform.source_ids), rain_by_point.shape[0]), np.nan)
+        values[source[source >= 0]] = rain_by_point[:, source >= 0].T.astype(float)
+        present = np.zeros((len(transform.source_ids), len(years)), dtype=bool)
+        present[source[source >= 0]] = True
+        if policy == "zero":
+            values = np.where(np.isnan(values), 0.0, values)
+        elif policy == "drop":
+            for y, year in enumerate(years):
+                days = read.years == year
+                incomplete = np.isnan(values[:, days]).any(axis=1)
+                values[np.ix_(incomplete, days)] = np.nan
+                present[incomplete, y] = False
+        rain_by_point = transform.observed_mean(values).T
+        supported = transform.supported(present)
+        points = pd.DataFrame({"id": pd.Series(transform.target_ids, dtype=str)})
+        policy = "keep"  # applied to the sources
+    elif regridder is not None and "id" not in points.columns:
         transform = regridder.transform(*domain.grid_axes(points))
         source = domain.point_sources(points, transform)
         values = np.full((len(transform.source_ids), rain_by_point.shape[0]), np.nan)
@@ -65,10 +86,7 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
     kept = np.zeros(len(points), dtype=bool)
     kept[context["area"](points.assign(_point=np.arange(len(points))))["_point"].to_numpy()] = True
     ids = points["id"].to_numpy()[kept]
-    if pd.Index(ids).duplicated().any():
-        return _observed_file_from_table(path, context)
-    spec = context["spec"]
-    policy = str(spec["options"]["missing_rain_policy"]).lower()
+    _refuse_shared_ids(ids, path)
     rain = rain_by_point[:, kept].astype(float)
     if policy == "zero":
         rain = np.where(np.isnan(rain), 0.0, rain)
@@ -76,14 +94,16 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
     order = np.argsort(ids.astype(str), kind="stable")
     ids = ids[order]
     rain = rain[:, order]
+    if supported is not None:
+        supported = supported[kept][order]
     thresholds = context["reference"].unit_thresholds(ids.astype(str), context["convention"])
     cutoff_md = spec["options"]["cutoff_month_day"]
     parts = []
-    for year in np.unique(read.years):
+    for y, year in enumerate(years):
         days = np.flatnonzero(read.years == year)
         days = days[np.argsort(read.dates[days], kind="stable")]
         series = rain[days].T
-        units = np.ones(len(ids), dtype=bool)
+        units = np.ones(len(ids), dtype=bool) if supported is None else supported[:, y].copy()
         if policy == "drop":
             units = ~np.isnan(series).any(axis=1)
         cutoff = dt.date.fromisoformat(f"{year}-{cutoff_md}")
@@ -112,40 +132,42 @@ def _observed_file(path: Path, context: dict) -> pd.DataFrame:
     return out.sort_values(["id", "year"], kind="stable", ignore_index=True) if len(parts) > 1 else out
 
 
-def _observed_file_from_table(path: Path, context: dict) -> pd.DataFrame:
-    """The legacy route: a table row per unit and day, then the onset search."""
-    spec = context["spec"]
-    variable = spec["input"]["value_col"]
-    df = nc_utils.nc_read_groundtruth_long(
-        nc_path=str(path),
-        var_name=variable,
-        dim_rename_map=spec["dimensions"]["rename"],
-        missing_rain_policy=spec["options"]["missing_rain_policy"],
-    )
-    if df is None:
-        import netCDF4
+def _refuse_shared_ids(ids: np.ndarray, path: Path) -> None:
+    """Two points of a file under one unit id have no single series."""
+    shared = pd.Index(ids.astype(str))
+    shared = shared[shared.duplicated()].unique()
+    if len(shared):
+        raise ValueError(f"{path.name}: points share the unit ids {', '.join(map(str, shared[:5]))}")
 
-        with netCDF4.Dataset(path) as ds:
-            found = ", ".join(ds.variables)
-        raise ValueError(f"{path.name} has no {variable!r} variable (it has: {found})")
-    shift = int(spec["options"].get("date_shift_days", 0))
-    if shift:
-        # As read_observations does: dates onto the forecasts' labels, each day
-        # keeping the season (year) of the calendar day it covers.
-        codes, distinct = pd.factorize(df["time"])
-        moved = (pd.to_datetime(pd.Index(distinct)) + pd.Timedelta(days=shift)).date
-        df["time"] = pd.Series(np.asarray(moved, dtype=object)[codes], index=df.index, dtype=object)
-    df = domain.with_ids(df, context["convention"])
-    if context["cell_transform"] is not None:
-        df = nc_utils.transform_groundtruth_long(df, context["cell_transform"], variable.lower(), spec=spec)
-    df = context["area"](df)
-    return nc_utils.process_ground_truth_rainfall_id(
-        df,
-        spec,
-        ref_onset_dt=context["reference_onset"],
-        thr_dt=context["thresholds"],
-        value_col=variable.lower(),
-    )["wide"]
+
+def _cell_transform(points: pd.DataFrame, weights: pd.DataFrame, explicit, where: str):
+    """The cell transform from a file's points onto its targets, and each
+    point's source position (-1 for a point the weights do not use). Points
+    are named as the weights' source ids are: grid ids under the convention
+    those establish, else their own ids."""
+    expected = ids.normalize(weights["source_id"].drop_duplicates(), context="cell-transform source IDs")
+    convention = ids.resolve(explicit, authoritative_ids=expected, context=f"cell transform for {where}")
+    if convention is not None and {"lat", "lon"} <= set(points.columns):
+        point_ids = np.asarray(ids.format_grid_ids(
+            pd.to_numeric(points["lat"]).to_numpy(float), pd.to_numeric(points["lon"]).to_numpy(float), convention
+        ), dtype=object)
+    else:
+        point_ids = ids.with_id_column(points, explicit=explicit, context="cell transform")["id"].to_numpy(dtype=object)
+    missing = sorted(set(expected) - set(point_ids.tolist()))
+    if missing:
+        raise ValueError(
+            f"{where}: {len(missing)} expected weight source IDs are absent from the raw NetCDF coordinates: "
+            f"{', '.join(missing[:10])}"
+        )
+    transform = domain.SparseTransform.compile(
+        weights, source_ids=tuple(sorted(weights["source_id"].unique())),
+        target_ids=tuple(sorted(weights["target_id"].unique())),
+    )
+    source = np.array([transform.source_index.get(i, -1) for i in point_ids.tolist()], dtype=np.int64)
+    used = source[source >= 0]
+    if len(np.unique(used)) != len(used):
+        raise ValueError(f"{where}: points share cell-transform source ids")
+    return transform, source
 
 
 @dataclass
@@ -285,22 +307,26 @@ def _as_dates(values: np.ndarray) -> np.ndarray:
     return out[codes]
 
 
-def _kept_mask(path: Path, context: dict) -> tuple[pd.DataFrame, np.ndarray, np.ndarray] | None:
-    """The file's points with ids, the points kept (in the area, and among
-    keep_ids), and the points of the area (where member spread is judged)."""
-    points = nc_utils.forecast_points(str(path), context["variable"], context["spec"]["dimensions"]["rename"], day_dim="day")
-    if points is None:
-        return None
+def _kept_mask(points: pd.DataFrame, context: dict, path: Path) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    """The file's points with ids, the points kept (in the area and the
+    dissemination units, and among keep_ids), and the points of the area
+    (where member spread is judged)."""
     points = domain.with_ids(points, context["convention"])
-    inside = context["area"].area(points.assign(_point=np.arange(len(points))))
-    in_area = np.zeros(len(points), dtype=bool)
-    in_area[inside["_point"].to_numpy()] = True
-    if points["id"][in_area].duplicated().any():
-        return None
+    in_area = _inside(context["area"], points["id"])
+    _refuse_shared_ids(points["id"].to_numpy()[in_area], path)
     keep = in_area.copy()
     if context["keep_ids"] is not None:
         keep &= points["id"].isin(context["keep_ids"]).to_numpy()
     return points, keep, in_area
+
+
+def _inside(area: domain.AreaFilter, unit_ids) -> np.ndarray:
+    """Per unit: inside the area of interest (and the dissemination units
+    when they restrict the inputs)."""
+    units = pd.DataFrame({"id": pd.Series(unit_ids, dtype=str)})
+    inside = np.zeros(len(units), dtype=bool)
+    inside[area(units.assign(_point=np.arange(len(units))))["_point"].to_numpy()] = True
+    return inside
 
 
 def _unit_frame_values(context: dict, ids: np.ndarray, issues: np.ndarray):
@@ -347,16 +373,21 @@ def _forecast_file(path: Path, context: dict) -> tuple[xr.Dataset, bool]:
     """One forecast file's onset counts and rain summaries, a run of issues
     at a time."""
     context = _file_context(path, context)
-    if context["cell_transform"] is not None or context["area"].dissemination:
-        return _forecast_file_from_table(path, context)
-    if context["regridder"] is not None:
-        points = nc_utils.forecast_points(str(path), context["variable"], context["spec"]["dimensions"]["rename"], day_dim="day")
-        if points is not None and "id" not in points.columns:
-            return _regridded_forecast_file(path, points, context)
-    masks = _kept_mask(path, context)
-    if masks is None:
-        return _forecast_file_from_table(path, context)
-    points, keep, in_area = masks
+    points = io.forecast_points(path, context["variable"], context["spec"]["dimensions"]["rename"])
+    if points is None:
+        raise ValueError(
+            f"{path.name}: no {context['variable']!r} variable over issue time, lead day, optional member and "
+            "spatial dimensions only"
+        )
+    if context["cell_transform"] is not None:
+        transform, source = _cell_transform(points, context["cell_transform"], context["convention"], path.name)
+        return _forecast_onto_units(path, transform, source, transform.target_ids, context, scale_first=True)
+    if context["regridder"] is not None and "id" not in points.columns:
+        regridder = context["regridder"]
+        transform = regridder.transform(*domain.grid_axes(points))
+        source = domain.point_sources(points, transform)
+        return _forecast_onto_units(path, transform, source, regridder.targets, context, scale_first=False)
+    points, keep, in_area = _kept_mask(points, context, path)
     spec = context["spec"]
     with io.ForecastFile(
         path, context["variable"], spec["dimensions"]["rename"], spec, keep,
@@ -384,21 +415,21 @@ def _selected_members(members: np.ndarray | None, context: dict, path: Path):
     return selected
 
 
-def _regridded_forecast_file(path: Path, points: pd.DataFrame, context: dict) -> tuple[xr.Dataset, bool]:
-    """A gridded forecast summarised on the blend's units: each run of issues
-    is read at the cells feeding the kept units and regridded in memory, then
-    scaled (the legacy order: regrid the file, scale as it is read)."""
-    regridder = context["regridder"]
-    transform = regridder.transform(*domain.grid_axes(points))
-    source = domain.point_sources(points, transform)
-    units = pd.DataFrame({"id": pd.Series(regridder.targets, dtype=str)})
-    in_area = np.zeros(len(units), dtype=bool)
-    in_area[context["area"].area(units.assign(_point=np.arange(len(units))))["_point"].to_numpy()] = True
+def _forecast_onto_units(path: Path, transform, source: np.ndarray, targets, context: dict, *,
+                         scale_first: bool) -> tuple[xr.Dataset, bool]:
+    """A forecast summarised on other units (a regrid or a cell transform):
+    each run of issues is read at the points feeding the kept units and
+    transformed in memory. A regrid scales after (the legacy order: regrid
+    the file, scale as it is read), a cell transform before."""
+    units = pd.DataFrame({"id": pd.Series(np.asarray(targets, dtype=object), dtype=str)})
+    in_area = _inside(context["area"], units["id"])
     keep = in_area & (units["id"].isin(context["keep_ids"]).to_numpy() if context["keep_ids"] is not None else True)
     kept_units = np.flatnonzero(keep)
     feeding = np.isin(source, domain.Regridder.sources_of(transform, kept_units))
     spec = context["spec"]
-    with io.ForecastFile(path, context["variable"], spec["dimensions"]["rename"], spec, feeding) as forecast:
+    scale = context["unit_scale"]
+    with io.ForecastFile(path, context["variable"], spec["dimensions"]["rename"], spec, feeding,
+                         scale=scale if scale_first else 1.0) as forecast:
         selected = _selected_members(forecast.members, context, path)
         rows = source[feeding]
         summary = _Summary(units["id"].to_numpy()[keep], forecast.issues, forecast.days, context)
@@ -409,19 +440,12 @@ def _regridded_forecast_file(path: Path, points: pd.DataFrame, context: dict) ->
             values[rows] = rain.transpose(2, 0, 1, 3).reshape(len(rows), -1)
             regridded = domain.Regridder.apply(transform, values)[kept_units]
             regridded = regridded.reshape(len(kept_units), n_run, n_member, n_day).transpose(1, 2, 0, 3)
-            if context["unit_scale"] != 1.0:
-                regridded = regridded * context["unit_scale"]
+            if not scale_first and scale != 1.0:
+                regridded = regridded * scale
             if forecast.members is not None and not member_spread:
                 member_spread = bool(((~np.isnan(regridded)).sum(axis=1) >= 2).any())
             summary.add(start, stop, np.ascontiguousarray(regridded[:, selected]))
     return summary.dataset(), member_spread
-
-
-def _summarise(rain: np.ndarray, ids: np.ndarray, issues: np.ndarray, days: list[int], context: dict) -> xr.Dataset:
-    """Onset counts and rain summaries from a file's (issue, member, unit, day) rainfall."""
-    summary = _Summary(ids, issues, days, context)
-    summary.add(0, len(issues), rain)
-    return summary.dataset()
 
 
 def member_mean(rain: np.ndarray) -> np.ndarray:
@@ -501,48 +525,6 @@ class _Summary:
         )
 
 
-def _forecast_file_from_table(path: Path, context: dict) -> tuple[xr.Dataset, bool]:
-    """The legacy table route, for cell transforms and dissemination filters:
-    read every row, transform and filter, then summarise as arrays."""
-    spec = context["spec"]
-    df = nc_utils.nc_read_forecast_wide(
-        nc_path=str(path), var_name=context["variable"], dim_rename_map=spec["dimensions"]["rename"],
-        spec=spec, day_dim="day", prefix="rain",
-    )
-    if df is None:
-        raise ValueError(f"{path.name} has no {context['variable']!r} variable")
-    rain_cols = [c for c in df.columns if c.startswith("rain_day_")]
-    _, ordered = io.lead_days_in_order(
-        np.arange(len(rain_cols)), [int(c.rsplit("_", 1)[1]) for c in rain_cols], path.name
-    )
-    rain_cols = [f"rain_day_{d}" for d in ordered]
-    if context["unit_scale"] != 1.0:
-        df[rain_cols] = df[rain_cols].to_numpy() * context["unit_scale"]
-    df = domain.with_ids(df, context["convention"])
-    if context["cell_transform"] is not None:
-        df = nc_utils.transform_forecast_wide(df, context["cell_transform"], spec=spec)
-    df = context["area"](df)
-    has_spread = "number" in df.columns and bool(
-        (df[rain_cols].notna().groupby([df["id"], df["time"]]).sum() >= 2).to_numpy().any()
-    )
-    if context["keep_ids"] is not None:
-        df = df[df["id"].isin(context["keep_ids"])]
-    if "number" in df.columns and context["max_member"] is not None:
-        df = df[df["number"] <= context["max_member"]]
-    if "number" in df.columns and context["member_ids"] is not None:
-        df = df[df["number"].isin(context["member_ids"])]
-    issues = np.sort(pd.to_datetime(df["time"].unique()).to_numpy())
-    ids = np.sort(df["id"].astype(str).unique())
-    members = np.sort(df["number"].unique()) if "number" in df.columns else np.array([0])
-    days = [int(c.rsplit("_", 1)[1]) for c in rain_cols]
-    rain = np.full((len(issues), len(members), len(ids), len(days)), np.nan, dtype=df[rain_cols[0]].dtype)
-    t = np.searchsorted(issues, pd.to_datetime(df["time"]).to_numpy())
-    m = np.searchsorted(members, df["number"].to_numpy()) if "number" in df.columns else np.zeros(len(df), int)
-    u = np.searchsorted(ids, df["id"].astype(str).to_numpy())
-    rain[t, m, u] = df[rain_cols].to_numpy()
-    return _summarise(rain, ids, issues, days, context), has_spread
-
-
 def _forecast_bytes(path: Path, context: dict) -> int:
     """Peak memory to process one forecast file: one run of issues' rainfall
     at the kept points (read in storage-chunk runs) and its working copies,
@@ -563,9 +545,7 @@ def _forecast_bytes(path: Path, context: dict) -> int:
         n_times = variable.shape[0]
     kept = 1.0
     if context["keep_ids"] is not None:
-        points = nc_utils.forecast_points(
-            str(path), context["variable"], context["spec"]["dimensions"]["rename"], day_dim="day"
-        )
+        points = io.forecast_points(path, context["variable"], context["spec"]["dimensions"]["rename"])
         if points is not None and len(points):
             kept = float(domain.with_ids(points, context["convention"])["id"].isin(context["keep_ids"]).mean())
     run_values = values * kept * min(1.0, run / max(n_times, 1))

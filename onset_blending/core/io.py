@@ -211,10 +211,10 @@ class ForecastFile:
             raise ValueError(f"{self.path}: a layout the point reader does not support")
         self._v = v = ds.variables[variable]
         dim_names, dim_vals = layout["dim_names"], layout["dim_vals"]
-        day_idx, other_idx, n_leading = layout["day_idx"], layout["other_idx"], layout["n_leading"]
+        day_idx, time_idx, member_idx = layout["day_idx"], layout["time_idx"], layout["member_idx"]
         positions, _, day_numbers = _select_forecast_days(dim_vals[dim_names[day_idx]], spec, self.path)
         self._day_positions, self.days = lead_days_in_order(positions, day_numbers, self.path)
-        spatial = [dim_names[i] for i in other_idx[n_leading:]]
+        spatial = [dim_names[i] for i in layout["spatial_idx"]]
         shape = [len(dim_vals[d]) for d in spatial]
         n_points = int(np.prod(shape))
         keep = np.asarray(keep, dtype=bool)
@@ -227,8 +227,9 @@ class ForecastFile:
             _product_frame(spatial, [dim_vals[d] for d in spatial]), rename, layout["adm3_dim_name"]
         ).take(kept).reset_index(drop=True)
 
-        self._n_times = len(dim_vals[dim_names[0]])
-        self._member_dim = other_idx[1] if layout["has_members"] else None
+        self._time_dim = time_idx
+        self._n_times = len(dim_vals[dim_names[time_idx]])
+        self._member_dim = member_idx
         self._n_members = len(dim_vals[dim_names[self._member_dim]]) if self._member_dim is not None else 1
         self.members = (
             np.asarray(dim_vals[dim_names[self._member_dim]]).astype(int) if self._member_dim is not None else None
@@ -247,10 +248,11 @@ class ForecastFile:
         for corner in np.ndindex(*[len(_ranges(t, size)) for t, size in zip(tile_sizes, shape)]):
             bounds = [_ranges(t, size)[c] for t, size, c in zip(tile_sizes, shape, corner)]
             self._tiles.append((bounds, grid_index[tuple(slice(a, b) for a, b in bounds)].reshape(-1)))
-        self._perm = other_idx + [day_idx]
+        # Read blocks are put in (time, member, points..., day) order.
+        self._perm = [time_idx] + ([member_idx] if member_idx is not None else []) + layout["spatial_idx"] + [day_idx]
         self._dim_names = dim_names
         # The issue dimension's own units, whatever it is called.
-        time_dim = dim_names[0]
+        time_dim = dim_names[time_idx]
         units = getattr(ds.variables[time_dim], "units", None) if time_dim in ds.variables else None
         units = units or nc_time(ds)["units"]
         stamps = pd.DatetimeIndex(time_to_dates(dim_vals[time_dim], units))
@@ -266,7 +268,7 @@ class ForecastFile:
         """(start, stop, rain) for consecutive runs of issues; rain holds every
         member: (issue, member, point, day), one member when deterministic."""
         runs = {}
-        for t0, t1, m0, m1 in _leading_tiles(self._v, self._n_times, self._n_members, self._member_dim):
+        for t0, t1, m0, m1 in _leading_tiles(self._v, self._n_times, self._n_members, self._member_dim, self._time_dim):
             runs.setdefault((t0, t1), []).append((m0, m1))
         for (t0, t1), member_ranges in runs.items():
             rain = None
@@ -283,7 +285,7 @@ class ForecastFile:
             if not kept_here.any() and not area_here.any():
                 continue
             index = [slice(None)] * len(self._dim_names)
-            index[0] = slice(t0, t1)
+            index[self._time_dim] = slice(t0, t1)
             if self._member_dim is not None:
                 index[self._member_dim] = slice(m0, m1)
             for axis, (a, b) in zip(self._spatial_axes, bounds):
@@ -500,9 +502,9 @@ def _named_grid(frame: pd.DataFrame, rename, adm3_dim_name) -> pd.DataFrame:
 
 
 def _forecast_layout(ds, variable: str, rename, day_dim: str) -> dict | None:
-    """The forecast variable's layout for point-wise reading, or None: leading
-    (time[, number]) dimensions, the lead day, and trailing spatial
-    dimensions (lat/lon, or adm3_name read as `id`), time first."""
+    """The forecast variable's layout for point-wise reading, or None: the
+    issue time, the lead day, optionally the member, and spatial dimensions
+    (lat/lon, or adm3_name read as `id`), in any order and nothing else."""
     v = ds.variables[variable]
     dim_names = list(v.dimensions)
     dim_vals = {}
@@ -524,28 +526,40 @@ def _forecast_layout(ds, variable: str, rename, day_dim: str) -> dict | None:
     renamed = [c.lower() for c in renamed]
     adm3 = adm3_dim_name.lower() if adm3_dim_name else None
     renamed = ["id" if name in ("adm3_name", adm3) else name for name in renamed]
-    if day_dim.lower() not in renamed:
-        return None
-    day_idx = renamed.index(day_dim.lower())
-    other_idx = [i for i in range(len(dim_names)) if i != day_idx]
-    names = [renamed[i] for i in other_idx]
-    n_spatial = 0
-    for name in reversed(names):
-        if name not in _SPATIAL_DIMS:
-            break
-        n_spatial += 1
-    leading = names[: len(names) - n_spatial]
-    if not n_spatial or leading not in (["time"], ["time", "number"]) or other_idx[0] != 0:
+    roles = {"time": [], "number": [], day_dim.lower(): [], "spatial": []}
+    for i, name in enumerate(renamed):
+        if name in _SPATIAL_DIMS:
+            roles["spatial"].append(i)
+        elif name in roles:
+            roles[name].append(i)
+        else:
+            return None
+    if len(roles["time"]) != 1 or len(roles[day_dim.lower()]) != 1 or len(roles["number"]) > 1 or not roles["spatial"]:
         return None
     return {
         "dim_names": dim_names,
         "dim_vals": dim_vals,
         "adm3_dim_name": adm3_dim_name,
-        "day_idx": day_idx,
-        "other_idx": other_idx,
-        "n_leading": len(leading),
-        "has_members": "number" in leading,
+        "day_idx": roles[day_dim.lower()][0],
+        "time_idx": roles["time"][0],
+        "member_idx": roles["number"][0] if roles["number"] else None,
+        "spatial_idx": roles["spatial"],
     }
+
+
+def forecast_points(path, variable: str, rename) -> pd.DataFrame | None:
+    """The forecast variable's spatial points, in file order (lat/lon, or id);
+    None without the variable or for a layout the reader does not support."""
+    import netCDF4
+
+    with netCDF4.Dataset(path) as ds:
+        if variable not in ds.variables:
+            return None
+        layout = _forecast_layout(ds, variable, rename, "day")
+        if layout is None:
+            return None
+        spatial = [layout["dim_names"][i] for i in layout["spatial_idx"]]
+        return _named_grid(_product_frame(spatial, [layout["dim_vals"][d] for d in spatial]), rename, layout["adm3_dim_name"])
 
 
 def _whole_day(value) -> int | None:
@@ -618,19 +632,19 @@ def _select_forecast_days(day_values, spec: dict, path) -> tuple[np.ndarray, lis
     return positions, day_values[positions].tolist(), [day_numbers[position] for position in positions]
 
 
-def _leading_tiles(v, n_times: int, n_members: int, member_dim):
-    """(t0, t1, m0, m1) tiles over the leading time (and member) dimensions:
-    whole storage chunks, grown along time to about _READ_SLAB_VALUES values,
-    so each chunk is decompressed exactly once. member_dim is the member
-    dimension's position in the variable, or None."""
+def _leading_tiles(v, n_times: int, n_members: int, member_dim, time_dim: int = 0):
+    """(t0, t1, m0, m1) tiles over the time (and member) dimensions: whole
+    storage chunks, grown along time to about _READ_SLAB_VALUES values, so
+    each chunk is decompressed exactly once. member_dim and time_dim are the
+    dimensions' positions in the variable (member_dim None without one)."""
     chunks = v.chunking()
     if isinstance(chunks, list):
-        time_chunk = int(chunks[0])
+        time_chunk = int(chunks[time_dim])
         member_step = int(chunks[member_dim]) if member_dim is not None else n_members
     else:  # contiguous storage: any slab reads only its own bytes
         time_chunk, member_step = 1, n_members
     member_step = max(1, min(n_members, member_step))
-    per_time = int(np.prod(v.shape[1:])) * member_step // max(1, n_members)
+    per_time = int(np.prod(v.shape)) // max(1, v.shape[time_dim]) * member_step // max(1, n_members)
     rows = max(1, _READ_SLAB_VALUES // max(1, per_time))
     time_step = max(1, min(n_times, max(time_chunk, -(-rows // time_chunk) * time_chunk)))
     for t0 in range(0, n_times, time_step):
