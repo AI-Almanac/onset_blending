@@ -451,10 +451,37 @@ def write_pickle(path, obj):
 
 
 def assert_same_files(old_dir, new_dir):
+    """Byte-identical files; pickles may instead hold exactly equal objects,
+    since frames scored in worker processes share fewer string objects (and
+    so pickle to other bytes)."""
     old = {p.name: p.read_bytes() for p in old_dir.iterdir()}
     new = {p.name: p.read_bytes() for p in new_dir.iterdir()}
     assert sorted(new) == sorted(old)
-    assert [name for name in old if old[name] != new[name]] == []
+    differ = [name for name in old if old[name] != new[name]]
+    assert [name for name in differ if not name.endswith(".pkl")] == []
+    for name in differ:
+        assert_same_object(pickle.loads(old[name]), pickle.loads(new[name]))
+
+
+def assert_same_object(old, new):
+    assert type(new) is type(old)
+    if isinstance(old, pd.DataFrame):
+        pd.testing.assert_frame_equal(new, old, check_exact=True)
+        assert new.attrs == old.attrs
+    elif isinstance(old, pd.Series):
+        pd.testing.assert_series_equal(new, old, check_exact=True)
+    elif isinstance(old, dict):
+        assert list(new) == list(old)
+        for key in old:
+            assert_same_object(old[key], new[key])
+    elif isinstance(old, (list, tuple)):
+        assert len(new) == len(old)
+        for a, b in zip(old, new):
+            assert_same_object(a, b)
+    elif isinstance(old, np.ndarray):
+        np.testing.assert_array_equal(new, old, strict=True)
+    else:
+        assert new == old
 
 
 def run_both(tmp_path, weekly, spec, dissemination, inputs=None, workers=1):

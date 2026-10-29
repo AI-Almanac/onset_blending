@@ -7,13 +7,16 @@ import os
 import shutil
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+from multiprocessing import get_context
 from pathlib import Path
 
 import pandas as pd
 
 from . import _parallel, climatology as climatology_stage, features, onsets
 from .climatology import Climatology
+from . import config as cfg
 from .config import BlendConfig
 from .onsets import ForecastOnsets, ObservedOnsets
 from .reference import Reference
@@ -185,16 +188,46 @@ def train(config: BlendConfig, *, resources: Resources | None = None, daily: boo
     cv_spec = _specs.cv_spec(config)
     dissemination = dissemination_table(config, inputs.weekly)
 
+    # The final fit needs only the training rows' formula columns, so it runs
+    # in its own process alongside the evaluation (as the separate
+    # 3_fit_final_model.py did beside 1_blend_evaluation.py).
     started = time.perf_counter()
-    evaluation = evaluate(inputs.weekly, cv_spec, dissemination, workers=_cv_workers(inputs.weekly, resources))
-    inputs.timings["evaluation"] = time.perf_counter() - started
-    log.info("evaluation in %.1fs", inputs.timings["evaluation"])
-
-    started = time.perf_counter()
-    fitted = fit_final(inputs.weekly, cv_spec, dissemination, model_name=config.final_formula())
-    inputs.timings["final fit"] = time.perf_counter() - started
+    # One BLAS thread: the fit's coefficients do not depend on the thread
+    # count (checked on India), and it then takes no core from the evaluation.
+    with ProcessPoolExecutor(
+        max_workers=1, mp_context=get_context("spawn"), initializer=_parallel.limit_blas_threads, initargs=(1,)
+    ) as pool:
+        final = pool.submit(
+            fit_final, _final_fit_columns(inputs.weekly, cv_spec, config), cv_spec, dissemination,
+            model_name=config.final_formula(),
+        )
+        evaluation = evaluate(inputs.weekly, cv_spec, dissemination, workers=_cv_workers(inputs.weekly, resources))
+        inputs.timings["evaluation"] = time.perf_counter() - started
+        log.info("evaluation in %.1fs", inputs.timings["evaluation"])
+        started = time.perf_counter()
+        fitted = final.result()
+    inputs.timings["final fit (after the evaluation)"] = time.perf_counter() - started
     blend = TrainedBlend.from_training(config, inputs, fitted)
     return TrainingResult(config=config, inputs=inputs, evaluation=evaluation, blend=blend)
+
+
+def _final_fit_columns(weekly: pd.DataFrame, cv_spec: dict, config: BlendConfig) -> pd.DataFrame:
+    """The weekly table's columns the final fit reads: keys, outcome, the
+    climatology weeks and every enabled formula's terms (the sample support
+    spans them all); the whole table when a formula names anything else."""
+    from ._legacy.blend_evaluation_utils import _parse_formula_cols, build_formulas_from_spec
+
+    formulas = build_formulas_from_spec(
+        cv_spec, config.evaluation.cutoff_mode, data=weekly, n_bins=config.features.bins.count
+    )
+    terms = {column for text in formulas.values() for column in _parse_formula_cols(text)}
+    if not terms <= set(weekly.columns):
+        return weekly
+    keys = {"id", "time", "year", "lat", "lon", "outcome"}
+    climatology = f"{cfg.CLIMATOLOGY_FEATURE}_"
+    slim = weekly[[c for c in weekly.columns if c in keys or c in terms or c.startswith(climatology)]]
+    slim.attrs.update(weekly.attrs)
+    return slim
 
 
 # Copies of the weekly table the evaluation's main process and each CV fold

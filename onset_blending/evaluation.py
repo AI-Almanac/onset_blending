@@ -14,6 +14,7 @@ forecasts; the MME blend.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -250,12 +251,17 @@ def evaluate(
     result = Evaluation(output_tag=run.output_tag, sample_support=support, formulas=formulas)
     scores = _Scores(cells, n_bins)
     _cross_validate(ctx, formulas, cv_methods, workers, result, scores)
-    for external, preds in externals:
-        log.info("\nExternal CV predictions: %s (%s)", external.name, external.path)
-        scores.add_model(preds, external.name, external.method)
-    clim_preds = _climatology_baselines(ctx, scores)
-    calibrated_preds = _forecast_baselines(ctx, result, scores)
-    _mme(ctx, clim_preds, calibrated_preds, workers, results_dir, result, scores)
+    # After the CV, the scoring and the Platt calibration fan out over worker
+    # processes (with one BLAS thread each); scores keep their order.
+    with _scoring_pool(workers) as pool:
+        scores.pool = ctx.pool = pool
+        for external, preds in externals:
+            log.info("\nExternal CV predictions: %s (%s)", external.name, external.path)
+            scores.add_model(preds, external.name, external.method)
+        clim_preds = _climatology_baselines(ctx, scores)
+        calibrated_preds = _forecast_baselines(ctx, result, scores)
+        _mme(ctx, clim_preds, calibrated_preds, workers, results_dir, result, scores)
+        scores.resolve()
 
     if scores.cells:
         result.cell_metrics = pd.concat(scores.cells, ignore_index=True)
@@ -268,13 +274,38 @@ def evaluate(
     return result
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Context:
     spec: dict
     run: RunSettings
     weekly: pd.DataFrame  # the formula-supported rows of every cell
     cells: pd.DataFrame  # dissemination cells
     n_bins: int
+    pool: object = None  # the scoring pool, once the CV is done
+
+
+@contextlib.contextmanager
+def _scoring_pool(workers: int):
+    """Spawned processes with one BLAS thread each, or None for one worker."""
+    if workers <= 1:
+        yield None
+        return
+    from concurrent.futures import ProcessPoolExecutor
+    from multiprocessing import get_context
+
+    from ._parallel import limit_blas_threads
+
+    with ProcessPoolExecutor(
+        max_workers=workers, mp_context=get_context("spawn"), initializer=limit_blas_threads, initargs=(1,)
+    ) as pool:
+        yield pool
+
+
+def _baseline_metrics(preds, allowed_cells, model, method):
+    cell_metrics = compute_cell_metrics_fast(preds, allowed_cells=allowed_cells)
+    cell_metrics["model"] = model
+    cell_metrics["cv_method"] = method
+    return cell_metrics
 
 
 @dataclass
@@ -283,23 +314,43 @@ class _Scores:
 
     allowed_cells: pd.DataFrame
     n_bins: int
-    cells: list[pd.DataFrame] = field(default_factory=list)
-    yearly: list[dict] = field(default_factory=list)
+    cells: list = field(default_factory=list)   # metric frames, or futures of them until resolve()
+    yearly: list = field(default_factory=list)
+    pool: object = None
 
     def add_model(self, preds, model, method):
         """CV predictions: per-cell and per-year metrics."""
-        cell_metrics, yearly_rows = score_model_predictions(
-            preds, model, method, self.allowed_cells, self.n_bins
-        )
-        self.cells.append(cell_metrics)
-        self.yearly.extend(yearly_rows)
+        if self.pool is None:
+            cell_metrics, yearly_rows = score_model_predictions(
+                preds, model, method, self.allowed_cells, self.n_bins
+            )
+            self.cells.append(cell_metrics)
+            self.yearly.extend(yearly_rows)
+            return
+        future = self.pool.submit(score_model_predictions, preds, model, method, self.allowed_cells, self.n_bins)
+        self.cells.append((future, 0))
+        self.yearly.append((future, 1))
 
     def add_baseline(self, preds, model, method):
         """Baselines and the MME: per-cell metrics only."""
-        cell_metrics = compute_cell_metrics_fast(preds, allowed_cells=self.allowed_cells)
-        cell_metrics["model"] = model
-        cell_metrics["cv_method"] = method
-        self.cells.append(cell_metrics)
+        if self.pool is None:
+            self.cells.append(_baseline_metrics(preds, self.allowed_cells, model, method))
+        else:
+            self.cells.append((self.pool.submit(_baseline_metrics, preds, self.allowed_cells, model, method), None))
+
+    def resolve(self) -> None:
+        """Wait for the pooled scores, keeping the order they were added in."""
+        def value(entry):
+            if not isinstance(entry, tuple):
+                return [entry]
+            future, part = entry
+            result = future.result()
+            return [result] if part is None else ([result[part]] if part == 0 else list(result[part]))
+        self.cells = [frame for entry in self.cells for frame in value(entry)]
+        yearly = []
+        for entry in self.yearly:
+            yearly.extend(value(entry) if isinstance(entry, tuple) else [entry])
+        self.yearly = yearly
 
 
 def _load_external_predictions(extras, results_dir, n_bins):
@@ -448,6 +499,7 @@ def _forecast_baselines(ctx, result, scores):
                     run.true_holdout_years,
                     ctx.cells,
                     ctx.spec,
+                    executor=ctx.pool,
                 )
                 if preds is not None and not preds.empty:
                     key = fc_name if variant == "base" else f"{fc_name}_calibrated_{variant}"

@@ -17,9 +17,10 @@ from ._legacy import nc_utils, onset_utils
 from .config import BlendConfig, ForecastModel
 from .reference import OBSERVATIONS, Reference
 
-# Peak bytes per forecast value while one file is processed (the values read
-# at kept points, measured below), and the cost beyond its values.
-_FORECAST_BYTES_PER_VALUE = 18
+# Peak bytes per rainfall value of one run of issues (the float32 run, the
+# onset search's float64 copy of an issue, the summaries), and the
+# interpreter's own footprint.
+_FORECAST_BYTES_PER_RUN_VALUE = 10
 _FORECAST_FIXED_BYTES = 512 * 2**20
 
 
@@ -562,13 +563,20 @@ def _forecast_file_from_table(path: Path, context: dict) -> tuple[xr.Dataset, bo
 
 
 def _forecast_bytes(path: Path, context: dict) -> int:
-    """Peak memory to process one forecast file: the kept points' rainfall,
-    its float64 copy for one issue at a time, and the summaries."""
+    """Peak memory to process one forecast file: one run of issues' rainfall
+    at the kept points (read in storage-chunk runs) and its working copies,
+    over the interpreter's own. Measured at 1.04 GB for an India ENS file
+    (26 members, 4,624 kept units) against this estimate's 1.1 GB."""
     import netCDF4
 
     with netCDF4.Dataset(path) as ds:
         variable = ds.variables.get(context["variable"])
-        values = math.prod(variable.shape) if variable is not None else 0
+        if variable is None:
+            return _FORECAST_FIXED_BYTES
+        values = math.prod(variable.shape)
+        chunks = variable.chunking()
+        run = int(chunks[0]) if isinstance(chunks, list) else 1
+        n_times = variable.shape[0]
     kept = 1.0
     if context["keep_ids"] is not None:
         points = nc_utils.forecast_points(
@@ -576,7 +584,8 @@ def _forecast_bytes(path: Path, context: dict) -> int:
         )
         if points is not None and len(points):
             kept = float(domain.with_ids(points, context["convention"])["id"].isin(context["keep_ids"]).mean())
-    return int(values * kept * _FORECAST_BYTES_PER_VALUE) + _FORECAST_FIXED_BYTES
+    run_values = values * kept * min(1.0, run / max(n_times, 1))
+    return int(run_values * _FORECAST_BYTES_PER_RUN_VALUE) + _FORECAST_FIXED_BYTES
 
 
 def forecast(

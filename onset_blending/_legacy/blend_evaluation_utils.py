@@ -555,11 +555,15 @@ def fit_platt_weights_export(df, prob_cols, training_years,
 
 def platt_cv_multibin(df, prob_cols, holdout_years, true_holdout_years=(),
                        outcome_col="outcome", year_col="year",
-                       cv_prefix="cv_", allowed_cells=None):
+                       cv_prefix="cv_", allowed_cells=None, executor=None):
     """Cross-validated per-bin Platt calibration.
 
     IMPORTANT: matches R glm(y ~ p, ...) which regresses on raw probability p,
     NOT logit(p). This produces different calibrated values than the logit version.
+
+    Each fit runs with one BLAS thread, so the results do not depend on the
+    machine's core count; with an executor (spawned, process-based) the
+    holdout years are fitted in parallel, with the same results.
     """
     bins = prob_cols
     out_list = []
@@ -581,30 +585,29 @@ def platt_cv_multibin(df, prob_cols, holdout_years, true_holdout_years=(),
         for b in bins
     }
 
-    for test_year in holdout_years:
+    arrays = {
+        "p": np.stack([p_all[b] for b in bins]),
+        "y": np.stack([y_all[b] for b in bins]),
+        "years": years,
+        "trainable": outside_true_holdout & allowed,
+    }
+    if executor is None:
+        folds = [_platt_fold(arrays, test_year) for test_year in holdout_years]
+    else:
+        from .._parallel import SharedArrays
+
+        with SharedArrays(**arrays) as shared:
+            futures = [executor.submit(_platt_fold, shared.specs, test_year) for test_year in holdout_years]
+            folds = [future.result() for future in futures]
+
+    for test_year, fold in zip(holdout_years, folds):
         test_rows = years == test_year
         test = df[test_rows].copy()
         if test.empty:
             continue
-        train_positions = np.flatnonzero((years != test_year) & outside_true_holdout & allowed)
-
-        cal_mat = np.full((len(test), len(bins)), np.nan)
-        for j, b in enumerate(bins):
-            p_tr = p_all[b][train_positions]
-            y_tr = y_all[b][train_positions]
-            ok = np.isfinite(p_tr) & ~np.isnan(y_tr)
-            if ok.sum() < 10 or len(np.unique(y_tr[ok])) < 2:
-                cal_mat[:, j] = test[b].values.astype(float)
-                continue
-
-            # Match R: use raw p as the predictor (not logit)
-            X = p_tr[ok].reshape(-1, 1)
-            clf = LogisticRegression(solver="lbfgs", C=1e9, max_iter=1000, tol=1e-5)
-            clf.fit(X, y_tr[ok])
-
-            # Predict on test using raw probability
-            test_p = p_all[b][test_rows].reshape(-1, 1)
-            cal_mat[:, j] = expit(clf.intercept_[0] + clf.coef_[0][0] * test_p.flatten())
+        cal_mat, fallback = fold
+        for j in fallback:
+            cal_mat[:, j] = test[bins[j]].values.astype(float)
 
         rs = cal_mat.sum(axis=1, keepdims=True)
         rs[rs == 0] = 1
@@ -620,9 +623,44 @@ def platt_cv_multibin(df, prob_cols, holdout_years, true_holdout_years=(),
     return pd.DataFrame()
 
 
+def _platt_fold(arrays, test_year):
+    """One holdout year's per-bin Platt fits: (calibrated test probabilities,
+    bins left uncalibrated). arrays holds p, y (bin, row), years and
+    trainable, or their shared-memory specs."""
+    from threadpoolctl import threadpool_limits
+
+    if not isinstance(arrays["p"], np.ndarray):
+        from .._parallel import attach
+
+        arrays = attach(arrays)
+    p_all, y_all, years = arrays["p"], arrays["y"], arrays["years"]
+    test_rows = years == test_year
+    train_positions = np.flatnonzero((years != test_year) & arrays["trainable"])
+    cal_mat = np.full((int(test_rows.sum()), len(p_all)), np.nan)
+    fallback = []
+    with threadpool_limits(limits=1):
+        for j in range(len(p_all)):
+            p_tr = p_all[j][train_positions]
+            y_tr = y_all[j][train_positions]
+            ok = np.isfinite(p_tr) & ~np.isnan(y_tr)
+            if ok.sum() < 10 or len(np.unique(y_tr[ok])) < 2:
+                fallback.append(j)
+                continue
+
+            # Match R: use raw p as the predictor (not logit)
+            X = p_tr[ok].reshape(-1, 1)
+            clf = LogisticRegression(solver="lbfgs", C=1e9, max_iter=1000, tol=1e-5)
+            clf.fit(X, y_tr[ok])
+
+            # Predict on test using raw probability
+            test_p = p_all[j][test_rows].reshape(-1, 1)
+            cal_mat[:, j] = expit(clf.intercept_[0] + clf.coef_[0][0] * test_p.flatten())
+    return cal_mat, fallback
+
+
 def make_calibrated_preds_from_wide(wide_df, forecast_name, variant,
                                     training_years, holdout_years, true_holdout_years,
-                                    allowed_cells, spec):
+                                    allowed_cells, spec, executor=None):
     """Platt-calibrated predictions via platt_cv_multibin (any number of week bins)."""
     suf = get_forecast_variant_suffix(spec, variant)
     base = f"{forecast_name}_p_onset{suf}"
@@ -646,6 +684,7 @@ def make_calibrated_preds_from_wide(wide_df, forecast_name, variant,
         year_col="year",
         cv_prefix="cv_",
         allowed_cells=allowed_cells,
+        executor=executor,
     )
 
 
