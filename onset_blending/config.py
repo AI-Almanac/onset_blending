@@ -529,7 +529,7 @@ class Mme:
     variants: tuple[str, ...] = _field(("fixed_cutoff",), doc="Labels the MME runs carry.")
     sources: tuple[MmeSource, ...] = _field(factory=tuple)
     optimize: Literal["auto", "always", "never"] = _field(
-        "auto", doc="auto: optimise only when the holdout years are 2000-2024; else read saved weights."
+        "auto", doc="auto: optimise only when the holdout years are 2000-2024; else read saved weights (CSV)."
     )
     weights_year_tag: str | None = _field(None, doc="Tag of the saved weights to read.")
 
@@ -537,7 +537,7 @@ class Mme:
 @dataclass(frozen=True, kw_only=True)
 class ExternalPrediction:
     name: str
-    file: str = _field(doc="Pickle of cv_* predictions (relative to the outputs dir).")
+    file: str = _field(doc="CV predictions: NetCDF (.nc, as evaluations save them) or a pickled cv_* table; relative to the outputs dir.")
     method: str = "global"
 
 

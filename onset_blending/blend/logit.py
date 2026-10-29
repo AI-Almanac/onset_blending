@@ -3,13 +3,24 @@ multinomial logistic regression over the week bins.
 
 `FittedModel` is a fitted blend (it converts to and from the coefficient
 bundle the legacy scripts pickled, and to plain arrays and JSON-able
-metadata); `fit_samples` fits one on weekly samples, from the arrays when the
-formula has a design plan. Global leave-one-year-out cross-validation and the
-final fit share one design matrix (`global_cv`): a formula's design for every
-evaluation sample is built once, column-major, in shared memory that the
-fold workers and the final fit attach to. Each fits its rows as the legacy
-compute_cv_global and fit_final did, bit for bit, while holding one copy of
-its rows rather than two or three:
+metadata; `fold_coefficients` stacks CV folds' models into one Dataset);
+`fit_samples` fits one on weekly samples, from the arrays when the formula
+has a design plan.
+
+Cross-validation, on samples of the weekly features:
+
+- `global_cv`: leave one year out, pooling every unit;
+- `local_cv`: leave one year out within each unit;
+- `cluster_cv`: leave one year out within each unit's cluster (one fit per
+  cluster and year, predicting each of its units).
+
+A formula without a design plan (functions, categorical terms) builds a
+Patsy design per fit instead, from the fit's own training rows, as the
+legacy CV did. Global CV and the final fit share one design matrix: a
+formula's design for every evaluation sample is built once, column-major,
+in shared memory that the fold workers and the final fit attach to. Each
+fits its rows as the legacy compute_cv_global and fit_final did, bit for
+bit, while holding one copy of its rows rather than two or three:
 
 - a fold computes its scaler statistics a column at a time (a design column
   is contiguous, so the sums run as on the fold's own column-major design)
@@ -27,6 +38,7 @@ import os
 import pickle
 import tempfile
 import warnings
+from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from multiprocessing import get_context
@@ -34,14 +46,20 @@ from multiprocessing import get_context
 import numpy as np
 import pandas as pd
 import patsy
+import sklearn
+import xarray as xr
+from packaging.version import Version
+from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
-from .._legacy.blend_evaluation_utils import _coef_artifact, _fit_and_predict, _make_multinom_clf
 from ..core import design, parallel
 from ..core.design import Plan
 from ..core.features import Weekly
 
-__all__ = ["FittedModel", "design_matrix", "fit", "fit_samples", "global_cv"]
+__all__ = [
+    "FittedModel", "cluster_cv", "design_matrix", "fit", "fit_samples", "fold_coefficients", "fold_models",
+    "global_cv", "local_cv", "multinomial",
+]
 
 log = logging.getLogger(__name__)
 
@@ -250,6 +268,48 @@ class FittedModel:
         return scaler
 
 
+def fold_coefficients(models: Mapping[int, FittedModel]) -> xr.Dataset:
+    """CV folds' models, stacked over their holdout `year`: coef (year,
+    class, feature), intercept (year, class) and the scaler statistics
+    (year, feature). The folds share the formula, features and classes."""
+    first = next(iter(models.values()))
+    for year, model in models.items():
+        if (model.formula, model.features, model.classes) != (first.formula, first.features, first.classes):
+            raise ValueError(f"fold {year} has another formula, features or classes than the first fold")
+        if model.scaler_mean is None:
+            raise ValueError(f"fold {year} has no scaler")
+    stack = lambda name: np.stack([getattr(m, name) for m in models.values()])
+    return xr.Dataset(
+        {
+            "coef": (("year", "class", "feature"), stack("coef")),
+            "intercept": (("year", "class"), stack("intercept")),
+            **{name: (("year", "feature"), stack(name)) for name in _SCALER_ARRAYS},
+            "n_samples": ("year", np.array([m.n_samples for m in models.values()], dtype=np.int64)),
+        },
+        coords={"year": np.array(list(models), dtype=np.int64), "class": list(first.classes),
+                "feature": list(first.features)},
+        attrs={"formula": first.formula},
+    )
+
+
+def fold_models(data: xr.Dataset) -> dict[int, FittedModel]:
+    """The models fold_coefficients stacked, by holdout year."""
+    features = [str(f) for f in data["feature"].values]
+    classes = [str(c) for c in data["class"].values]
+    out = {}
+    for k, year in enumerate(data["year"].values.tolist()):
+        out[int(year)] = FittedModel(
+            formula=str(data.attrs["formula"]),
+            features=features,
+            classes=classes,
+            coef=data["coef"].values[k],
+            intercept=data["intercept"].values[k],
+            n_samples=int(data["n_samples"].values[k]),
+            **{name: data[name].values[k] for name in _SCALER_ARRAYS},
+        )
+    return out
+
+
 def design_matrix(formula: str, data: pd.DataFrame) -> pd.DataFrame:
     """The formula's right-hand side as a Patsy design matrix, without the
     intercept column and keeping rows with missing values."""
@@ -274,9 +334,18 @@ def fit(formula: str, train: pd.DataFrame) -> FittedModel:
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_fit)
-    clf = _make_multinom_clf()
+    clf = multinomial()
     clf.fit(X_scaled, y_fit)
     return FittedModel.from_estimators(formula, features, clf, scaler)
+
+
+def multinomial() -> LogisticRegression:
+    """The blend's multinomial logistic regression (lbfgs, effectively
+    unpenalised); sklearn before 1.5 has to be asked for multinomial."""
+    kwargs = dict(solver="lbfgs", C=1e9, max_iter=5000, tol=1e-5)
+    if Version(sklearn.__version__) < Version("1.5"):
+        kwargs["multi_class"] = "multinomial"
+    return LogisticRegression(**kwargs)
 
 
 def log_fit(used: int, rows: int, classes, features) -> None:
@@ -308,16 +377,16 @@ _WORKER_BASE_BYTES = 350 * 2**20
 
 def global_cv(plan: Plan, values, rows: np.ndarray, trainable: np.ndarray, year: np.ndarray,
               outcome: np.ndarray, *, holdout_years, training_years, true_holdout_years=(),
-              required_classes=None, save_coefs=False, final_years=None, workers=1,
-              budget_bytes=None):
-    """The folds' predictions and coefficients, and the final fit.
+              required_classes=None, final_years=None, workers=1, budget_bytes=None):
+    """The folds' predictions and models, and the final fit.
 
     values(name) gives a feature per sample; rows are the evaluation's
     samples (the design's rows), trainable marks those models train on (the
     dissemination cells), and year and outcome are per row. Returns
-    ([(test_year, test_rows, predictions, coefficient artifact)], final),
-    final being (classifier, scaler, rows used, rows) for the final_years
-    fit, or None without final_years."""
+    ([(test_year, test_rows, probabilities, model)], final): probabilities
+    (test rows, classes) in the model's class order, final being
+    (classifier, scaler, rows used, rows) for the final_years fit, or None
+    without final_years."""
     tasks = [("fold", int(y)) for y in holdout_years]
     if final_years is not None:
         tasks.append(("final", tuple(int(y) for y in final_years)))
@@ -330,7 +399,6 @@ def global_cv(plan: Plan, values, rows: np.ndarray, trainable: np.ndarray, year:
         "training_years": tuple(training_years),
         "true_holdout_years": tuple(true_holdout_years),
         "required_classes": tuple(required_classes) if required_classes is not None else None,
-        "save_coefs": bool(save_coefs),
     }
     shape = (len(rows), len(plan.columns))
     with parallel.SharedArrays() as shared:
@@ -344,6 +412,50 @@ def global_cv(plan: Plan, values, rows: np.ndarray, trainable: np.ndarray, year:
         del design
     final = results.pop() if final_years is not None else None
     return results, final
+
+
+def global_cv_frames(formula: str, weekly: Weekly, rows: np.ndarray, trainable: np.ndarray, *,
+                     holdout_years, training_years, true_holdout_years=(), required_classes=None):
+    """global_cv for a formula without a design plan: each fold builds its
+    Patsy design from its own training rows. Returns the folds as global_cv does."""
+    year = weekly.take("year", rows)
+    outcome = weekly.take("outcome", rows)
+    columns = _frame_columns(formula, weekly)
+    out = []
+    for test_year in holdout_years:
+        train = np.flatnonzero(
+            trainable & np.isin(year, training_years) & (year != test_year) & ~np.isin(year, true_holdout_years)
+        )
+        test = np.flatnonzero(year == test_year)
+        _check_fold(test_year, train, test, outcome[train], training_years, required_classes)
+        fitted = _fit_frames(formula, weekly.frame(rows[train], columns), outcome[train])
+        if fitted is None:
+            raise ValueError(f"Global CV model fitting failed for holdout year {test_year}.")
+        clf, scaler, info = fitted
+        probabilities = _predict_frame(clf, scaler, info, weekly.frame(rows[test], columns))
+        model = FittedModel.from_estimators(formula, info[1], clf, scaler)
+        out.append((int(test_year), test, probabilities, model))
+    return out
+
+
+def _check_fold(test_year, train, test, outcome, training_years, required_classes):
+    if not len(test):
+        raise ValueError(f"Global CV holdout year {test_year} has no test rows.")
+    if not len(train):
+        raise ValueError(
+            f"Global CV holdout year {test_year} has no training rows in "
+            f"training_years={sorted(set(training_years))}."
+        )
+    present = {value for value in pd.unique(outcome) if isinstance(value, str)}
+    if required_classes is not None:
+        missing = [value for value in required_classes if value not in present]
+        if missing:
+            raise ValueError(
+                f"Global CV holdout year {test_year} training rows are missing "
+                f"outcome classes: {', '.join(missing)}."
+            )
+    if len(present) < 2:
+        raise ValueError(f"Global CV model fitting failed for holdout year {test_year}.")
 
 
 def _workers(n_tasks: int, workers: int, shape, train_rows: int, budget_bytes) -> int:
@@ -406,40 +518,27 @@ def _fold(test_year: int, design: np.ndarray, context: dict):
         & ~np.isin(year, context["true_holdout_years"])
     )
     test = np.flatnonzero(year == test_year)
-    if not len(test):
-        raise ValueError(f"Global CV holdout year {test_year} has no test rows.")
-    if not len(train):
-        raise ValueError(
-            f"Global CV holdout year {test_year} has no training rows in "
-            f"training_years={sorted(set(context['training_years']))}."
-        )
     outcome = context["outcome"][train]
-    present = {value for value in pd.unique(outcome) if isinstance(value, str)}
-    if context["required_classes"] is not None:
-        missing = [value for value in context["required_classes"] if value not in present]
-        if missing:
-            raise ValueError(
-                f"Global CV holdout year {test_year} training rows are missing "
-                f"outcome classes: {', '.join(missing)}."
-            )
-    if len(present) < 2:
+    _check_fold(test_year, train, test, outcome, context["training_years"], context["required_classes"])
+    fitted = fit_fold(design, train, outcome, test)
+    if fitted is None:
         raise ValueError(f"Global CV model fitting failed for holdout year {test_year}.")
-    preds, clf = fit_fold(design, train, outcome, test, context["columns"])
-    if preds is None or clf is None:
-        raise ValueError(f"Global CV model fitting failed for holdout year {test_year}.")
-    return test_year, test, preds, _coef_artifact(test_year, clf, context)
+    probabilities, clf, scaler = fitted
+    return test_year, test, probabilities, FittedModel.from_estimators(
+        context["formula_str"], context["columns"], clf, scaler
+    )
 
 
-def fit_fold(design: np.ndarray, train: np.ndarray, y: np.ndarray, test: np.ndarray, columns):
-    """_fit_predict_design(scale=True) on rows of a column-major design:
-    (probabilities for the test rows, classifier), or (None, None)."""
+def fit_fold(design: np.ndarray, train: np.ndarray, y: np.ndarray, test: np.ndarray):
+    """fit_predict on rows of a column-major design: (probabilities for the
+    test rows, classifier, scaler), or None."""
     n_columns = design.shape[1]
     stats, bad = [], np.array([not isinstance(v, str) for v in y])
     for j in range(n_columns):
         values = design[:, j][train]
         if np.isnan(values).any():
             # NaN-aware statistics count per column: the legacy route.
-            return _fit_fold_copy(design, train, y, test, columns)
+            return fit_predict(_rows(design, train), y, _rows(design, test))
         stat = StandardScaler().fit(values[:, None])
         stats.append(stat)
         bad |= ~np.isfinite((values - stat.mean_[0]) / stat.scale_[0])
@@ -450,16 +549,173 @@ def fit_fold(design: np.ndarray, train: np.ndarray, y: np.ndarray, test: np.ndar
         X[:, j] = (design[:, j][keep] - scaler.mean_[j]) / scaler.scale_[j]
     X_test = scaler.transform(_rows(design, test))
     scaler.set_params(copy=True)  # as the legacy scaler is saved
-    return _fit_and_predict(X, y[~bad], X_test, list(columns), pd.RangeIndex(len(test)), scaler, return_clf=True)
+    clf = _fit(X, y[~bad])
+    return None if clf is None else (_predict(clf, X_test), clf, scaler)
 
 
-def _fit_fold_copy(design, train, y, test, columns):
-    from ._legacy.blend_evaluation_utils import _fit_predict_design
+def fit_predict(X_tr: np.ndarray, y_tr: np.ndarray, X_te: np.ndarray):
+    """The legacy CV fit (_fit_predict_design): training rows standardised
+    (in place) before the rows with a non-finite feature or no outcome are
+    dropped, then the multinomial fit. Returns (probabilities for the test
+    rows, NaN where one has a non-finite feature; the classifier; the
+    scaler), or None when there is nothing to fit."""
+    fitted = _fit_scaled(X_tr, y_tr)
+    if fitted is None:
+        return None
+    clf, scaler = fitted
+    return _predict(clf, scaler.transform(X_te)), clf, scaler
 
-    return _fit_predict_design(
-        _rows(design, train), y, _rows(design, test), list(columns), pd.RangeIndex(len(test)),
-        return_clf=True, scale=True,
-    )
+
+def _fit_scaled(X_tr: np.ndarray, y_tr: np.ndarray):
+    """(classifier, scaler) fitted as fit_predict fits them, or None."""
+    scaler = StandardScaler(copy=False)
+    X_tr = scaler.fit_transform(X_tr)
+    scaler.set_params(copy=True)  # as saved before: later transforms copy
+    bad = ~np.isfinite(X_tr).all(axis=1) | np.array([not isinstance(v, str) for v in y_tr], dtype=bool)
+    clf = _fit(X_tr[~bad], y_tr[~bad])
+    return None if clf is None else (clf, scaler)
+
+
+def _fit(X: np.ndarray, y: np.ndarray):
+    """The multinomial fit on prepared rows, or None (no rows, one class, or
+    a solver failure, which warns)."""
+    if len(X) == 0 or len(np.unique(y)) < 2:
+        return None
+    clf = multinomial()
+    try:
+        clf.fit(X, y)
+    except Exception as e:
+        warnings.warn(f"_fit_predict_multinom fit failed: {e}")
+        return None
+    return clf
+
+
+def _predict(clf, X: np.ndarray) -> np.ndarray:
+    """Class probabilities, NaN for rows with a non-finite feature."""
+    bad = ~np.isfinite(X).all(axis=1)
+    probs = np.full((len(X), len(clf.classes_)), np.nan)
+    if (~bad).any():
+        probs[~bad] = clf.predict_proba(X[~bad])
+    return probs
+
+
+# -- local and cluster CV ------------------------------------------------------
+
+
+def local_cv(formula: str, weekly: Weekly, rows: np.ndarray, holdout_years):
+    """Each unit's own leave-one-year-out CV (compute_cv_local): for each unit
+    and each holdout year it has, a fit on its other years' samples predicts
+    that year's. rows are the evaluation's samples, in every unit and year.
+
+    Returns [(test positions into rows, probabilities, classes)], by unit in
+    order of first appearance, then holdout year; a fit with fewer than two
+    outcome classes predicts nothing."""
+    year = weekly.take("year", rows)
+    outcome = weekly.take("outcome", rows)
+    fits = _Fits(formula, weekly, rows, outcome)
+    out = []
+    for mine in _by_unit(weekly, rows):
+        present = set(year[mine].tolist())
+        for test_year in (y for y in holdout_years if y in present):
+            train = mine[year[mine] != test_year]
+            test = mine[year[mine] == test_year]
+            if not len(train) or not len(test):
+                continue
+            predicted = fits.predict(fits.fit(train), test)
+            if predicted is not None:
+                out.append((test, *predicted))
+    return out
+
+
+def cluster_cv(formula: str, weekly: Weekly, rows: np.ndarray, holdout_years, cluster_var: str):
+    """Leave-one-year-out CV within clusters (compute_cv_clusters): a unit's
+    holdout year is predicted by the fit on the other years' samples of
+    every unit in its cluster (its first sample's `cluster_var`). The fit is
+    the same for every unit of a cluster, so it runs once per cluster and
+    year. Returns as local_cv."""
+    year = weekly.take("year", rows)
+    outcome = weekly.take("outcome", rows)
+    cluster = weekly.take(cluster_var, rows)
+    fits = _Fits(formula, weekly, rows, outcome)
+    cache = {}
+    out = []
+    for mine in _by_unit(weekly, rows):
+        here = cluster[mine[0]]
+        present = set(year[mine].tolist())
+        for test_year in (y for y in holdout_years if y in present):
+            key = (here, test_year)
+            if key not in cache:
+                train = np.flatnonzero((year != test_year) & (cluster == here))
+                cache[key] = fits.fit(train) if len(train) else None
+            test = mine[year[mine] == test_year]
+            predicted = fits.predict(cache[key], test)
+            if predicted is not None:
+                out.append((test, *predicted))
+    return out
+
+
+def _by_unit(weekly: Weekly, rows: np.ndarray):
+    """Positions into rows of each unit's samples, units in order of first appearance."""
+    codes, units = pd.factorize(weekly.take("id", rows))
+    order = np.argsort(codes, kind="stable")
+    bounds = np.searchsorted(codes[order], np.arange(len(units) + 1))
+    return [order[bounds[k]:bounds[k + 1]] for k in range(len(units))]
+
+
+class _Fits:
+    """CV fits of one formula on positions into rows, from the arrays when it
+    has a design plan and with Patsy designs otherwise, as
+    _fit_predict_multinom fitted them."""
+
+    def __init__(self, formula: str, weekly: Weekly, rows: np.ndarray, outcome: np.ndarray):
+        self.formula, self.weekly, self.rows, self.outcome = formula, weekly, rows, outcome
+        self.plan = design.plan(formula, weekly.column_dtypes())
+        self.columns = None if self.plan is not None else _frame_columns(formula, weekly)
+
+    def fit(self, train: np.ndarray):
+        """(classifier, scaler, Patsy design or None), or None."""
+        y = self.outcome[train]
+        if len({v for v in pd.unique(y) if isinstance(v, str)}) < 2:
+            return None
+        if self.plan is not None:
+            fitted = _fit_scaled(self.plan.build(self.weekly.take, self.rows[train], order="F"), y)
+            return None if fitted is None else (*fitted, None)
+        return _fit_frames(self.formula, self.weekly.frame(self.rows[train], self.columns), y)
+
+    def predict(self, fitted, test: np.ndarray):
+        """(probabilities, classes) for the test positions, or None without a fit."""
+        if fitted is None:
+            return None
+        clf, scaler, info = fitted
+        if info is not None:
+            frame = self.weekly.frame(self.rows[test], self.columns)
+            return _predict_frame(clf, scaler, info, frame), tuple(clf.classes_)
+        X = scaler.transform(self.plan.build(self.weekly.take, self.rows[test], order="F"))
+        return _predict(clf, X), tuple(clf.classes_)
+
+
+def _frame_columns(formula: str, weekly: Weekly) -> list[str]:
+    """The weekly columns a Patsy design of the formula may read."""
+    return [c for c in dict.fromkeys(design.formula_columns(formula)) if c in weekly.columns]
+
+
+def _fit_frames(formula: str, train: pd.DataFrame, y: np.ndarray):
+    """fit_predict's fit on a Patsy design of the training table: (classifier,
+    scaler, (design info, design columns)), or None."""
+    matrix = patsy.dmatrix(design.right_hand_side(formula), train, return_type="dataframe")
+    info = (matrix.design_info, [c for c in matrix.columns if c != "Intercept"])
+    matrix = matrix.drop(columns=["Intercept"], errors="ignore")
+    fitted = _fit_scaled(matrix.values.astype(float), y)
+    return None if fitted is None else (*fitted, info)
+
+
+def _predict_frame(clf, scaler, info, frame: pd.DataFrame) -> np.ndarray:
+    """Probabilities for a test table, its design built with the training
+    design's info, as _fit_predict_multinom predicted them."""
+    design_info, columns = info
+    matrix = patsy.dmatrix(design_info, frame, return_type="dataframe")
+    matrix = matrix.drop(columns=["Intercept"], errors="ignore").reindex(columns=columns, fill_value=0.0)
+    return _predict(clf, scaler.transform(matrix.values.astype(float)))
 
 
 def _rows(design: np.ndarray, rows: np.ndarray) -> np.ndarray:
@@ -505,6 +761,6 @@ def fit_final_rows(column, n_columns: int, y: np.ndarray):
         X[:, j] = column(j)[mask]
     scaler = StandardScaler(copy=False)
     scaler.fit_transform(X)
-    clf = _make_multinom_clf()
+    clf = multinomial()
     clf.fit(X, y_fit)
     return clf, scaler, int(mask.sum()), len(y)

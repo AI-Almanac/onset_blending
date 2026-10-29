@@ -22,15 +22,23 @@ Phase 3 (data model), against the same references:
   outcome codes, ids and coordinates per unit; `frame()` rebuilds the
   legacy table exactly). Design matrices come from the arrays
   (`design.Plan`, Patsy's columns and bits, 6x faster than Patsy); global
-  CV and the final fit share one design in shared memory (`cv`); baselines
-  and scoring read slim tables of the rows and columns they use. CV
-  predictions keep only their keys (id, time, year, lat, lon, outcome)
-  beside the probabilities.
-- Ethiopia: 20 s; India: 199 s with the system peak +13.8 GB (phase 2:
-  469 s and 66 GB). Both match the references on every artifact; the one
-  exception is the Platt-calibrated baselines, whose fits now run on one
-  BLAS thread so results do not depend on the core count: their Brier and
-  RPS move by < 1e-13, their AUC by < 3e-4 (near-ties reorder).
+  CV and the final fit share one design in shared memory.
+- The evaluation is arrays too, driven by the config: every model's CV
+  predictions are `Predictions` (an xarray Dataset over samples, with the
+  samples' keys), the baselines, Platt calibration, MME and scores are
+  computed from the arrays (`core.calibration`, `blend.mme`,
+  `core.metrics`), and local and cluster CV fit from the arrays (a cluster
+  once per year rather than once per unit). Artifacts are NetCDF (CV
+  predictions, fold coefficients) and CSV (scores, weights); no pickles.
+  The legacy script, run on `_specs.cv_spec(config)`, stays the oracle in
+  the tests: every artifact has the same content.
+- Ethiopia: 21 s; India: 197 s (evaluation and final fit 138 s; the system
+  peak was +13.8 GB before the evaluation moved to arrays, against 469 s and
+  66 GB in phase 2). Both match the
+  references on every artifact; the one exception is the Platt-calibrated
+  baselines, whose fits now run on one BLAS thread so results do not
+  depend on the core count: their Brier and RPS move by < 1e-13, their AUC
+  by < 3e-4 (near-ties reorder).
 
 ## Goals
 
@@ -125,7 +133,7 @@ reads from the one before.
 | forecast onsets | 19.5M-row wide table per India file, then member aggregation | `xr.Dataset[issue, cell, lead]` per model (member stats on read) |
 | climatology | pickled frames per chunk | `xr.Dataset[issue, cell, lead]` |
 | combine + connect | 12 GB daily table → 1.2 GB weekly table, via pickles and row chunks | `features.Weekly`: feature arrays over `sample`, outcome codes, ids/lat/lon per unit (done) |
-| evaluation | spawned scripts reading pickles and YAML | `evaluate()` → `Evaluation` (CV predictions, coefficients, metrics, final model); design matrices built from the arrays, one shared per formula (done) |
+| evaluation | spawned scripts reading pickles and YAML | `evaluate(weekly, config)` → `Evaluation`: every model's CV predictions as `Predictions` (xarray over samples), fold models, metrics from the arrays, final model; design matrices built from the arrays, one shared per formula; NetCDF and CSV artifacts (done) |
 
 ## Package layout
 
@@ -146,12 +154,16 @@ onset_blending/
     onsets.py        observed and forecast onsets
     climatology.py   KDE onset climatology
     features.py      the weekly samples (Weekly)
-    design.py        formula design matrices from the arrays
+    design.py        formulas, and their design matrices from the arrays
+    predictions.py   a model's probabilities for samples (Predictions, NetCDF)
+    metrics.py       Brier, RPS, AUC, Pietra per unit, pooled and per year
+    calibration.py   Platt calibration (cross-validated, weight export)
     parallel.py      worker pools, shared memory
   blend/             blending methods behind one interface
-    logit.py         the multinomial logistic blend; global CV + final fit
+    logit.py         the multinomial logistic blend; global, local, cluster CV + final fit
     random_forest.py the CRPS random forest over daily rain and the climatology
     _crps_tree.py    its trees, from onset-forest (same numerics, stored as arrays)
+    mme.py           the multi-model ensemble of baselines (RPS-optimised weights)
   evaluation.py      cross-validation, baselines, calibration, scores
   training.py        train(config) -> TrainingResult, holding a TrainedBlend
   trained.py         TrainedBlend: recipe + fitted model + reference data
@@ -372,8 +384,8 @@ does about each:
 
 | Today | New |
 |---|---|
-| MME with two or more sources raises KeyError 'lat' at the merge | fixed in phase 2 |
-| formula `window_variants` never match, so a variant repeats its base formula | the variant swaps the windowed climatology in (the converter notes it) |
+| MME with two or more sources raises KeyError 'lat' at the merge | sources aligned on their samples' id and issue date (phase 3) |
+| formula `window_variants` never match, so a variant repeats its base formula | the variant swaps the windowed climatology in (phase 3; the converter notes it) |
 | two `diff` predictors on one model write one column | rejected by validation |
 | combine `join` treats anything but `full` as inner | `inner` or `full` only |
 | no threshold configured gives no onsets, silently | the threshold is required |

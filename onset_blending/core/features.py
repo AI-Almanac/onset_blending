@@ -12,6 +12,7 @@ request.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -34,6 +35,7 @@ from .._legacy.rain_horizon_utils import resolve_rain_day_max, valid_week_start_
 from .climatology import Climatology
 from ..config import BlendConfig
 from .onsets import ForecastOnsets, ObservedOnsets
+from .predictions import outcome_codes, outcome_series
 
 _CHUNK_ROWS = 1_000_000
 
@@ -133,12 +135,6 @@ def _outcome_codes(lead: np.ndarray, days_per_bin: int, n_bins: int) -> tuple[np
     return codes, labels
 
 
-def _outcome_series(codes: np.ndarray, labels: list[str]) -> pd.Series:
-    """The legacy table's outcome column: the labels, missing where code is -1."""
-    values = np.array([*labels, None], dtype=object)[codes]
-    return pd.Series(values, dtype=object).astype(str).where(pd.Series(values).notna(), None)
-
-
 # Names a Weekly uses for its dimensions and bookkeeping.
 _RESERVED = ("sample", "unit", "sample_unit")
 
@@ -194,7 +190,7 @@ class Weekly:
             return variable.values[unit]
         values = variable.values if rows is None else variable.values[rows]
         if "labels" in variable.attrs:
-            return _outcome_series(values, list(variable.attrs["labels"])).to_numpy()
+            return outcome_series(values, list(variable.attrs["labels"])).to_numpy()
         return values
 
     def column_dtypes(self) -> dict[str, np.dtype]:
@@ -206,6 +202,20 @@ class Weekly:
             else:
                 out[name] = self.data[name].dtype
         return out
+
+    def outcome_codes(self, rows: np.ndarray | None = None, labels=None) -> np.ndarray:
+        """The samples' outcomes as positions into `labels` (default: the
+        stored labels): -1 without one, len(labels) for another label."""
+        variable = self.data["outcome"]
+        if "labels" not in variable.attrs:
+            return outcome_codes(self.take("outcome", rows), labels)
+        codes = variable.values if rows is None else variable.values[rows]
+        stored = list(variable.attrs["labels"])
+        if labels is None or list(labels) == stored:
+            return codes.astype(np.int8)
+        index = {label: k for k, label in enumerate(labels)}
+        remap = np.array([index.get(label, len(labels)) for label in stored] + [-1], dtype=np.int8)
+        return remap[codes]
 
     def frame(self, rows: np.ndarray | None = None, columns=None) -> pd.DataFrame:
         """The legacy table, or some rows (positions) and columns of it, on a
@@ -222,13 +232,36 @@ class Weekly:
         variable = None if name == "id" else self.data[name]
         if variable is not None and "labels" in variable.attrs:
             codes = variable.values if rows is None else variable.values[rows]
-            return _outcome_series(codes, list(variable.attrs["labels"]))
+            return outcome_series(codes, list(variable.attrs["labels"]))
         values = self.take(name, rows)
         if name == "id":
             return pd.Series(values, dtype=str)
         if name == "time":
             return pd.Series(pd.DatetimeIndex(values).date, dtype=object)
         return values
+
+    def to_netcdf(self, path) -> None:
+        """The features as NetCDF, for `Weekly.open` (features built from
+        the arrays; a table taken by from_frame keeps its own dtypes)."""
+        if self.dtypes:
+            raise ValueError("a Weekly taken from a table is saved as that table")
+        data = self.data.copy()
+        data.attrs = {"columns": json.dumps(self.columns), "attrs": json.dumps(self.attrs, default=_json_scalar)}
+        for name in data.variables:
+            if "labels" in data[name].attrs:
+                data[name].attrs["labels"] = json.dumps(list(data[name].attrs["labels"]))
+        data.to_netcdf(path)
+
+    @classmethod
+    def open(cls, path) -> "Weekly":
+        with xr.open_dataset(path) as stored:
+            data = stored.load()
+        columns, attrs = json.loads(data.attrs.pop("columns")), json.loads(data.attrs.pop("attrs"))
+        for name in data.variables:
+            if "labels" in data[name].attrs:
+                data[name].attrs["labels"] = json.loads(data[name].attrs["labels"])
+        data = data.assign_coords(unit=np.asarray(data["unit"].values, dtype=object))
+        return cls(data=data, columns=columns, attrs=attrs)
 
     def with_units(self, ids: np.ndarray) -> "Weekly":
         """The same samples with these unit ids (one per unit)."""
@@ -259,6 +292,12 @@ class Weekly:
     @classmethod
     def of(cls, table) -> "Weekly":
         return table if isinstance(table, cls) else cls.from_frame(table)
+
+
+def _json_scalar(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"{type(value).__name__} is not JSON serialisable")
 
 
 def _grid_lat_lon(units: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

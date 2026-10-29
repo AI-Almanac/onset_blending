@@ -23,12 +23,13 @@ from onset_blending._legacy.blend_evaluation_utils import (
 )
 from onset_blending._legacy.nc_utils import ensure_id_col
 from onset_blending._legacy.spatial_id_utils import resolve_grid_id_convention
-from onset_blending.evaluation import evaluate
+from _configs import blend_config
 from onset_blending.blend.logit import FittedModel
-from onset_blending.evaluation import fit_final
+from onset_blending.core import _specs
+from onset_blending.evaluation import evaluate, fit_final
 
 BINS = ["week1", "week2", "later"]
-FORMULA = "outcome ~ clim_week1 + clim_week2 + x + clim_week1:x"
+FORMULA = "outcome ~ prob_clim_week1 + prob_clim_week2 + diff_m_week1 + prob_clim_week1:diff_m_week1"
 
 
 def _legacy_fit_final_model(formula_str, train_df):
@@ -138,29 +139,27 @@ def weekly_table(seed=0, years=range(2010, 2021), n_cells=4, issues=8):
     ]
     frame = pd.DataFrame(rows)
     n = len(frame)
-    frame["clim_week1"] = rng.normal(-1.0, 0.5, n)
-    frame["clim_week2"] = rng.normal(-1.0, 0.5, n)
-    frame["x"] = rng.normal(size=n)
+    frame["prob_clim_week1"] = rng.normal(-1.0, 0.5, n)
+    frame["prob_clim_week2"] = rng.normal(-1.0, 0.5, n)
+    frame["diff_m_week1"] = rng.normal(size=n)
     # Outcomes that depend on the features, so the coefficients mean something.
-    logits = np.column_stack([frame["clim_week1"] + frame["x"], frame["clim_week2"], np.zeros(n)])
+    logits = np.column_stack([frame["prob_clim_week1"] + frame["diff_m_week1"], frame["prob_clim_week2"], np.zeros(n)])
     p = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
     frame["outcome"] = [BINS[rng.choice(3, p=row)] for row in p]
     frame.loc[rng.random(n) < 0.05, "outcome"] = np.nan
-    frame.loc[5, "x"] = np.nan  # outside the formula sample support
+    frame.loc[5, "diff_m_week1"] = np.nan  # outside the formula sample support
     return frame
 
 
-SPEC = {
-    "run": {
+CONFIG = blend_config(
+    {
         "cutoff_mode": "fixed_cutoff",
-        "training_years": list(range(2010, 2020)),
-        "true_holdout_years": [2019],
-        "cv_holdout_years": [2018],
+        "years": {"training": "2010:2019", "true_holdout": [2019], "cv_holdout": [2018]},
+        "formulas": {"blend": "outcome ~ prob_clim_qx + diff_m_week1 + prob_clim_week1:diff_m_week1"},
     },
-    "cell": {},
-    "models": {"formulas": {"blend": {"text": "outcome ~ clim_qx + x + clim_week1:x"}}},
-    "extras": {"clim_logits": [{"name": "clim_raw", "base_col_prefix": "clim"}]},
-}
+    models=("m",),
+)
+SPEC = _specs.cv_spec(CONFIG)
 
 
 def dissemination(weekly):
@@ -169,7 +168,7 @@ def dissemination(weekly):
 
 def fitted():
     weekly = weekly_table()
-    return weekly, fit_final(weekly, SPEC, dissemination(weekly), model_name="blend")
+    return weekly, fit_final(weekly, CONFIG, dissemination(weekly))
 
 
 def test_final_fit_is_the_scripts_bundle():
@@ -187,7 +186,7 @@ def test_final_fit_beside_the_cv_folds_is_the_scripts_bundle():
     weekly = weekly_table()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        evaluation = evaluate(weekly, SPEC, dissemination(weekly), workers=2, final_model="blend")
+        evaluation = evaluate(weekly, CONFIG, dissemination(weekly), workers=2, final=True)
     formula, train = _legacy_final_training_rows(weekly, SPEC, dissemination(weekly), "blend")
     bundle, legacy = evaluation.final_model.to_legacy_bundle(), _legacy_fit_final_model(formula, train)
 
@@ -225,8 +224,8 @@ def test_arrays_round_trip_without_pickles():
 def test_predictions_are_apply_blend_models():
     weekly, model = fitted()
     test = weekly_table(seed=1, years=[2021]).set_index(pd.RangeIndex(100, 100 + 4 * 8))
-    test.loc[105, "x"] = 0.5
-    test.loc[103, "clim_week2"] = np.nan
+    test.loc[105, "diff_m_week1"] = 0.5
+    test.loc[103, "prob_clim_week2"] = np.nan
 
     predicted = model.predict(test)
 
@@ -239,7 +238,7 @@ def test_predictions_are_apply_blend_models():
 
 
 def test_cv_fold_bundles_predict_like_apply_blend_model():
-    weekly = weekly_table().dropna(subset=["x"])
+    weekly = weekly_table().dropna(subset=["diff_m_week1"])
     _, coefs = compute_cv_global(
         FORMULA,
         weekly,
@@ -281,12 +280,12 @@ def test_missing_coefficients_count_as_zero_with_a_warning():
     _, model = fitted()
     bundle = model.to_legacy_bundle()
     coefs = bundle["coefs"]
-    bundle["coefs"] = coefs[~((coefs["class"] == "week1") & (coefs["feature"] == "x"))]
+    bundle["coefs"] = coefs[~((coefs["class"] == "week1") & (coefs["feature"] == "diff_m_week1"))]
 
-    with pytest.warns(UserWarning, match="Feature 'x' not found in coefs for class 'week1'"):
+    with pytest.warns(UserWarning, match="Feature 'diff_m_week1' not found in coefs for class 'week1'"):
         partial = FittedModel.from_legacy_bundle(bundle)
 
-    assert partial.coef[partial.classes.index("week1"), partial.features.index("x")] == 0.0
+    assert partial.coef[partial.classes.index("week1"), partial.features.index("diff_m_week1")] == 0.0
 
 
 def test_application_data_must_have_the_saved_features():
@@ -294,12 +293,12 @@ def test_application_data_must_have_the_saved_features():
     test = weekly_table(seed=4, years=[2021])
 
     other_terms = dataclasses.replace(
-        model, formula="outcome ~ clim_week1 + clim_week2 + x + clim_week2:x"
+        model, formula="outcome ~ prob_clim_week1 + prob_clim_week2 + diff_m_week1 + prob_clim_week2:diff_m_week1"
     )
     with pytest.raises(ValueError, match="does not match the saved training schema"):
         other_terms.predict(test)
     with pytest.raises(ValueError, match="no finite values"):
-        model.predict(test.assign(x=np.nan))
+        model.predict(test.assign(diff_m_week1=np.nan))
 
 
 def test_final_fit_requires_every_outcome_class():
@@ -307,9 +306,7 @@ def test_final_fit_requires_every_outcome_class():
     weekly.loc[weekly["outcome"] == "week2", "outcome"] = "later"
 
     with pytest.raises(ValueError, match="missing outcome classes: week2"):
-        fit_final(weekly, SPEC, dissemination(weekly), model_name="blend")
-    with pytest.raises(ValueError, match="Model 'other' not found"):
-        fit_final(weekly, SPEC, dissemination(weekly), model_name="other")
+        fit_final(weekly, CONFIG, dissemination(weekly))
 
 
 def test_models_are_immutable():

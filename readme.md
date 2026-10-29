@@ -18,7 +18,7 @@ pip install -e .            # extras: [regrid] polygon regridding, [maps], [test
 from onset_blending import BlendConfig, TrainedBlend, train
 
 result = train(BlendConfig.from_yaml("configs/india_aifs.yml"))
-result.save("out/")                       # evaluation summaries, trained.blend, config.yml
+result.save("out/")                       # scores (CSV), CV predictions (NetCDF), trained.blend
 
 blend = TrainedBlend.load("out/trained.blend")
 forecast = blend.forecast({"aifs_ensv2": "live/ens_2026-06-09.nc", "aifsv2": "live/det_2026-06-09.nc"})
@@ -34,6 +34,11 @@ trained on, and refuses live files that do not cover it (fewer members or
 lead days, another grid, other units or daily aggregation); anything more is
 trimmed.
 
+An evaluation writes CSV score tables (`summary_models*`,
+`yearly_metrics_global*`), each model's CV predictions and the CV folds'
+coefficients as NetCDF (`cv_preds_*.nc`: `Predictions.open`; `coefs_*.nc`:
+`blend.logit.fold_models`), Platt and MME weights as CSV, and no pickles.
+
 ## Layout
 
 ```
@@ -46,12 +51,16 @@ onset_blending/
     onsets.py        observed and forecast onsets
     climatology.py   KDE onset climatology
     features.py      the weekly samples
-    design.py        formula design matrices
+    design.py        formulas and their design matrices
+    predictions.py   a model's probabilities for samples (NetCDF)
+    metrics.py       Brier, RPS, AUC, Pietra
+    calibration.py   Platt calibration
     parallel.py      worker pools, shared memory
   blend/           blending methods
-    logit.py         the multinomial logistic blend
+    logit.py         the multinomial logistic blend; global, local, cluster CV
     random_forest.py the CRPS random forest (daily probabilities too)
     _crps_tree.py    its trees (from onset-forest)
+    mme.py           the multi-model ensemble of baselines
   evaluation.py    cross-validation, baselines, scores
   training.py      train(config)
   trained.py       TrainedBlend: what operations applies

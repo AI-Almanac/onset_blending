@@ -14,6 +14,9 @@ from onset_blending.config import FileSet
 from onset_blending import forecast as forecast_module
 from onset_blending.forecast import IncompatibleForecast
 from onset_blending.training import Resources, train
+from onset_blending.blend.logit import fold_models
+from onset_blending.core.features import Weekly
+from onset_blending.core.predictions import Predictions
 
 LATS, LONS = [10.0, 10.25], [70.0, 70.25]
 OBS_YEARS = range(2000, 2014)
@@ -105,7 +108,8 @@ def test_the_random_forest_blend_is_scored_and_forecasts_by_day(forest_region, t
     pooled = result.evaluation.pooled.set_index("model")
     assert {"blended_model", "blended_forest"} <= set(pooled.index)
     preds = result.evaluation.cv_preds[("blended_forest", "global")]
-    assert np.allclose(preds.filter(like="cv_").sum(axis=1), 1.0)
+    assert np.allclose(preds.probabilities.sum(axis=1), 1.0)
+    assert np.allclose(preds.data["daily"].sum("lead_day"), 1.0)
 
     blend = TrainedBlend.load(result.save(tmp_path / "trained") / "trained.blend")
     forecast = blend.forecast({"ens": root / "ens" / "2013.nc"})
@@ -284,3 +288,23 @@ def test_the_day_level_table_is_built_on_request(region):
     combined = with_daily.combined
     assert len(combined) == len(with_daily.weekly)
     assert {"clim_p_onset_day_1", "ens_p_onset_day_41plus", "ens_rain_sd_day_1", "true_onset_date"} <= set(combined)
+
+
+def test_a_training_run_saves_netcdf_and_csv_artifacts(region, tmp_path):
+    _, _, result = region
+    out = result.save(tmp_path / "trained")
+    tag = result.evaluation.output_tag
+
+    assert not list(out.glob("*.pkl"))
+    preds = Predictions.open(out / f"cv_preds_blended_model_global{tag}.nc")
+    assert_same_predictions(preds, result.evaluation.cv_preds[("blended_model", "global")])
+    with xr.open_dataset(out / f"coefs_blended_model_global{tag}.nc") as stored:
+        folds = fold_models(stored.load())
+    assert set(folds) == set(result.evaluation.coefficients[("blended_model", "global")])
+    weekly = Weekly.open(out / "weekly_features.nc")
+    pd.testing.assert_frame_equal(weekly.frame(), result.inputs.weekly.frame(), check_exact=True)
+    assert weekly.attrs == result.inputs.weekly.attrs
+
+
+def assert_same_predictions(a, b):
+    xr.testing.assert_identical(a.data, b.data)

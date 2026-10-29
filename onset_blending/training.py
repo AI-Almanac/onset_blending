@@ -129,14 +129,6 @@ def prepare(
     )
 
 
-def dissemination_table(config: BlendConfig, weekly: Weekly) -> pd.DataFrame:
-    """The units the blend trains on and is scored on: the configured table, or
-    every unit of the weekly features."""
-    if config.domain.dissemination is None:
-        return pd.DataFrame({"adm3_name": sorted({str(unit) for unit in weekly.units})})
-    return pd.read_csv(config.path(config.domain.dissemination.file), dtype=str)
-
-
 @dataclass
 class TrainingResult:
     config: BlendConfig
@@ -147,15 +139,15 @@ class TrainingResult:
     def save(self, directory, *, intermediates=("weekly",)) -> Path:
         """Write the evaluation, the trained blend (trained.blend) and the chosen
         intermediates into a new directory, all or nothing: the weekly
-        features (as the legacy table) and day-level ("combined", when built)
-        tables as pickles, the observed onsets as NetCDF."""
+        features (Weekly.open reads them) and the observed onsets as NetCDF,
+        the day-level table ("combined", when built) as a pickle."""
         directory = Path(directory)
         if directory.exists() and any(directory.iterdir()):
             raise FileExistsError(f"{directory} exists and is not empty")
         directory.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=f".{directory.name}.", dir=directory.parent))
         try:
-            self.evaluation.save(staging)
+            self.evaluation.save(staging, pickles=self.config.outputs.pickles)
             self.blend.save(staging / TRAINED_BLEND_FILENAME)
             self.blend.config.to_yaml(staging / "config.yml")
             for name in intermediates:
@@ -166,7 +158,7 @@ class TrainingResult:
                         raise ValueError("the day-level table was not built (train(..., daily=True))")
                     self.inputs.combined.to_pickle(staging / "combined_wide.pkl")
                 elif name == "weekly":
-                    self.inputs.weekly.frame().to_pickle(staging / "weekly_training_input.pkl")
+                    self.inputs.weekly.to_netcdf(staging / "weekly_features.nc")
                 else:
                     raise ValueError(f"unknown intermediate {name!r}")
             if directory.exists():
@@ -185,23 +177,16 @@ def train(config: BlendConfig, *, resources: Resources | None = None, daily: boo
     """Every stage of a blend, in memory: inputs, cross-validated evaluation,
     and the operational model fitted on every training year. daily also
     builds the day-level table (for export or day-level models)."""
-    from .core import _specs
-    from .trained import TrainedBlend
-    from .blend import random_forest
     from .evaluation import evaluate
+    from .trained import TrainedBlend
 
     resources = resources or Resources.default()
     inputs = prepare(config, resources=resources, keep=("observed", "weekly"), daily=daily)
-    cv_spec = _specs.cv_spec(config)
-    dissemination = dissemination_table(config, inputs.weekly)
 
     # The final fit runs alongside the global CV folds, on their design matrix.
     started = time.perf_counter()
-    forest = config.evaluation.random_forest
     evaluation = evaluate(
-        inputs.weekly, cv_spec, dissemination, workers=resources.workers,
-        budget_bytes=_budget_now(resources), final_model=config.final_formula(),
-        forest=None if forest is None else random_forest.Params.from_config(forest, config.features.bins.days),
+        inputs.weekly, config, workers=resources.workers, budget_bytes=_budget_now(resources), final=True,
         forest_inputs=inputs.forest_inputs,
     )
     inputs.timings["evaluation and final fit"] = time.perf_counter() - started

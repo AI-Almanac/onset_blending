@@ -1,14 +1,21 @@
-"""evaluate() + Evaluation.save() write exactly what 1_blend_evaluation.py wrote."""
+"""evaluate() and Evaluation.save() against the legacy 1_blend_evaluation.py.
+
+The script, run on the spec `_specs.cv_spec` builds from the same config, is
+the oracle: every artifact it wrote has its counterpart, with the same
+content (CV predictions and coefficients as NetCDF, weights as CSV)."""
 
 import json
 import os
 import pickle
+import re
 import warnings
 
 import numpy as np
 import pandas as pd
 import pytest
+import xarray as xr
 
+from _configs import blend_config
 from onset_blending._legacy.blend_evaluation_utils import (
     _present_weeks,
     apply_formula_sample_support,
@@ -43,7 +50,10 @@ from onset_blending._legacy.spatial_id_utils import (
     resolve_grid_id_convention,
     validate_id_coordinate_consistency,
 )
-from onset_blending.evaluation import PREDICTION_KEYS, evaluate
+from onset_blending.blend import logit, mme
+from onset_blending.core import _specs, design
+from onset_blending.core.predictions import Predictions
+from onset_blending.evaluation import evaluate
 
 BINS = interval_bins(2)
 
@@ -379,9 +389,9 @@ def weekly_table(years, seed=0, n_cells=5, issues=4):
     n = len(frame)
     frame["outcome"] = rng.choice(BINS, size=n)
     frame.loc[rng.random(n) < 0.05, "outcome"] = np.nan
-    frame["prob_clim_mr_unc_earlier"] = rng.normal(-2.0, 0.5, n)
+    frame["prob_clim_unc_earlier"] = rng.normal(-2.0, 0.5, n)
     for w in (1, 2):
-        for prefix in ("prob_clim_mr", "prob_clim_mr_unc", "prob_clim_mr_2018_2024"):
+        for prefix in ("prob_clim", "prob_clim_unc", "prob_clim_2018_2024"):
             frame[f"{prefix}_week{w}"] = rng.normal(-1.0, 0.5, n)
         frame[f"fc_p_onset_fixed_cutoff_week{w}"] = rng.uniform(0.0, 0.5, n)
         frame[f"diff_fc_week{w}"] = rng.normal(size=n)
@@ -389,59 +399,38 @@ def weekly_table(years, seed=0, n_cells=5, issues=4):
     return frame
 
 
-def cv_spec(training_years, cv_holdout_years, true_holdout_years, methods):
-    return {
-        "run": {
+def config(training, cv_holdout, true_holdout, methods, mme_sources=(), **evaluation):
+    return blend_config(
+        {
             "cutoff_mode": "fixed_cutoff",
-            "training_years": list(training_years),
-            "cv_holdout_years": list(cv_holdout_years),
-            "true_holdout_years": list(true_holdout_years),
-        },
-        "cv": {"methods": list(methods)},
-        "cell": {"id_col": "unit"},
-        "models": {
+            "years": {"training": list(training), "cv_holdout": list(cv_holdout),
+                      "true_holdout": list(true_holdout)},
+            "cv_methods": list(methods),
             "formulas": {
-                "blend": {"text": "outcome ~ prob_clim_mr_qx * diff_fc_qx"},
-                "clim_only": {"text": "outcome ~ prob_clim_mr_qx"},
+                "blend": "outcome ~ prob_clim_qx * diff_fc_qx",
+                "clim_only": "outcome ~ prob_clim_qx",
                 "off": {"enabled": False, "text": "outcome ~ absent_qx"},
             },
-            "window_variants": {"enabled": False},
+            "final_formula": "blend",
+            "climatology_baselines": {"windows": [[2018, 2024]]},
+            "forecasts": [{"model": "fc", "variant": "fixed_cutoff", "platt_weights": True}],
+            "mme": {
+                "enabled": bool(mme_sources),
+                "sources": [
+                    {"name": name} if name == "clim_raw"
+                    else {"name": name, "source": "forecast", "cal_variant": "fixed_cutoff"}
+                    for name in mme_sources
+                ],
+            },
+            **evaluation,
         },
-        "mme": {
-            "enabled": True,
-            "variants": ["fixed_cutoff"],
-            "blend_models": [{"name": "clim_raw", "source": "clim"}],
-        },
-        "extras": {
-            "clim_logits": [
-                {
-                    "name": "unc_clim_raw",
-                    "base_col_prefix": "prob_clim_mr_unc",
-                    "earlier_col": "prob_clim_mr_unc_earlier",
-                },
-                {
-                    "name": "clim_raw",
-                    "base_col_prefix": "prob_clim_mr",
-                    "window_start_years": [1900, 2018],
-                    "window_end_year": 2024,
-                },
-            ],
-            "forecast_variants": {"base": "", "fixed_cutoff": "_fixed_cutoff"},
-            "forecasts": [
-                {
-                    "name": "fc",
-                    "variant": "fixed_cutoff",
-                    "raw": True,
-                    "calibrated": True,
-                    "export_platt_weights": True,
-                }
-            ],
-        },
-    }
+        windows=[(2018, 2024)],
+        dissemination_id_col="unit",
+    )
 
 
 def dissemination_table(weekly):
-    """The units minus one, under the spec's id column, as read from CSV."""
+    """The units minus one, under the config's id column, as read from CSV."""
     return pd.DataFrame({"unit": sorted(weekly["id"].unique())[:-1]}).astype(str)
 
 
@@ -450,190 +439,259 @@ def write_pickle(path, obj):
         pickle.dump(obj, handle)
 
 
-def assert_same_files(old_dir, new_dir):
-    """Byte-identical files; pickles may instead hold exactly equal objects,
-    since frames scored in worker processes share fewer string objects (and
-    so pickle to other bytes)."""
-    old = {p.name: p.read_bytes() for p in old_dir.iterdir()}
-    new = {p.name: p.read_bytes() for p in new_dir.iterdir()}
-    assert sorted(new) == sorted(old)
-    differ = [name for name in old if old[name] != new[name]]
-    assert [name for name in differ if not name.endswith(".pkl")] == []
-    for name in differ:
-        old_object, new_object = pickle.loads(old[name]), pickle.loads(new[name])
-        if name.startswith("cv_preds_"):
-            # CV predictions keep only their keys beside the probabilities.
-            keys = [c for c in old_object.columns if c in PREDICTION_KEYS or c.startswith("cv_")]
-            assert list(new_object.columns) == keys
-            old_object = old_object[keys]
-        assert_same_object(old_object, new_object)
-
-
-def assert_same_object(old, new):
-    assert type(new) is type(old)
-    if isinstance(old, pd.DataFrame):
-        pd.testing.assert_frame_equal(new, old, check_exact=True)
-        assert new.attrs == old.attrs
-    elif isinstance(old, pd.Series):
-        pd.testing.assert_series_equal(new, old, check_exact=True)
-    elif isinstance(old, dict):
-        assert list(new) == list(old)
-        for key in old:
-            assert_same_object(old[key], new[key])
-    elif isinstance(old, (list, tuple)):
-        assert len(new) == len(old)
-        for a, b in zip(old, new):
-            assert_same_object(a, b)
-    elif isinstance(old, np.ndarray):
-        np.testing.assert_array_equal(new, old, strict=True)
-    elif hasattr(old, "__dict__") and not isinstance(old, type):
-        # Estimators (a fold's scaler): the same attributes, in the same order.
-        assert list(vars(new)) == list(vars(old))
-        assert_same_object(vars(old), vars(new))
-    else:
-        assert new == old
-
-
-def run_both(tmp_path, weekly, spec, dissemination, inputs=None, workers=1):
-    """Write the old script's files and evaluate().save()'s, each next to a copy of `inputs`."""
+def run_both(tmp_path, weekly, cfg, dissemination, *, old_inputs=None, new_inputs=None, workers=1):
+    """The old script's files and evaluate().save()'s, each written next to its inputs."""
     old_dir, new_dir = tmp_path / "old", tmp_path / "new"
-    for directory in (old_dir, new_dir):
+    for directory, inputs in ((old_dir, old_inputs), (new_dir, new_inputs)):
         directory.mkdir()
-        for name, obj in (inputs or {}).items():
-            write_pickle(directory / name, obj)
+        for name, write in (inputs or {}).items():
+            write(directory / name)
+    spec = _specs.cv_spec(cfg)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         _script(spec, weekly, dissemination, str(old_dir), cores=workers)
-        evaluation = evaluate(weekly, spec, dissemination, workers=workers, results_dir=new_dir)
+        evaluation = evaluate(weekly, cfg, dissemination, workers=workers, results_dir=new_dir)
     written = evaluation.save(new_dir)
     return evaluation, written, old_dir, new_dir
+
+
+def counterpart(name):
+    """The new artifact holding what the script wrote to `name` (None: not written)."""
+    stem, ext = name.rsplit(".", 1)
+    if ext != "pkl":
+        return name
+    if name.startswith("coefs_"):
+        return re.sub(r"_year\d+$", "", stem) + ".nc"
+    if name.startswith("cv_preds_"):
+        return stem + ".nc"
+    if name.startswith(("summary_models", "yearly_metrics_global")):
+        return None  # the CSV twin holds it
+    return stem + ".csv"  # weights
+
+
+def assert_same_artifacts(old_dir, new_dir, inputs=()):
+    old = sorted(p.name for p in old_dir.iterdir() if p.name not in inputs)
+    new = sorted(p.name for p in new_dir.iterdir() if p.name not in inputs)
+    assert new == sorted({counterpart(name) for name in old} - {None})
+    for name in old:
+        target = counterpart(name)
+        if target is None:
+            continue
+        if not name.endswith(".pkl"):
+            assert (new_dir / target).read_bytes() == (old_dir / name).read_bytes(), name
+            continue
+        with open(old_dir / name, "rb") as handle:
+            legacy = pickle.load(handle)
+        if name.startswith("cv_preds_"):
+            assert_same_predictions(Predictions.open(new_dir / target), legacy)
+        elif name.startswith("coefs_"):
+            year = int(re.search(r"_year(\d+)\.pkl$", name).group(1))
+            with xr.open_dataset(new_dir / target) as stored:
+                model = logit.fold_models(stored.load())[year]
+            assert_same_bundle(model.to_legacy_bundle(), legacy)
+        else:
+            pd.testing.assert_frame_equal(pd.read_csv(new_dir / target), legacy, check_exact=True)
+
+
+def assert_same_predictions(preds, legacy):
+    """The same samples and probabilities as a legacy CV-prediction table."""
+    new = preds.frame()
+    cv = sorted(c for c in legacy.columns if c.startswith("cv_"))
+    assert sorted(c for c in new.columns if c.startswith("cv_")) == cv
+    np.testing.assert_array_equal(new[cv].to_numpy(), legacy[cv].to_numpy())
+    assert new["id"].tolist() == legacy["id"].astype(str).tolist()
+    assert new["year"].tolist() == legacy["year"].tolist()
+    assert new["outcome"].fillna("-").tolist() == legacy["outcome"].fillna("-").tolist()
+    assert (pd.to_datetime(new["time"]) == pd.to_datetime(legacy["time"])).all()
+
+
+def assert_same_bundle(bundle, legacy):
+    """A fold model's coefficients and scaler are the script's fold bundle's."""
+    coefs = legacy["coefs"].drop(columns=["test_year"])
+    pd.testing.assert_frame_equal(bundle["coefs"], coefs, check_exact=True)
+    assert (bundle["features"], bundle["formula"]) == (list(legacy["features"]), legacy["formula"])
+    for name in ("mean_", "scale_", "var_", "n_samples_seen_"):
+        np.testing.assert_array_equal(getattr(bundle["scaler"], name), getattr(legacy["scaler"], name))
 
 
 def test_every_artifact_is_the_scripts(tmp_path):
     years = range(2014, 2026)
     weekly = weekly_table(years)
-    spec = cv_spec(
-        range(2014, 2024), [2022, 2023], [2025], ["global", "local", "clusters", "bogus"]
+    cfg = config(
+        range(2014, 2024), [2022, 2023], [2025], ["global", "local", "clusters"],
+        external_predictions=[{"name": "forest", "file": "forest_preds.pkl"}],
     )
-    spec["extras"]["external_predictions"] = [{"name": "forest", "file": "forest_preds.pkl"}]
     forest = weekly[weekly["year"].isin([2022, 2023, 2025])][["id", "year", "outcome"]].copy()
     probs = np.random.default_rng(3).dirichlet(np.ones(len(BINS)), size=len(forest))
     for j, b in enumerate(BINS):
         forest[f"cv_{b}"] = probs[:, j]
-    # Holdouts other than 2000-2024: the MME reads its saved weights.
-    weights = pd.DataFrame([{"objective": "rps", "w_clim_raw": 1.0, "rps": 0.0}])
-    inputs = {
-        "forest_preds.pkl": forest,
-        "mme_optimized_weights_fixed_cutoff_clim_raw_fixed_cutoff_2022_2025.pkl": weights,
-    }
+    inputs = {"forest_preds.pkl": lambda path: write_pickle(path, forest)}
 
     evaluation, written, old_dir, new_dir = run_both(
-        tmp_path, weekly, spec, dissemination_table(weekly), inputs
+        tmp_path, weekly, cfg, dissemination_table(weekly), old_inputs=inputs, new_inputs=inputs
     )
 
-    assert_same_files(old_dir, new_dir)
+    assert_same_artifacts(old_dir, new_dir, inputs=set(inputs))
     assert {path.name for path in written} == {p.name for p in new_dir.iterdir()} - set(inputs)
     assert evaluation.output_tag == "_fixed_cutoff_2022_2025"
     assert set(evaluation.cv_preds) == {
-        (model, method)
-        for model in ("blend", "clim_only")
-        for method in ("global", "local", "clusters")
+        (model, method) for model in ("blend", "clim_only") for method in ("global", "local", "cluster")
     }
-    assert set(evaluation.coefs_by_year) == {("blend", "global"), ("clim_only", "global")}
-    assert set(evaluation.coefs_by_year["blend", "global"]) == {2022, 2023, 2025}
-    assert list(evaluation.platt_weights) == [
-        "platt_weights_fc_fixed_cutoff_calibrated_df_fixed_cutoff_2022_2025"
-    ]
-    assert evaluation.mme_weights == {}
+    assert set(evaluation.coefficients) == {("blend", "global"), ("clim_only", "global")}
+    assert set(evaluation.coefficients["blend", "global"]) == {2022, 2023, 2025}
+    assert list(evaluation.platt_weights) == ["platt_weights_fc_fixed_cutoff_calibrated_df_fixed_cutoff_2022_2025"]
     assert {
-        "forest",
-        "unc_clim_raw",
-        "clim_raw",
-        "clim_raw_2018_2024",
-        "fc_fixed_cutoff_raw",
+        "forest", "unc_clim_raw", "clim_raw", "clim_raw_2018_2024", "fc_fixed_cutoff_raw",
         "fc_calibrated_fixed_cutoff",
-        "mme_fixed_cutoff_clim_raw_opt_rps",
     } <= set(evaluation.cell_metrics["model"])
     # Scoring is on the dissemination units only.
     assert "unit4" not in set(evaluation.cell_metrics["id"])
     assert evaluation.sample_support["rows_excluded"] == 1
 
 
-def test_mme_weights_are_optimised_when_the_holdouts_are_2000_2024(tmp_path):
+MME_SOURCES = ("clim_raw", "fc")
+CV = [f"cv_{b}" for b in BINS]
+
+
+def _legacy_mme(weekly, cfg, dissemination):
+    """The script's MME of clim_raw and the calibrated forecast, its merge
+    on the samples' keys without the lat/lon its sources lack: (weights
+    frame, per-unit metrics)."""
+    spec = _specs.cv_spec(cfg)
+    wide = ensure_id_col(weekly, spec=spec, context="blend input IDs")
+    wide, _ = apply_formula_sample_support(wide, build_formulas_from_spec(spec, "fixed_cutoff", data=wide, n_bins=2))
+    cells = dissemination.rename(columns={"unit": "id"})
+    run = spec["run"]
+    holdout = configured_holdout_years(spec)
+    clim = make_raw_preds_from_wide_logit_window(wide, "prob_clim", holdout)
+    calibrated = make_calibrated_preds_from_wide(
+        wide, "fc", "fixed_cutoff", run["training_years"], holdout, run["true_holdout_years"], cells, spec
+    )
+    keys = ["time", "id", "year", "outcome"]
+    joined = clim[keys + CV].rename(columns={c: f"clim_raw_{c}" for c in CV}).merge(
+        calibrated[keys + CV].rename(columns={c: f"fc_{c}" for c in CV}), on=keys, how="inner"
+    )
+    allowed = restrict_to_allowed(joined, cells)
+    P_full = [joined[[f"{n}_{c}" for c in CV]].to_numpy(dtype=float) for n in MME_SOURCES]
+    P_allowed = [clean_probs5(allowed[[f"{n}_{c}" for c in CV]].to_numpy(dtype=float)) for n in MME_SOURCES]
+    Y = np.column_stack([(allowed["outcome"] == b).astype(float) for b in BINS])
+    opt = optimize_mme_weights(P_allowed, Y, [f"w_{n}" for n in MME_SOURCES])
+    mixed = clean_probs5(sum(w * clean_probs5(P) for w, P in zip(opt["weights"], P_full)))
+    preds = joined[keys].copy()
+    for j, c in enumerate(CV):
+        preds[c] = mixed[:, j]
+    return opt["weights_df"], compute_cell_metrics_fast(preds, allowed_cells=cells)
+
+
+def test_an_mme_of_two_sources_is_the_scripts_with_its_merge_fixed():
     years = range(2000, 2025)
-    weekly = weekly_table(years, seed=1, n_cells=3, issues=2)
-    spec = cv_spec(years, years, [], methods=[])
+    weekly = weekly_table(years, seed=1, n_cells=3, issues=3)
+    cfg = config(years, years, [], methods=[], mme_sources=MME_SOURCES)
 
-    evaluation, _, old_dir, new_dir = run_both(tmp_path, weekly, spec, dissemination_table(weekly))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        evaluation = evaluate(weekly, cfg, dissemination_table(weekly))
+        weights, cells = _legacy_mme(weekly, cfg, dissemination_table(weekly))
 
-    assert_same_files(old_dir, new_dir)
-    assert list(evaluation.mme_weights) == [
-        "mme_optimized_weights_fixed_cutoff_clim_raw_fixed_cutoff_2000_2024"
-    ]
-    assert evaluation.cv_preds == {} and evaluation.yearly is None
+    assert list(evaluation.mme_weights) == ["mme_optimized_weights_fixed_cutoff_clim_raw_fixed_cutoff_2000_2024"]
+    pd.testing.assert_frame_equal(next(iter(evaluation.mme_weights.values())), weights, check_exact=True)
+    scored = evaluation.cell_metrics
+    mixed = scored[scored["model"] == "mme_fixed_cutoff_clim_raw_opt_rps"]
+    pd.testing.assert_frame_equal(
+        mixed.drop(columns=["model", "cv_method"]).dropna(axis=1, how="all").reset_index(drop=True),
+        cells.dropna(axis=1, how="all"),
+        check_exact=True,
+    )
+
+
+def test_mme_weights_are_read_unless_the_holdouts_are_2000_2024(tmp_path):
+    weekly = weekly_table(range(2016, 2024))
+    always = config(range(2016, 2024), [2021, 2022], [2023], [], mme_sources=MME_SOURCES,
+                    mme={"enabled": True, "optimize": "always",
+                         "sources": [{"name": "clim_raw"},
+                                     {"name": "fc", "source": "forecast", "cal_variant": "fixed_cutoff"}]})
+    auto = config(range(2016, 2024), [2021, 2022], [2023], [], mme_sources=MME_SOURCES)
+    mme_rows = lambda e: e.cell_metrics[e.cell_metrics["cv_method"] == "mme"].reset_index(drop=True)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        optimised = evaluate(weekly, always, dissemination_table(weekly))
+        optimised.save(tmp_path)
+        (stem,) = optimised.mme_weights
+        assert stem == "mme_optimized_weights_fixed_cutoff_clim_raw_fixed_cutoff_2021_2023"
+        read = evaluate(weekly, auto, dissemination_table(weekly), results_dir=tmp_path)
+        skipped = evaluate(weekly, auto, dissemination_table(weekly), results_dir=tmp_path / "elsewhere")
+
+    assert read.mme_weights == {}
+    pd.testing.assert_frame_equal(mme_rows(read), mme_rows(optimised), check_exact=True)
+    assert mme_rows(skipped).empty
 
 
 def test_global_cv_in_worker_processes_saves_the_same_files(tmp_path):
     weekly = weekly_table(range(2016, 2024), seed=2)
-    spec = cv_spec(range(2016, 2024), [2020, 2021, 2022], [2023], ["global"])
-    spec["mme"]["enabled"] = False
+    cfg = config(range(2016, 2024), [2020, 2021, 2022], [2023], ["global"])
 
-    _, _, old_dir, new_dir = run_both(
-        tmp_path, weekly, spec, dissemination_table(weekly), workers=2
-    )
+    _, _, old_dir, new_dir = run_both(tmp_path, weekly, cfg, dissemination_table(weekly), workers=2)
 
-    assert_same_files(old_dir, new_dir)
+    assert_same_artifacts(old_dir, new_dir)
 
 
-def test_mme_of_two_sources_still_fails_at_the_merge():
-    # Known defect kept in phase 2: the sources have no lat/lon to merge on.
-    weekly = weekly_table(range(2016, 2024))
-    spec = cv_spec(range(2016, 2024), [2022], [2023], methods=[])
-    spec["mme"]["blend_models"].append(
-        {"name": "fc", "source": "forecast", "cal_variant": "fixed_cutoff"}
-    )
+def test_formulas_without_a_design_plan_fit_as_the_script(tmp_path, monkeypatch):
+    # Without a plan, every fit builds its Patsy design from its own rows.
+    monkeypatch.setattr(design, "plan", lambda formula, dtypes: None)
+    weekly = weekly_table(range(2016, 2024), seed=4)
+    cfg = config(range(2016, 2024), [2021, 2022], [2023], ["global", "local", "clusters"])
 
-    with pytest.raises(KeyError, match="lat"), warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        evaluate(weekly, spec, dissemination_table(weekly))
+    evaluation, _, old_dir, new_dir = run_both(tmp_path, weekly, cfg, dissemination_table(weekly))
+
+    assert_same_artifacts(old_dir, new_dir)
+    assert set(evaluation.coefficients) == {("blend", "global"), ("clim_only", "global")}
+
+
+def test_mme_weights_are_the_legacy_optimisers():
+    rng = np.random.default_rng(5)
+    sources = [rng.dirichlet(np.ones(3), size=300) for _ in range(3)]
+    sources[1][:5] = np.nan
+    Y = np.eye(3)[rng.integers(0, 3, size=300)]
+    cleaned = [clean_probs5(P) for P in sources]
+
+    weights, rps = mme.optimise_weights(cleaned, Y)
+
+    legacy = optimize_mme_weights(cleaned, Y, ["w_a", "w_b", "w_c"])
+    np.testing.assert_array_equal(weights, legacy["weights"])
+    assert rps == legacy["rps"]
 
 
 def test_formula_and_cv_errors_raise_and_baseline_errors_warn():
     weekly = weekly_table(range(2016, 2024))
-    spec = cv_spec(range(2016, 2024), [2022], [2023], ["global"])
-    spec["mme"]["enabled"] = False
-    spec["extras"]["clim_logits"][0]["earlier_col"] = None
+    cfg = config(range(2016, 2024), [2022], [2023], ["global"])
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        evaluation = evaluate(weekly, spec, dissemination_table(weekly))
+        evaluation = evaluate(weekly.drop(columns="prob_clim_unc_earlier"), cfg, dissemination_table(weekly))
     messages = [str(w.message) for w in caught]
-    assert any(
-        m.startswith("Error in clim logit 'unc_clim_raw': unc_clim_raw requires") for m in messages
-    )
+    assert any(m.startswith("Error in clim logit 'unc_clim_raw': unc_clim_raw requires") for m in messages)
     assert "unc_clim_raw" not in set(evaluation.cell_metrics["model"])
     # Without the unconditional-climatology baseline there is no pooled summary.
     assert any(m.startswith("Could not compute pooled summary") for m in messages)
     assert evaluation.pooled is None
 
-    spec["models"]["formulas"]["blend"]["text"] = "outcome ~ absent_qx"
     with pytest.raises(ValueError, match="missing predictor columns"):
-        evaluate(weekly, spec, dissemination_table(weekly))
+        evaluate(weekly.drop(columns="diff_fc_week2"), cfg, dissemination_table(weekly))
 
-    spec["models"]["formulas"]["blend"]["text"] = "outcome ~ prob_clim_mr_qx"
-    spec["run"]["training_years"] = []  # no fold has training rows
+    no_training = config(range(2000, 2003), [2022], [2023], ["global"])
     with pytest.raises(RuntimeError, match="Error in blend/global"):
-        evaluate(weekly, spec, dissemination_table(weekly))
+        evaluate(weekly, no_training, dissemination_table(weekly))
 
 
 def test_inputs_are_left_unchanged():
     weekly = weekly_table(range(2016, 2024))
     dissemination = dissemination_table(weekly)
     before = weekly.copy(), dissemination.copy()
-    spec = cv_spec(range(2016, 2024), [2022], [2023], ["global"])
+    cfg = config(range(2016, 2024), [2022], [2023], ["global"])
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        evaluate(weekly, spec, dissemination)
+        evaluate(weekly, cfg, dissemination)
 
     pd.testing.assert_frame_equal(weekly, before[0])
     pd.testing.assert_frame_equal(dissemination, before[1])
@@ -641,16 +699,49 @@ def test_inputs_are_left_unchanged():
 
 def test_relative_external_predictions_need_a_results_dir():
     weekly = weekly_table(range(2016, 2024))
-    spec = cv_spec(range(2016, 2024), [2022], [2023], ["global"])
-    spec["extras"]["external_predictions"] = [{"name": "forest", "file": "preds.pkl"}]
+    cfg = config(range(2016, 2024), [2022], [2023], ["global"],
+                 external_predictions=[{"name": "forest", "file": "preds.pkl"}])
 
     with pytest.raises(ValueError, match="no results_dir"):
-        evaluate(weekly, spec, dissemination_table(weekly))
+        evaluate(weekly, cfg, dissemination_table(weekly))
+
+
+def test_external_predictions_in_netcdf_score_as_the_model_they_came_from(tmp_path):
+    weekly = weekly_table(range(2016, 2024))
+    cfg = config(range(2016, 2024), [2021, 2022], [2023], ["global"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        first = evaluate(weekly, cfg, dissemination_table(weekly))
+        first.cv_preds[("blend", "global")].to_netcdf(tmp_path / "blend.nc")
+        again = evaluate(weekly, config(range(2016, 2024), [2021, 2022], [2023], [],
+                                        external_predictions=[{"name": "blend", "file": "blend.nc"}]),
+                         dissemination_table(weekly), results_dir=tmp_path)
+
+    scored = lambda e: e.cell_metrics[e.cell_metrics["model"] == "blend"].reset_index(drop=True)
+    pd.testing.assert_frame_equal(scored(again), scored(first), check_exact=True)
+    pd.testing.assert_frame_equal(again.yearly, first.yearly[first.yearly["model"] == "blend"], check_exact=True)
 
 
 def test_dissemination_id_column_must_exist():
     weekly = weekly_table(range(2016, 2024))
-    spec = cv_spec(range(2016, 2024), [2022], [2023], ["global"])
+    cfg = config(range(2016, 2024), [2022], [2023], ["global"])
 
     with pytest.raises(ValueError, match="cell.id_col 'unit' not found"):
-        evaluate(weekly, spec, pd.DataFrame({"adm3_name": ["unit0"]}))
+        evaluate(weekly, cfg, pd.DataFrame({"adm3_name": ["unit0"]}))
+
+
+def test_a_window_variant_swaps_the_windowed_climatology_in():
+    weekly = weekly_table(range(2016, 2024))
+    cfg = config(range(2016, 2024), [2021, 2022], [2023], ["global"],
+                 window_variants=[{"base": "blend", "windows": [[2018, 2024]]}])
+
+    formulas, resolution = design.formulas(cfg.evaluation, {}, 2, "fixed_cutoff")
+
+    assert list(formulas) == ["blend", "clim_only", "blend_2018_2024"]
+    assert formulas["blend_2018_2024"] == formulas["blend"].replace("prob_clim_week", "prob_clim_2018_2024_week")
+    assert resolution["blend_2018_2024"]["original_formula"] == "outcome ~ prob_clim_2018_2024_qx * diff_fc_qx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        evaluation = evaluate(weekly, cfg, dissemination_table(weekly))
+    blend, variant = (evaluation.cv_preds[(name, "global")].probabilities for name in ("blend", "blend_2018_2024"))
+    assert blend.shape == variant.shape and not np.array_equal(blend, variant)

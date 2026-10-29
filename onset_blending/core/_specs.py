@@ -253,7 +253,7 @@ def cv_spec(config: BlendConfig) -> dict:
 
     mme = evaluation.mme
     if mme.enabled and mme.optimize == "always":
-        raise NotImplementedError("evaluation.mme.optimize 'always' arrives with the phase-3 evaluation")
+        raise NotImplementedError("the legacy cv spec cannot express evaluation.mme.optimize 'always'")
     spec = {
         "n_bins": config.features.bins.count,
         "run": {
