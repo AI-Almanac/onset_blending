@@ -28,9 +28,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import xarray as xr
 import yaml
 
 from ._specs import _FORECAST_DIMS
+from .onsets import ObservedOnsets
 from .config import BlendConfig, ConfigError, ForecastModel
 
 # Bump whenever the numbers the features are computed from change: a blend
@@ -181,49 +183,8 @@ def _replace(node, route: tuple, value):
 
 
 # ---------------------------------------------------------------------------
-# Tables without pickles
+# Arrays without pickles
 # ---------------------------------------------------------------------------
-
-
-def _table_arrays(df: pd.DataFrame) -> tuple[dict, dict[str, np.ndarray]]:
-    """A table as a column schema and plain arrays (strings as unicode)."""
-    schema, arrays = [], {}
-    for index, column in enumerate(df.columns):
-        series = df[column]
-        key = f"c{index}"
-        if pd.api.types.is_bool_dtype(series) or pd.api.types.is_numeric_dtype(series):
-            kind, data = "number", series.to_numpy()
-        elif pd.api.types.is_datetime64_any_dtype(series):
-            kind, data = "datetime", series.to_numpy(dtype="datetime64[ns]").astype(np.int64)
-        else:
-            values = series.astype(object)
-            if values.map(lambda v: isinstance(v, dt.date)).any():
-                kind = "date"
-                data = np.array([v.isoformat() if isinstance(v, dt.date) else "" for v in values], dtype=str)
-            else:
-                kind = "text"
-                data = np.array(["" if pd.isna(v) else str(v) for v in values], dtype=str)
-            arrays[f"{key}_missing"] = values.isna().to_numpy()
-        schema.append({"name": str(column), "kind": kind, "dtype": str(series.dtype)})
-        arrays[key] = data
-    return {"columns": schema, "rows": len(df)}, arrays
-
-
-def _table_from_arrays(schema: dict, arrays) -> pd.DataFrame:
-    columns = {}
-    for index, column in enumerate(schema["columns"]):
-        data = arrays[f"c{index}"]
-        kind = column["kind"]
-        if kind == "number":
-            columns[column["name"]] = pd.Series(data, dtype=column["dtype"])
-        elif kind == "datetime":
-            columns[column["name"]] = pd.Series(data.astype("datetime64[ns]"))
-        else:
-            missing = arrays[f"c{index}_missing"]
-            values = [None if m else (dt.date.fromisoformat(v) if kind == "date" else str(v))
-                      for v, m in zip(data.tolist(), missing.tolist())]
-            columns[column["name"]] = pd.Series(values, dtype=object if kind == "date" else column["dtype"])
-    return pd.DataFrame(columns, index=pd.RangeIndex(schema["rows"]))
 
 
 def _npz_bytes(arrays: dict[str, np.ndarray]) -> bytes:
@@ -245,7 +206,7 @@ def _npz_load(data: bytes):
 class TrainedBlend:
     config: BlendConfig                 # the recipe, derived defaults frozen
     model: object                       # model.FittedModel
-    observed: pd.DataFrame              # id, year, onset_day: what the climatology is fitted on
+    observed: ObservedOnsets            # what the climatology is fitted on
     units: tuple[str, ...]              # the units the blend was trained and scores on
     signatures: dict[str, dict]         # model name -> forecast signature
     reference_files: dict[str, bytes]   # frozen reference inputs, by artifact name
@@ -289,11 +250,10 @@ class TrainedBlend:
         if problems:
             raise ConfigError(problems)
 
-        observed = inputs.observed[["id", "year", "onset_day"]].reset_index(drop=True)
         return cls(
             config=frozen,
             model=model,
-            observed=observed,
+            observed=inputs.observed,
             units=tuple(sorted(inputs.weekly["id"].astype(str).unique())),
             signatures=signatures,
             reference_files=reference_files,
@@ -315,9 +275,12 @@ class TrainedBlend:
         model_meta, model_arrays = self.model.to_arrays()
         members["model.json"] = json.dumps(model_meta, indent=1).encode()
         members["model.npz"] = _npz_bytes(model_arrays)
-        schema, arrays = _table_arrays(self.observed)
-        members["observed.json"] = json.dumps(schema).encode()
-        members["observed.npz"] = _npz_bytes(arrays)
+        observed = self.observed.data
+        members["observed.npz"] = _npz_bytes({
+            "unit": observed["unit"].values.astype(str),
+            "year": observed["year"].values,
+            **{name: observed[name].values for name in ("onset_day", "onset_idx", "present")},
+        })
         members["units.json"] = json.dumps(list(self.units)).encode()
         members["signatures.json"] = json.dumps(self.signatures, indent=1).encode()
         members.update(self.reference_files)
@@ -368,7 +331,14 @@ class TrainedBlend:
                 f"computes version {FEATURES_VERSION}. Retrain it, or forecast with the version it was trained with."
             )
         config = BlendConfig.from_dict(yaml.safe_load(members["config.yml"]))
-        observed = _table_from_arrays(json.loads(members["observed.json"]), _npz_load(members["observed.npz"]))
+        arrays = _npz_load(members["observed.npz"])
+        observed = ObservedOnsets(
+            data=xr.Dataset(
+                {name: (("unit", "year"), arrays[name]) for name in ("onset_day", "onset_idx", "present")},
+                coords={"unit": arrays["unit"].astype(object), "year": arrays["year"]},
+            ),
+            season_start=config.onset.season_start,
+        )
         model = FittedModel.from_arrays(json.loads(members["model.json"]), dict(_npz_load(members["model.npz"])))
         return cls(
             config=config,

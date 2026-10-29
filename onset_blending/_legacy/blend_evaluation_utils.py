@@ -737,21 +737,33 @@ def _fit_predict_multinom(train, test, feature_cols, outcome_col="outcome", retu
 
     # AFTER
     if formula_str is not None:
-        from sklearn.preprocessing import StandardScaler
         rhs = formula_str.split("~", 1)[1].strip() if "~" in formula_str else formula_str
         X_tr_df = patsy.dmatrix(rhs, train, return_type="dataframe")
         X_te_df = patsy.dmatrix(X_tr_df.design_info, test, return_type="dataframe")
         X_tr_df = X_tr_df.drop(columns=["Intercept"], errors="ignore")
         X_te_df = X_te_df.drop(columns=["Intercept"], errors="ignore")
         X_te_df = X_te_df.reindex(columns=X_tr_df.columns, fill_value=0.0)  # ← fixes index OOB
-        feature_cols = list(X_tr_df.columns)
+        return _fit_predict_design(
+            X_tr_df.values.astype(float), train[outcome_col].values, X_te_df.values.astype(float),
+            list(X_tr_df.columns), test.index, return_clf=return_clf, scale=True,
+        )
+    return _fit_predict_design(
+        train[feature_cols].values.astype(float), train[outcome_col].values,
+        test[feature_cols].values.astype(float), feature_cols, test.index,
+        return_clf=return_clf, scale=False,
+    )
+
+
+def _fit_predict_design(X_tr, y_tr, X_te, feature_cols, test_index, *, return_clf=False, scale=True):
+    """The multinomial fit and its test predictions from design matrices:
+    training rows are standardised (when scale) before rows with a
+    non-finite feature or no outcome are dropped, as the formula path always did."""
+    scaler = None
+    if scale:
+        from sklearn.preprocessing import StandardScaler
         scaler = StandardScaler()
-        X_tr = scaler.fit_transform(X_tr_df.values.astype(float))            # ← fixes convergence
-        X_te = scaler.transform(X_te_df.values.astype(float))
-    else:
-        X_tr = train[feature_cols].values.astype(float)
-        X_te = test[feature_cols].values.astype(float)
-    y_tr = train[outcome_col].values
+        X_tr = scaler.fit_transform(X_tr)            # ← fixes convergence
+        X_te = scaler.transform(X_te)
 
     # Drop NaN/Inf rows from training
     #bad_tr = ~np.isfinite(X_tr).all(axis=1)
@@ -774,7 +786,7 @@ def _fit_predict_multinom(train, test, feature_cols, outcome_col="outcome", retu
     try:
         clf.fit(X_tr, y_tr)
         clf.feature_names = feature_cols
-        clf.scaler_ = scaler if formula_str is not None else None
+        clf.scaler_ = scaler
     except Exception as e:
         warnings.warn(f"_fit_predict_multinom fit failed: {e}")
         #return None
@@ -787,7 +799,7 @@ def _fit_predict_multinom(train, test, feature_cols, outcome_col="outcome", retu
         probs[~bad_te] = clf.predict_proba(X_te[~bad_te])
 
     #return pd.DataFrame(probs, columns=[f"cv_{c}" for c in clf.classes_], index=test.index)
-    preds_df = pd.DataFrame(probs, columns=[f"cv_{c}" for c in clf.classes_], index=test.index)
+    preds_df = pd.DataFrame(probs, columns=[f"cv_{c}" for c in clf.classes_], index=test_index)
     return (preds_df, clf) if return_clf else preds_df
 
 
@@ -920,12 +932,120 @@ def _initialize_global_cv_worker(context, blas_threads=None):
         _GLOBAL_CV_WORKER_THREAD_LIMIT = threadpool_limits(limits=int(blas_threads))
 
 
+def _shared_design(formula_str, data_train, data_pred, directory):
+    """The formula's design matrices for every training and prediction row,
+    saved under directory for the fold workers to map rather than copy; None
+    when folds must build their own.
+
+    A formula of plain numeric columns gives each row's terms from that row
+    alone, so slicing these matrices by a fold's rows gives what the fold's
+    own patsy design would. Formula functions (whose state could depend on
+    the fold) and rows patsy would drop keep the per-fold route."""
+    if _fit_columns(data_train, formula_str, []) is None or _fit_columns(data_pred, formula_str, []) is None:
+        return None
+    rhs = formula_str.split("~", 1)[1].strip() if "~" in formula_str else formula_str
+    shared = {}
+    for name, data in (("pred", data_pred), ("train", data_train)):
+        if name == "train" and data_train is data_pred:
+            shared["train"] = shared["pred"]
+            break
+        design = patsy.dmatrix(rhs, data, return_type="dataframe")
+        if len(design) != len(data):
+            return None
+        design = design.drop(columns=["Intercept"], errors="ignore")
+        columns = list(design.columns)
+        if shared and columns != shared["columns"]:
+            return None
+        path = os.path.join(directory, f"design_{name}.npy")
+        # Column-major, as patsy's frame hands its values over: the scaler and
+        # the solver then sum in the same order as for a fold's own design.
+        np.save(path, np.asfortranarray(design.to_numpy(dtype=float)))
+        shared[name] = path
+        shared["columns"] = columns
+        del design
+    return shared
+
+
+def _design_rows(path, rows):
+    """The rows of a saved design, column-major as patsy's design would be."""
+    mapped = np.load(path, mmap_mode="r")
+    out = np.empty((len(rows), mapped.shape[1]), dtype=mapped.dtype, order="F")
+    for column in range(mapped.shape[1]):
+        out[:, column] = mapped[:, column][rows]
+    return out
+
+
+def _compute_shared_fold(test_year, context):
+    """A fold from the shared design matrices (see _shared_design)."""
+    year = context["train_year"]
+    train_rows = np.flatnonzero(
+        np.isin(year, context["training_years"])
+        & (year != test_year)
+        & ~np.isin(year, context["true_holdout_years"])
+    )
+    test_positions = np.flatnonzero(context["pred_year"] == test_year)
+    if not len(test_positions):
+        raise ValueError(f"Global CV holdout year {test_year} has no test rows.")
+    if not len(train_rows):
+        raise ValueError(
+            f"Global CV holdout year {test_year} has no training rows in "
+            f"training_years={sorted(set(context['training_years']))}."
+        )
+    outcome = context["train_outcome"][train_rows]
+    present = {value for value in pd.unique(outcome) if isinstance(value, str)}
+    if context["required_classes"] is not None:
+        missing = [value for value in context["required_classes"] if value not in present]
+        if missing:
+            raise ValueError(
+                f"Global CV holdout year {test_year} training rows are missing "
+                f"outcome classes: {', '.join(missing)}."
+            )
+    if len(present) < 2:
+        raise ValueError(f"Global CV model fitting failed for holdout year {test_year}.")
+    design = context["design"]
+    preds, clf = _fit_predict_design(
+        _design_rows(design["train"], train_rows),
+        outcome,
+        _design_rows(design["pred"], test_positions),
+        design["columns"],
+        pd.RangeIndex(len(test_positions)),
+        return_clf=True,
+        scale=True,
+    )
+    if preds is None or clf is None:
+        raise ValueError(f"Global CV model fitting failed for holdout year {test_year}.")
+    return test_year, test_positions, preds, _coef_artifact(test_year, clf, context)
+
+
+def _coef_artifact(test_year, clf, context):
+    if not context["save_coefs"]:
+        return None
+    rows = []
+    for i, cls in enumerate(clf.classes_):
+        for j, feat in enumerate(clf.feature_names):
+            rows.append({
+                "test_year": test_year,
+                "class": cls,
+                "feature": feat,
+                "coefficient": float(clf.coef_[i, j]),
+                "intercept": float(clf.intercept_[i]),
+            })
+    return {
+        "coefs": pd.DataFrame(rows),
+        "scaler": clf.scaler_,
+        "features": clf.feature_names,
+        "formula": context["formula_str"],
+    }
+
+
 def _compute_global_cv_fold(test_year, context=None):
     """Fit and predict one holdout year using explicit or worker context."""
     if context is None:
         context = _GLOBAL_CV_WORKER_CONTEXT
     if context is None:
         raise RuntimeError("Global CV worker context has not been initialized.")
+    if "design" in context:
+        return _compute_shared_fold(test_year, context)
 
     data_train = context["data_train"]
     data_pred = context["data_pred"]
@@ -975,28 +1095,30 @@ def _compute_global_cv_fold(test_year, context=None):
             f"Global CV model fitting failed for holdout year {test_year}."
         )
 
-    coef_artifact = None
-    if context["save_coefs"]:
-        rows = []
-        actual_features = clf.feature_names
-        for i, cls in enumerate(clf.classes_):
-            for j, feat in enumerate(actual_features):
-                rows.append({
-                    "test_year": test_year,
-                    "class": cls,
-                    "feature": feat,
-                    "coefficient": float(clf.coef_[i, j]),
-                    "intercept": float(clf.intercept_[i]),
-                })
-        coef_artifact = {
-            "coefs": pd.DataFrame(rows),
-            "scaler": clf.scaler_,
-            "features": actual_features,
-            "formula": formula_str,
-        }
     # The fold's rows go back as positions: the caller has every column of
     # them, so workers can hold just the columns a fit reads.
-    return test_year, test_positions, preds, coef_artifact
+    return test_year, test_positions, preds, _coef_artifact(test_year, clf, context)
+
+
+def _run_global_cv_folds(context, holdout_years, worker_count, tmp):
+    if worker_count <= 1:
+        return [_compute_global_cv_fold(test_year, context) for test_year in holdout_years]
+    print(
+        f"  Fitting {len(holdout_years)} global CV folds with "
+        f"{worker_count} workers."
+    )
+    blas_threads = max(1, (os.cpu_count() or 1) // worker_count)
+    # Each worker loads the context from one file: passed as initargs, it
+    # is pickled again for every worker, one worker after another.
+    context_path = os.path.join(tmp, "context.pkl")
+    with open(context_path, "wb") as handle:
+        pickle.dump(context, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    with get_context("spawn").Pool(
+        processes=worker_count,
+        initializer=_initialize_global_cv_worker,
+        initargs=(context_path, blas_threads),
+    ) as pool:
+        return list(pool.imap(_compute_global_cv_fold, holdout_years))
 
 
 def _fit_columns(data, formula_str, extra):
@@ -1030,15 +1152,9 @@ def compute_cv_global(formula_str, data_train, holdout_years, training_years,
         raise ValueError("n_jobs must be a positive integer.")
 
     holdout_years = list(holdout_years)
-    # Workers get only the columns a fit reads: each holds its own copy of
-    # these frames, and the full tables, times the workers, ran to tens of GB.
-    train_columns = _fit_columns(data_train, formula_str, ["year", "outcome"])
-    pred_columns = _fit_columns(data_pred, formula_str, ["year"])
     context = {
         "formula_str": formula_str,
         "feature_cols": feature_cols,
-        "data_train": data_train if train_columns is None else data_train[train_columns],
-        "data_pred": data_pred if pred_columns is None else data_pred[pred_columns],
         "training_years": tuple(training_years),
         "true_holdout_years": tuple(true_holdout_years),
         "required_classes": (
@@ -1047,31 +1163,26 @@ def compute_cv_global(formula_str, data_train, holdout_years, training_years,
         "save_coefs": bool(save_coefs),
     }
     worker_count = min(n_jobs, len(holdout_years))
-    if worker_count > 1:
-        print(
-            f"  Fitting {len(holdout_years)} global CV folds with "
-            f"{worker_count} workers."
-        )
-        blas_threads = max(1, (os.cpu_count() or 1) // worker_count)
-        # Each worker loads the context from one file: passed as initargs, it
-        # is pickled again for every worker, one worker after another.
-        with tempfile.TemporaryDirectory(prefix="global-cv-") as tmp:
-            context_path = os.path.join(tmp, "context.pkl")
-            with open(context_path, "wb") as handle:
-                pickle.dump(context, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            with get_context("spawn").Pool(
-                processes=worker_count,
-                initializer=_initialize_global_cv_worker,
-                initargs=(context_path, blas_threads),
-            ) as pool:
-                fold_results = list(
-                    pool.imap(_compute_global_cv_fold, holdout_years)
-                )
-    else:
-        fold_results = [
-            _compute_global_cv_fold(test_year, context)
-            for test_year in holdout_years
-        ]
+    with tempfile.TemporaryDirectory(prefix="global-cv-") as tmp:
+        # One design matrix for every fold, mapped by each worker; otherwise
+        # workers get only the columns a fit reads (each holds its own copy,
+        # and full tables times the workers ran to tens of GB).
+        design = _shared_design(formula_str, data_train, data_pred, tmp)
+        if design is not None:
+            context.update(
+                design=design,
+                train_year=data_train["year"].to_numpy(),
+                train_outcome=data_train["outcome"].to_numpy(dtype=object),
+                pred_year=data_pred["year"].to_numpy(),
+            )
+        else:
+            train_columns = _fit_columns(data_train, formula_str, ["year", "outcome"])
+            pred_columns = _fit_columns(data_pred, formula_str, ["year"])
+            context.update(
+                data_train=data_train if train_columns is None else data_train[train_columns],
+                data_pred=data_pred if pred_columns is None else data_pred[pred_columns],
+            )
+        fold_results = _run_global_cv_folds(context, holdout_years, worker_count, tmp)
 
     if not fold_results:
         raise ValueError("Global CV produced no fold predictions.")

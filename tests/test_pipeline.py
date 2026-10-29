@@ -125,3 +125,24 @@ def test_a_damaged_blend_is_refused(region, tmp_path):
 
     with pytest.raises(Exception):
         TrainedBlend.load(path)
+
+
+def test_stage_tables_are_kept_only_when_asked(region):
+    _, config, result = region
+    from onset_blending.training import STAGE_TABLES, prepare
+
+    assert all(f.data is None for f in result.inputs.forecasts.values())  # train releases them
+    kept = prepare(config, resources=Resources(workers=1, budget_bytes=None), keep=STAGE_TABLES)
+    assert all(f.data is not None for f in kept.forecasts.values())
+    assert kept.climatology.data is not None
+
+
+def test_the_day_level_table_is_built_on_request(region):
+    _, config, result = region
+    from onset_blending.training import prepare
+
+    assert result.inputs.combined is None
+    with_daily = prepare(config, resources=Resources(workers=1, budget_bytes=None), daily=True)
+    combined = with_daily.combined
+    assert len(combined) == len(with_daily.weekly)
+    assert {"clim_p_onset_day_1", "ens_p_onset_day_41plus", "ens_rain_sd_day_1", "true_onset_date"} <= set(combined)

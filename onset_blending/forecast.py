@@ -40,7 +40,6 @@ class Forecast:
 
     weekly: pd.DataFrame        # id, time, onset_threshold, lat, lon, cv_week1..N, cv_later, clim_*
     features: pd.DataFrame      # the weekly feature rows the probabilities come from
-    combined: pd.DataFrame      # the day-level table (for day-level models)
 
     def save(self, directory: str | Path) -> Path:
         """Write the forecast's files into a new directory, all or nothing."""
@@ -128,17 +127,14 @@ def run(blend, forecasts: dict, *, issue_date=None, resources=None) -> Forecast:
         climatology = climatology_stage.build(
             config, blend.observed, [year], test_years=(year, year), workers=resources.workers
         )
-        combined = features.combine(
-            config, climatology, blend.observed, model_onsets,
-            workers=resources.workers, budget_bytes=resources.budget_bytes,
-        )
-        weekly = features.weekly(config, combined)
+        # No trimming: a forecast must not know when the onset came.
+        weekly = features.weekly(config, climatology, blend.observed, model_onsets, trim=False)
     if issue_date is not None:
         weekly = weekly[pd.to_datetime(weekly["time"]).dt.date == issue_date]
     rows = weekly.dropna(subset=_input_columns(blend.model, weekly)).reset_index(drop=True)
     if rows.empty:
         raise IncompatibleForecast(["no unit and issue date has every feature the blend needs"])
-    return Forecast(weekly=_probabilities(blend, rows), features=rows, combined=combined)
+    return Forecast(weekly=_probabilities(blend, rows), features=rows)
 
 
 def _input_columns(model, weekly: pd.DataFrame) -> list[str]:
